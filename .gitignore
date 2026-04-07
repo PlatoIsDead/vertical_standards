@@ -5,10 +5,8 @@ __pycache__/
 .streamlit/
 .claude/
 
-# Generated data caches (regenerate with scripts)
-data/embeddings_cache.npy
-data/chunks_cache.json
-data/chunks_with_roles.json
+# Generated data caches
+data/chunks_with_roles.json  # 454MB — too large for GitHub
 
 # Generated role docs - large files, regenerate with scripts/generate_role_docs.py
 role_docs/security.md
