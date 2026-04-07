@@ -1,0 +1,23 @@
+.env
+__pycache__/
+*.pyc
+*.Zone.Identifier
+.streamlit/
+.claude/
+
+# Generated data caches (regenerate with scripts)
+data/embeddings_cache.npy
+data/chunks_cache.json
+data/chunks_with_roles.json
+
+# Generated role docs - large files, regenerate with scripts/generate_role_docs.py
+role_docs/security.md
+role_docs/hsk_supervisor.md
+role_docs/housekeeper.md
+role_docs/general_manager.md
+role_docs/marketing.md
+role_docs/sales_manager.md
+role_docs/supervisor_fo.md
+role_docs/admin_reception.md
+role_docs/owner_relations.md
+role_docs/all_staff.md
