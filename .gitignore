@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+data/embeddings_cache.npy
+data/chunks_cache.json
+.streamlit/
+data/
