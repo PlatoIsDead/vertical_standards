@@ -5,3 +5,4 @@ data/embeddings_cache.npy
 data/chunks_cache.json
 .streamlit/
 data/
+*:Zone.Identifier
