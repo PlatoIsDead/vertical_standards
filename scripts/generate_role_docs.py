@@ -16,8 +16,6 @@ DATA_DIR   = os.path.join(os.path.dirname(__file__), "..", "data")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "role_docs")
 CHUNKS_PATH = os.path.join(DATA_DIR, "chunks_cache.json")
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 # ─── РОЛИ И ИХ КЛЮЧЕВЫЕ СЛОВА ────────────────────────────────────────────────
 # Формат: "ID роли": ("Название", [ключевые слова в тексте/заголовке])
 
@@ -158,11 +156,11 @@ def generate_markdown(role_id: str, role_name: str, chunks: list[dict]) -> str:
     """Генерирует markdown документ для роли."""
     lines = [
         f"# {role_name}",
-        f"",
-        f"*Стандарты и инструкции — апарт-отели Вертикаль*",
-        f"",
+        "",
+        "*Стандарты и инструкции — апарт-отели Вертикаль*",
+        "",
         f"Всего правил в этом документе: **{len(chunks)}**",
-        f"",
+        "",
         "---",
         "",
     ]
@@ -200,6 +198,7 @@ def generate_markdown(role_id: str, role_name: str, chunks: list[dict]) -> str:
 
 def main():
     print("=== Генерация документов по ролям ===")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     chunks = load_chunks()
     print(f"Загружено чанков: {len(chunks)}")
@@ -246,8 +245,8 @@ def main():
     index_path = os.path.join(OUTPUT_DIR, "INDEX.md")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write("\n".join(index_lines))
-    print(f"\n  ✓ INDEX.md")
-    print(f"\nГотово! Открой папку: role_docs/")
+    print("\n  ✓ INDEX.md")
+    print("\nГотово! Открой папку: role_docs/")
 
 
 if __name__ == "__main__":

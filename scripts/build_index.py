@@ -9,7 +9,6 @@ import os
 import re
 import numpy as np
 from docx import Document
-from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()

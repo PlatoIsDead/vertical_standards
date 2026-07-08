@@ -6,3 +6,7 @@ data/chunks_cache.json
 .streamlit/
 data/
 *:Zone.Identifier
+onboarding.db
+cloudflared-linux-amd64.deb*
+.pytest_cache/
+.ruff_cache/

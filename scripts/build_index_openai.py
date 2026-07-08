@@ -3,7 +3,10 @@ scripts/build_index_openai.py
 Reads Vertical_franchise_standards.md, builds chunks, embeds with OpenAI.
 Run: python scripts/build_index_openai.py
 """
-import json, os, re, time
+import json
+import os
+import re
+import time
 import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv

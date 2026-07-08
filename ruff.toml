@@ -1,0 +1,3 @@
+# Стиль репо: компактные `parts.append(...); vals.append(...)` в db.py (E702)
+# и импорты после sys.path-бутстрапа в scripts/ и streamlit-файлах (E402).
+lint.ignore = ["E702", "E402"]
