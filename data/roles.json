@@ -1,0 +1,23 @@
+{
+  "_comment": "Реестр ролей. prefixes: аббревиатура департамента в начале имени файла ('FO, RES Название.docx', формат клиента с 29.07) → роль; ключи UPPERCASE. folders: legacy №1 (folder_id → роли) — фолбэк, если в имени префиксов нет. Всё редактируется без рестарта.",
+  "roles": {
+    "housekeeper": "Горничная / Уборщица",
+    "admin_reception": "Администратор ресепшн (СПиР)",
+    "engineer": "Техник / Инженер",
+    "general_manager": "Администратор / Управляющий",
+    "reservations": "Отдел бронирования",
+    "sales": "Отдел продаж",
+    "finance": "Финансовый отдел",
+    "all_staff": "Все сотрудники"
+  },
+  "prefixes": {
+    "FO": "admin_reception",
+    "HSKP": "housekeeper",
+    "ENG": "engineer",
+    "RES": "reservations",
+    "SAL": "sales",
+    "FIN": "finance",
+    "ALL": "all_staff"
+  },
+  "folders": {}
+}

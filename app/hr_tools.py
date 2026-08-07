@@ -1,6 +1,7 @@
 """
 app/hr_tools.py — чистые функции инструментов HR (доработка №3): правка вопросов
-через чат, «История», «Отчёт». Без сети и БД — всё тестируется напрямую.
+через чат, «История», «Отчёт». Без сети и БД (role_name читает только локальный
+data/roles.json) — всё тестируется напрямую.
 
 Нумерация вопросов в UI сквозная (смета): 1–5 = базовый тест, 6–15 = экзамен.
 В answers.question_id хранится индекс ВНУТРИ фазы (0-based) — не путать.
@@ -9,6 +10,7 @@ import json
 import re
 
 from app.course_generator import validate_question
+from app.roles import role_name
 
 # Кириллические двойники букв ответов — HR печатает по-русски
 _CYR_TO_LAT = {"А": "A", "В": "B", "С": "C", "Д": "D"}
@@ -177,16 +179,21 @@ def build_history_text(employee_label: str, sessions: list[dict],
 
 
 def build_report_text(rows: list[dict], employees_by_uid: dict[str, dict]) -> str:
-    """Сводка по всем сессиям (последние 30): кто, курс, этап, баллы."""
+    """Сводка по всем сессиям (последние 30): кто (ФИО, должность, роль),
+    курс, этап, баллы. Роль = «отдел» до №8 (аббревиатуры клиента)."""
     if not rows:
         return "Сессий обучения пока нет."
     lines = ["📊 Отчёт по обучению:", ""]
     for r in rows[:30]:
         emp = employees_by_uid.get(str(r["user_id"]))
         if emp:
-            label = f"{emp.get('full_name') or r['user_id']} ({emp.get('email') or '—'})"
+            inner = ", ".join(x for x in (emp.get("work_position"),
+                                          emp.get("email")) if x)
+            label = f"{emp.get('full_name') or r['user_id']} ({inner or '—'})"
         else:
             label = f"ID {r['user_id']}"  # legacy-сессия без записи в employees
+        if r.get("role"):
+            label += f" · {role_name(r['role'])}"
         try:
             questions = json.loads(r.get("questions_json") or "{}")
         except json.JSONDecodeError:

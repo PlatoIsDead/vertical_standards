@@ -53,8 +53,13 @@ from app.hr_tools import (
     question_by_ref,
 )
 from app.rag import load_index
-from app.roles import load_roles_config
-from app.state_machine import process_message, start_onboarding
+from app.roles import ALL_STAFF, display_name, load_roles_config, parse_filename
+from app.state_machine import (
+    _last_known_role,
+    course_roles,
+    process_message,
+    start_onboarding,
+)
 
 load_dotenv()
 
@@ -211,6 +216,12 @@ async def _walk_folder(client, folder_id: str, roles: list[str], depth: int,
         file_name = f.get("NAME", "")
         if not file_id:
             continue
+        if file_name.startswith("."):
+            # macOS-мусор: .DS_Store и AppleDouble ._*.docx (бинарь с
+            # расширением docx — ext-гейт ниже его пропустил бы).
+            # Демо-фидбек E: заодно убираем в корзину Диска (Дмитрий подтвердил)
+            asyncio.create_task(_trash_junk_file(file_id, file_name))
+            continue
         seen_files[file_id] = f
         ext = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else ""
         if ext not in SUPPORTED_EXTS:
@@ -245,6 +256,20 @@ async def _walk_folder(client, folder_id: str, roles: list[str], depth: int,
                 continue
             await _walk_folder(client, sub_id, roles, depth - 1,
                                seen_files, visited_folders)
+
+
+async def _trash_junk_file(file_id: str, file_name: str) -> None:
+    """macOS-мусор → корзина Диска (markdeleted восстановим, в отличие от
+    delete; мак пересоздаст файлы — Дмитрий в курсе). Best-effort: любая
+    ошибка только логируется, поллер не ронять."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                BITRIX_WEBHOOK_URL + "disk.file.markdeleted", json={"id": file_id}
+            )
+        print(f"[poller] junk → корзина: {file_name!r} ({r.status_code})")
+    except Exception as exc:
+        print(f"[poller] junk delete failed for {file_name!r}: {exc!r}")
 
 
 async def _sync_folder(root_id: str, roles: list[str]):
@@ -483,7 +508,9 @@ async def bot_handler(request: Request):
         return {"status": "ok"}
 
     # ── Employee onboarding / RAG ─────────────────────────────────────────────
-    had_session = bool(await asyncio.to_thread(get_session, user_id))
+    # №11: сессия может появиться с course_id=0 (этап выбора роли) — файл
+    # документа шлём в момент НАЗНАЧЕНИЯ курса, а не появления сессии.
+    before = await asyncio.to_thread(get_session, user_id)
     try:
         text = await asyncio.to_thread(
             process_message, user_id, question, dialog_id, chunks, embeddings
@@ -496,16 +523,50 @@ async def bot_handler(request: Request):
             "Попробуй, пожалуйста, ещё раз через минуту."
         )
 
-    # Новая сессия создана этим сообщением → приложить файл документа (№4)
-    if not had_session:
-        new_session = await asyncio.to_thread(get_session, user_id)
-        if new_session:
+    # Курс назначен этим сообщением → приложить файл документа (№4)
+    if not (before and before["course_id"]):
+        after = await asyncio.to_thread(get_session, user_id)
+        if after and after["course_id"]:
             asyncio.create_task(
-                _send_course_file(dialog_id, new_session["course_id"])
+                _send_course_file(dialog_id, after["course_id"])
             )
 
     asyncio.create_task(_send(dialog_id, text, bot_id, client_id))
     return {"status": "ok"}
+
+
+# ── Рассылка «доступен новый курс» при активации (демо-фидбек A) ─────────────
+
+def _course_recipients(course: dict) -> list[str]:
+    """Кому анонсировать активированный курс (sync — звать через to_thread):
+    в whitelist, БЕЗ активной сессии, курс не пройден, роль пересекается с
+    ролями курса. Роль неизвестна (ни разу не выбирал) → только ALL-курсы,
+    иначе ролевые курсы спамят не тем людям (до №8 роль-из-отдела)."""
+    croles = set(course_roles(course))
+    uids = []
+    for e in get_all_employees():
+        uid = e["bitrix_uid"]
+        if get_session(uid):                      # busy: текущий курс/выбор роли
+            continue
+        done = {s["course_id"] for s in get_sessions_by_user(uid)
+                if s["state"] == "DONE"}
+        if course["id"] in done:
+            continue
+        role = _last_known_role(uid)
+        if role and ({role, ALL_STAFF} & croles):
+            uids.append(uid)
+        elif role is None and ALL_STAFF in croles:
+            uids.append(uid)
+    return uids
+
+
+async def _broadcast_course(course: dict, uids: list[str]) -> None:
+    """Анонс от EMPLOYEE-бота (BOT_ID): client_id не передаём — _send возьмёт
+    BOT_CLIENT_ID из .env. Последовательно: _send ретраит до 5 раз на флапе."""
+    text = (f"📚 Тебе доступен новый курс: *{display_name(course['doc_name'])}*\n"
+            "Напиши мне любое сообщение, чтобы начать обучение.")
+    for uid in uids:
+        await _send(f"u{uid}", text, BOT_ID)
 
 
 @app.post("/hr")
@@ -579,10 +640,18 @@ async def hr_handler(request: Request):
                     text = f"❌ Курс №{course_id} не найден."
                 else:
                     ok = await asyncio.to_thread(activate_course_by_id, course_id, user_id)
-                    text = (
-                        f"✅ Курс «{course['doc_name']}» активирован. Сотрудники могут начать обучение."
-                        if ok else f"❌ Не удалось активировать курс №{course_id}."
-                    )
+                    if ok:
+                        # Рассылка fire-and-forget: HR не ждёт K×5 ретраев _send
+                        uids = await asyncio.to_thread(_course_recipients, course)
+                        asyncio.create_task(_broadcast_course(course, uids))
+                        text = (
+                            f"✅ Курс «{course['doc_name']}» активирован. "
+                            + (f"Рассылаю уведомления: {len(uids)} чел."
+                               if uids else
+                               "Подходящих сотрудников для уведомления нет.")
+                        )
+                    else:
+                        text = f"❌ Не удалось активировать курс №{course_id}."
             except ValueError:
                 text = "❌ Укажи числовой номер курса: Подтвердить {N}"
 
@@ -603,7 +672,9 @@ async def hr_handler(request: Request):
                     uid = str(user.get("ID"))
                     fio = (f"{user.get('NAME', '')} {user.get('LAST_NAME', '')}".strip()
                            or email)
-                    await asyncio.to_thread(add_employee, uid, email, fio, user_id)
+                    await asyncio.to_thread(
+                        add_employee, uid, email, fio, user_id,
+                        (user.get("WORK_POSITION") or "").strip() or None)
                     if await asyncio.to_thread(get_session, uid):
                         text = f"ℹ️ {fio} уже проходит обучение."
                     else:
@@ -620,7 +691,9 @@ async def hr_handler(request: Request):
                             # принадлежит HR-боту — _send возьмёт BOT_CLIENT_ID из .env
                             asyncio.create_task(_send(f"u{uid}", first_msg, BOT_ID))
                             new_session = await asyncio.to_thread(get_session, uid)
-                            if new_session:
+                            # №11: course_id=0 = этап выбора роли, файл уйдёт
+                            # после выбора (хук в bot_handler)
+                            if new_session and new_session["course_id"]:
                                 asyncio.create_task(_send_course_file(
                                     f"u{uid}", new_session["course_id"]))
                             text = (f"✅ {fio} ({email}) приглашён — "
@@ -730,7 +803,9 @@ async def hr_handler(request: Request):
                             f"Сначала: Пригласить {target.lower()}")
                 else:
                     uid = emp["bitrix_uid"]
-                    label = f"{emp.get('full_name') or uid} ({emp['email']})"
+                    inner = ", ".join(x for x in (emp.get("work_position"),
+                                                  emp.get("email")) if x)
+                    label = f"{emp.get('full_name') or uid} ({inner or '—'})"
             else:
                 uid = target
             if uid:
@@ -847,11 +922,21 @@ async def process_new_document(file_id: str, file_name: str,
                                folder_id: str = None) -> None:
     """Download from Bitrix Disk, update RAG index, generate questions, notify HR.
 
-    roles — роли-адресаты чанков этого документа (из ролевой папки)."""
+    roles — роли-адресаты чанков (из папки); префиксы в имени файла главнее (№11)."""
     global chunks, embeddings
 
-    roles = roles or ["all_staff"]
     print(f"[process_new_document] START file_id={file_id!r} name={file_name!r} roles={roles}")
+
+    if file_name.startswith("."):
+        # macOS-мусор (.DS_Store, AppleDouble ._*.docx) — путь вебхука
+        print(f"[process_new_document] hidden/junk file — skip: {file_name!r}")
+        return
+
+    # №11: роли из префиксов имени файла («FO, RES Название.docx»), фолбэк — папка
+    parsed = parse_filename(file_name)
+    if parsed["roles"]:
+        roles = parsed["roles"]
+    roles = roles or ["all_staff"]
 
     # Защита от двойного срабатывания (поллер + вебхук)
     if await asyncio.to_thread(is_file_processed, file_id):
@@ -994,6 +1079,12 @@ async def process_new_document(file_id: str, file_name: str,
             f"Посмотреть вопросы: Вопросы {course_id}\n"
             f"Активировать курс: Подтвердить {course_id}"
         )
+        if parsed["suspicious"]:
+            notify_text += (
+                f"\n\n⚠️ Возможная опечатка в префиксе: «{parsed['suspicious']}» — "
+                "такого департамента нет в реестре ролей (data/roles.json). "
+                "Проверь имя файла."
+            )
         for hr_id in hr_ids:
             await _send(str(hr_id), notify_text, HR_BOT_ID)
         print(f"[process_new_document] DONE course_id={course_id}, HR notified: {hr_ids}")

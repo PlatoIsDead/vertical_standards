@@ -97,6 +97,8 @@ def init_db() -> None:
         # №4: архив курса при удалении файла; детект новой версии при том же file_id
         _ensure_column(conn, "courses", "archived_at", "TEXT")
         _ensure_column(conn, "processed_files", "update_time", "TEXT")
+        # Демо-фидбек C: должность в отчётах (из user.get при «Пригласить»)
+        _ensure_column(conn, "employees", "work_position", "TEXT")
         # Гейт поллера: файлы, обработанные ДО появления processed_files,
         # известны по courses.doc_id — сидируем, чтобы их не переобработать.
         conn.execute(
@@ -108,6 +110,16 @@ def init_db() -> None:
             """INSERT OR IGNORE INTO employees (bitrix_uid, added_by)
                SELECT DISTINCT user_id, 'seed' FROM sessions"""
         )
+        # Тестировщики: HR из HR_USER_IDS автоматически допущены к employee-боту.
+        # INSERT OR IGNORE = идемпотентно; «Пригласить» поверх сида дополняет
+        # email/ФИО, не затирается.
+        for uid in os.getenv("HR_USER_IDS", "").split(","):
+            if uid.strip():
+                conn.execute(
+                    "INSERT OR IGNORE INTO employees (bitrix_uid, added_by)"
+                    " VALUES (?, 'hr-seed')",
+                    (uid.strip(),),
+                )
 
 
 # ── Courses ──────────────────────────────────────────────────────────────────
@@ -255,7 +267,7 @@ def create_session(user_id: str, dialog_id: str, course_id: int,
 
 def update_session(session_id: int, state: str = None, q_idx: int = None,
                     score_basic: int = None, score_exam: int = None,
-                    role: str = None) -> None:
+                    role: str = None, course_id: int = None) -> None:
     """Update non-None fields on a session."""
     parts, vals = ["updated_at = ?"], [datetime.utcnow().isoformat()]
     if state is not None:
@@ -264,6 +276,8 @@ def update_session(session_id: int, state: str = None, q_idx: int = None,
         parts.append("current_q_idx = ?"); vals.append(q_idx)
     if role is not None:
         parts.append("role = ?"); vals.append(role)
+    if course_id is not None:
+        parts.append("course_id = ?"); vals.append(course_id)
     if score_basic is not None:
         parts.append("score_basic = ?"); vals.append(score_basic)
     if score_exam is not None:
@@ -386,18 +400,20 @@ def count_processed_by_doc_name(doc_name: str) -> int:
 # ── Employees (whitelist доступа к обучению) ─────────────────────────────────
 
 def add_employee(bitrix_uid: str, email: str = None, full_name: str = None,
-                 added_by: str = None) -> None:
+                 added_by: str = None, work_position: str = None) -> None:
     """Добавить/обновить сотрудника в whitelist. Повторное приглашение обновляет
-    email/ФИО (в т.ч. у seed-записей без email), added_at первой записи сохраняется."""
+    email/ФИО/должность (в т.ч. у seed-записей), added_at первой записи сохраняется."""
     email = email.strip().lower() if email else None
     with _conn() as conn:
         conn.execute(
-            """INSERT INTO employees (bitrix_uid, email, full_name, added_by, added_at)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO employees (bitrix_uid, email, full_name, added_by,
+                                      work_position, added_at)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(bitrix_uid) DO UPDATE SET
                  email = COALESCE(excluded.email, email),
-                 full_name = COALESCE(excluded.full_name, full_name)""",
-            (str(bitrix_uid), email, full_name, added_by,
+                 full_name = COALESCE(excluded.full_name, full_name),
+                 work_position = COALESCE(excluded.work_position, work_position)""",
+            (str(bitrix_uid), email, full_name, added_by, work_position,
              datetime.utcnow().isoformat()),
         )
 

@@ -146,6 +146,25 @@ def test_report_labels():
     assert "ID 42" in text and "сдаёт экзамен" in text
 
 
+def test_report_label_with_position_and_role(tmp_path, monkeypatch):
+    """Демо-фидбек C: ФИО (должность, email) · РольРус."""
+    import json as _json
+
+    import app.roles as roles
+    cfg = tmp_path / "roles.json"
+    cfg.write_text(_json.dumps({
+        "roles": {"reservations": "Отдел бронирования"},
+        "prefixes": {}, "folders": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(roles, "CONFIG_PATH", str(cfg))
+
+    emps = {"500": {"bitrix_uid": "500", "full_name": "Иван Иванов",
+                    "email": "ivan@x.ru", "work_position": "Администратор"}}
+    row = dict(_row("500", "READING"), role="reservations")
+    text = build_report_text([row], emps)
+    assert "Иван Иванов (Администратор, ivan@x.ru) · Отдел бронирования" in text
+
+
 def test_report_truncates_to_30():
     rows = [_row(str(i), "READING") for i in range(35)]
     text = build_report_text(rows, {})

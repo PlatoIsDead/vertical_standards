@@ -152,3 +152,72 @@ def test_update_session_role(tmp_path, monkeypatch):
     updated = db.get_session("u1")
     assert updated["state"] == "READING"
     assert updated["role"] == "housekeeper"
+
+
+# ── №11: сид тестировщиков из HR_USER_IDS + course_id в update_session ───────
+
+def test_hr_user_ids_seeded_as_employees(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "28528, 36523")
+    db.init_db()
+
+    assert db.is_employee_allowed("28528")
+    assert db.is_employee_allowed("36523")
+    db.init_db()                                          # идемпотентно
+    # «Пригласить» поверх сида дополняет данные, added_at не задваивается
+    db.add_employee("36523", "d@x.ru", "Дмитрий", "9")
+    assert db.get_employee("36523")["email"] == "d@x.ru"
+
+
+def test_hr_seed_empty_env_noop(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+    assert db.get_all_employees() == []
+
+
+def test_update_session_course_id(tmp_path, monkeypatch):
+    """Сентинел 0 на этапе ROLE_SELECT → реальный курс после выбора роли."""
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+
+    cid = db.save_draft_course("Док.docx", "1", "{}")
+    session = db.create_session("u1", "d1", 0, state="ROLE_SELECT")
+    assert session["course_id"] == 0
+
+    db.update_session(session["id"], state="READING", course_id=cid)
+    updated = db.get_session("u1")
+    assert updated["course_id"] == cid and updated["state"] == "READING"
+
+
+# ── Демо-фидбек C: должность сотрудника ──────────────────────────────────────
+
+def test_work_position_upsert(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+
+    db.add_employee("50", "i@x.ru", "Иван", "9", work_position="Администратор")
+    assert db.get_employee("50")["work_position"] == "Администратор"
+    db.add_employee("50", added_by="9")               # повтор без должности
+    assert db.get_employee("50")["work_position"] == "Администратор"  # не затёрта
+
+
+def test_work_position_column_added_to_existing_table(tmp_path, monkeypatch):
+    """Живая БД со старой employees-схемой получает колонку миграцией."""
+    db_file = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "CREATE TABLE employees (bitrix_uid TEXT PRIMARY KEY, email TEXT,"
+        " full_name TEXT, added_by TEXT, added_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_PATH", db_file)
+    monkeypatch.setenv("HR_USER_IDS", "")
+
+    db.init_db()
+
+    db.add_employee("1", work_position="Техник")
+    assert db.get_employee("1")["work_position"] == "Техник"

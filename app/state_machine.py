@@ -6,6 +6,10 @@ States: ROLE_SELECT → READING → BASIC_TEST → WAITING_HR → EXAM → DONE
 ROLE_SELECT: сотрудник выбирает роль цифрой; RAG-ответы фильтруются по роли.
 Команда «Роль» в READING — сменить роль (тестирование в разных ролях).
 
+№11: курс назначается ПОСЛЕ определения роли (память прошлой сессии или меню) —
+первый активный непройденный курс, чьи роли (префиксы в doc_name) пересекаются
+с {роль, all_staff}. До выбора роли сессия живёт с сентинелом course_id=0.
+
 Entry point: process_message() — synchronous, designed to be called via asyncio.to_thread().
 """
 import os
@@ -20,15 +24,25 @@ from app.db import (
     get_active_courses,
     get_course_by_id,
     get_course_questions,
+    get_employee,
     get_session,
     get_session_answers,
+    get_session_by_id,
+    get_sessions_by_user,
     is_employee_allowed,
     log_answer,
     update_session,
 )
 from app.gamification import post_exam_congratulation
 from app.rag import answer as rag_answer
-from app.roles import selectable_roles
+from app.roles import (
+    ALL_STAFF,
+    display_name,
+    load_roles_config,
+    parse_filename,
+    role_name,
+    selectable_roles,
+)
 
 load_dotenv()
 
@@ -55,11 +69,20 @@ def process_message(user_id: str, message: str, dialog_id: str,
                 "Добро пожаловать! Активных курсов обучения пока нет.\n"
                 "Обратитесь к HR-менеджеру для назначения обучения."
             )
-        course = active_courses[0]
+        # №11: курс — после роли. Роль из прошлой сессии или через меню;
+        # до выбора сессия с сентинелом course_id=0.
         if selectable_roles():
-            session = create_session(user_id, dialog_id, course["id"],
-                                     state="ROLE_SELECT")
+            role = _last_known_role(user_id)
+            if role:
+                return _assign_course(user_id, dialog_id, role, None,
+                                      remembered=True)
+            create_session(user_id, dialog_id, 0, state="ROLE_SELECT")
             return _start_role_select()
+        course = pick_course_for_role(active_courses, None,
+                                      _done_course_ids(user_id))
+        if course is None:
+            return ("🎓 Все активные курсы уже пройдены. "
+                    "За новым обучением обратись к HR.")
         session = create_session(user_id, dialog_id, course["id"])
         return _start_reading(session, course)
 
@@ -72,7 +95,7 @@ def process_message(user_id: str, message: str, dialog_id: str,
     elif state == "BASIC_TEST":
         return _handle_test(session, message, "basic")
     elif state == "WAITING_HR":
-        return _handle_waiting_hr()
+        return _handle_waiting_hr(session, message)
     elif state == "EXAM":
         return _handle_test(session, message, "exam")
     elif state == "DONE":
@@ -92,13 +115,93 @@ def start_onboarding(user_id: str, dialog_id: str) -> str | None:
     courses = get_active_courses()
     if not courses:
         return None
-    course = courses[0]
-    # Зеркало ветки session is None в process_message
+    # Зеркало ветки session is None в process_message (№11)
     if selectable_roles():
-        create_session(user_id, dialog_id, course["id"], state="ROLE_SELECT")
+        role = _last_known_role(user_id)
+        if role:
+            return _assign_course(user_id, dialog_id, role, None, remembered=True)
+        create_session(user_id, dialog_id, 0, state="ROLE_SELECT")
         return _start_role_select()
+    course = pick_course_for_role(courses, None, _done_course_ids(user_id))
+    if course is None:
+        return ("🎓 Все активные курсы уже пройдены. "
+                "За новым обучением обратись к HR.")
     session = create_session(user_id, dialog_id, course["id"])
     return _start_reading(session, course)
+
+
+# ── Назначение курса по роли (№11: префиксы в имени файла) ────────────────────
+
+def course_roles(course: dict) -> list[str]:
+    """Роли курса — на лету из имени документа; без префиксов = для всех."""
+    return parse_filename(course["doc_name"])["roles"] or [ALL_STAFF]
+
+
+def pick_course_for_role(courses: list[dict], role_id: str | None,
+                         done_ids: set) -> dict | None:
+    """Первый непройденный курс для роли (порядок = порядок активации).
+
+    role_id None — легаси-режим без конфига ролей: любой непройденный."""
+    for c in courses:
+        if c["id"] in done_ids:
+            continue
+        if role_id is None or {role_id, ALL_STAFF} & set(course_roles(c)):
+            return c
+    return None
+
+
+def _done_course_ids(user_id: str) -> set:
+    return {s["course_id"] for s in get_sessions_by_user(user_id)
+            if s["state"] == "DONE"}
+
+
+def _last_known_role(user_id: str) -> str | None:
+    """Роль из последней сессии, если она ещё существует в реестре ролей."""
+    valid = load_roles_config().get("roles", {})
+    for s in get_sessions_by_user(user_id):
+        if s.get("role") and s["role"] in valid:
+            return s["role"]
+    return None
+
+
+def _assign_course(user_id: str, dialog_id: str, role_id: str,
+                   session: dict | None, remembered: bool = False) -> str:
+    """Назначить первый подходящий курс (роль/all_staff, непройденный).
+
+    session — живая ROLE_SELECT-сессия (course_id=0) либо None (роль вспомнили
+    из прошлой сессии, сессии ещё нет)."""
+    course = pick_course_for_role(get_active_courses(), role_id,
+                                  _done_course_ids(user_id))
+    if course is None:
+        # Маркер «курсов нет» (course_id=0, DONE, role) гасит повторный спам HR
+        # на каждое сообщение сотрудника.
+        last = get_sessions_by_user(user_id)
+        already_flagged = (bool(last) and last[0]["course_id"] == 0
+                           and last[0]["state"] == "DONE"
+                           and last[0].get("role") == role_id)
+        if session:
+            update_session(session["id"], state="DONE", role=role_id)
+        elif not already_flagged:
+            marker = create_session(user_id, dialog_id, 0, state="DONE")
+            update_session(marker["id"], role=role_id)
+        if not already_flagged:
+            notify_hr(
+                f"👀 Сотрудник (ID: {user_id}) с ролью «{role_name(role_id)}» "
+                "запросил обучение — подходящих активных курсов нет."
+            )
+        return ("📚 Для твоей роли пока нет назначенных курсов. "
+                "HR уже в курсе — получишь сообщение, когда курс появится.")
+    if session:
+        update_session(session["id"], state="READING", role=role_id,
+                       course_id=course["id"])
+        session = get_session_by_id(session["id"])
+    else:
+        session = create_session(user_id, dialog_id, course["id"])
+        update_session(session["id"], role=role_id)
+    role_line = f"✅ Твоя роль: *{role_name(role_id)}*"
+    if remembered:
+        role_line += " (помню с прошлого обучения; сменить — команда «Роль»)"
+    return role_line + "\n\n" + _start_reading(session, course)
 
 
 # ── State handlers ────────────────────────────────────────────────────────────
@@ -119,11 +222,19 @@ def _start_role_select() -> str:
 
 def _handle_role_select(session: dict, message: str) -> str:
     options = selectable_roles()
-    course = get_course_by_id(session["course_id"])
 
     if not options:
         # Конфиг ролей опустел между сообщениями — не блокируем обучение
-        update_session(session["id"], state="READING")
+        course = (get_course_by_id(session["course_id"])
+                  if session["course_id"] else None)
+        if course is None:
+            course = pick_course_for_role(
+                get_active_courses(), None, _done_course_ids(session["user_id"]))
+        if course is None:
+            update_session(session["id"], state="DONE")
+            return ("Активных курсов обучения пока нет.\n"
+                    "Обратитесь к HR-менеджеру для назначения обучения.")
+        update_session(session["id"], state="READING", course_id=course["id"])
         return _start_reading(session, course)
 
     m = re.match(r"^\s*(\d+)\s*[.)]?\s*$", message)
@@ -134,8 +245,15 @@ def _handle_role_select(session: dict, message: str) -> str:
         )
 
     role_id, role_label = options[int(m.group(1)) - 1]
-    update_session(session["id"], state="READING", role=role_id)
-    return f"✅ Твоя роль: *{role_label}*\n\n" + _start_reading(session, course)
+    if session["course_id"]:
+        # Смена роли командой «Роль»: курс уже назначен — НЕ переназначаем
+        # (сессия привязана; тестовый инструмент для просмотра других ролей)
+        course = get_course_by_id(session["course_id"])
+        if course:
+            update_session(session["id"], state="READING", role=role_id)
+            return f"✅ Твоя роль: *{role_label}*\n\n" + _start_reading(session, course)
+    return _assign_course(session["user_id"], session["dialog_id"],
+                          role_id, session)
 
 
 def _start_reading(session: dict, course: dict) -> str:
@@ -143,7 +261,8 @@ def _start_reading(session: dict, course: dict) -> str:
     summary = questions.get("course_summary", "")
     detail_url = course.get("doc_detail_url") or "(ссылка не найдена — спросите HR)"
 
-    lines = [f"👋 Добро пожаловать! Начинаем обучение: *{course['doc_name']}*", ""]
+    lines = [f"👋 Добро пожаловать! Начинаем обучение: "
+             f"*{display_name(course['doc_name'])}*", ""]
     if summary:
         lines += [summary, ""]
     lines += [
@@ -151,12 +270,43 @@ def _start_reading(session: dict, course: dict) -> str:
         "",
         "Прочитай документ и напиши *Готов*, когда будешь готов к тесту.",
         "Если есть вопросы по материалу — задавай, отвечу на основе стандартов.",
+        "",
+        "Команды: *Готов* — начать тест · *Мои курсы* — список курсов · "
+        "*Роль* — сменить роль.",
     ]
     return "\n".join(lines)
 
 
+def _my_courses_text(user_id: str, role_id: str | None) -> str:
+    """«Мои курсы»: список активных курсов роли со статусами (демо-фидбек B)."""
+    courses = get_active_courses()
+    done = _done_course_ids(user_id)
+    session = get_session(user_id)
+    current_id = session["course_id"] if session else 0
+    mine = [c for c in courses
+            if role_id is None or {role_id, ALL_STAFF} & set(course_roles(c))]
+    if not mine:
+        return "Для твоей роли пока нет активных курсов."
+    lines = ["📚 Твои курсы:", ""]
+    for c in mine:
+        name = display_name(c["doc_name"])
+        if c["id"] == current_id:
+            lines.append(f"▶️ {name} — проходишь сейчас")
+        elif c["id"] in done:
+            lines.append(f"✅ {name} — пройден")
+        else:
+            lines.append(f"⏳ {name} — будет предложен после текущего")
+    return "\n".join(lines)
+
+
+_MENU_COMMANDS = ("мои курсы", "курсы", "меню")
+
+
 def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> str:
-    if message.strip().lower() == "роль":
+    cmd = message.strip().lower()
+    if cmd in _MENU_COMMANDS:
+        return _my_courses_text(session["user_id"], session.get("role"))
+    if cmd == "роль":
         update_session(session["id"], state="ROLE_SELECT")
         return _start_role_select()
 
@@ -227,6 +377,18 @@ def _handle_test(session: dict, message: str, phase: str) -> str:
     return _finish_phase(session, phase, questions, last_feedback=feedback)
 
 
+def _employee_label(user_id: str) -> str:
+    """«Иван Иванов, Администратор (ID: 500)» для уведомлений HR; ID остаётся
+    всегда — команды «Допустить/История» работают по нему."""
+    emp = get_employee(user_id)
+    if emp and emp.get("full_name"):
+        label = emp["full_name"]
+        if emp.get("work_position"):
+            label += f", {emp['work_position']}"
+        return f"{label} (ID: {user_id})"
+    return f"(ID: {user_id})"
+
+
 def _finish_phase(session: dict, phase: str, questions: dict,
                    last_feedback: str = "") -> str:
     answers = get_session_answers(session["id"], phase)
@@ -239,7 +401,8 @@ def _finish_phase(session: dict, phase: str, questions: dict,
         update_session(session["id"], state="WAITING_HR", q_idx=0,
                        score_basic=correct_count)
         notify_hr(
-            f"📋 Сотрудник (ID: {session['user_id']}) завершил базовый тест.\n"
+            f"📋 Сотрудник {_employee_label(session['user_id'])} "
+            f"завершил базовый тест.\n"
             f"Результат: {correct_count}/{total}\n\n"
             f"Чтобы допустить к экзамену, напиши:\n"
             f"Допустить {session['user_id']}"
@@ -259,7 +422,7 @@ def _finish_phase(session: dict, phase: str, questions: dict,
     grade = "✅ Сдан" if passed else "❌ Не сдан"
 
     notify_hr(
-        f"🎓 Сотрудник (ID: {session['user_id']}) завершил экзамен.\n"
+        f"🎓 Сотрудник {_employee_label(session['user_id'])} завершил экзамен.\n"
         f"Базовый тест: {basic_score}/{basic_total}\n"
         f"Экзамен: {correct_count}/{total} — {grade}\n"
         f"Курс: {questions.get('doc_name', '')}"
@@ -277,8 +440,11 @@ def _finish_phase(session: dict, phase: str, questions: dict,
     )
 
 
-def _handle_waiting_hr() -> str:
-    return "⏳ Ожидаем решения HR о допуске к экзамену. Скоро получишь уведомление."
+def _handle_waiting_hr(session: dict, message: str) -> str:
+    if message.strip().lower() in _MENU_COMMANDS:
+        return _my_courses_text(session["user_id"], session.get("role"))
+    return ("⏳ Ожидаем решения HR о допуске к экзамену. Скоро получишь уведомление.\n"
+            "Посмотреть свои курсы: *Мои курсы*")
 
 
 def _handle_done(session: dict) -> str:

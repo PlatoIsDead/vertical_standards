@@ -123,7 +123,9 @@ def test_invite_already_learning(env):
     assert "уже проходит обучение" in next(m for m in sent if m[0] == "d9b")[1]
 
 
-def test_invite_sends_course_file(env, monkeypatch):
+def test_invite_role_select_defers_course_file(env, monkeypatch):
+    """№11: при старте с выбором роли курс ещё не назначен (course_id=0) —
+    файл документа НЕ шлётся, уйдёт после выбора роли через bot_handler."""
     client, sent, _ = env
     called = []
 
@@ -132,8 +134,31 @@ def test_invite_sends_course_file(env, monkeypatch):
 
     monkeypatch.setattr(bot, "_send_course_file", fake_course_file)
     _post_hr(client, "Пригласить ivan@x.ru")
+    assert _wait_for(lambda: db.get_session("500") is not None)
+    assert db.get_session("500")["course_id"] == 0
+    time.sleep(0.05)
+    assert not called
+
+
+def test_invite_remembered_role_sends_course_file(env, monkeypatch):
+    """№11: роль известна из прошлой сессии → курс назначен сразу, файл уходит."""
+    client, sent, course_id = env
+    cid2 = db.save_draft_course(
+        "Правила.docx", "2", json.dumps(QUESTIONS, ensure_ascii=False))
+    db.activate_course_by_id(cid2, "hr9")
+    s = db.create_session("500", "u500", course_id, state="DONE")
+    db.update_session(s["id"], role="housekeeper")
+    called = []
+
+    async def fake_course_file(dialog_id, course_id):
+        called.append((dialog_id, course_id))
+
+    monkeypatch.setattr(bot, "_send_course_file", fake_course_file)
+    _post_hr(client, "Пригласить ivan@x.ru")
     assert _wait_for(lambda: bool(called))
-    assert called[0][0] == "u500"
+    session = db.get_session("500")
+    assert session["state"] == "READING" and session["role"] == "housekeeper"
+    assert called[0] == ("u500", session["course_id"])
 
 
 def test_non_hr_rejected(env):

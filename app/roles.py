@@ -2,14 +2,17 @@
 app/roles.py — реестр ролей и ролевая фильтрация RAG.
 
 Источник правды: data/roles.json
-  roles:   {role_id: "Русское имя"} — "all_staff" служебная, в меню выбора не показывается
-  folders: {bitrix_folder_id: [role_id, ...]} — роль документа определяется папкой
+  roles:    {role_id: "Русское имя"} — "all_staff" служебная, в меню выбора не показывается
+  prefixes: {"FO": role_id, ...} — аббревиатуры департаментов в начале имени файла
+            («FO, RES АЛГОРИТМ....docx», формат клиента №11); роли документа из имени
+  folders:  {bitrix_folder_id: [role_id, ...]} — legacy №1, фолбэк без префиксов в имени
 
 Конфиг читается с диска при каждом вызове (файл крошечный) — можно менять
 без рестарта, поллер подхватит на следующем цикле.
 """
 import json
 import os
+import re
 
 import numpy as np
 
@@ -40,6 +43,58 @@ def role_name(role_id: str) -> str:
 
 def roles_for_folder(folder_id: str) -> list[str]:
     return list(load_roles_config().get("folders", {}).get(str(folder_id), []))
+
+
+# Кандидат в опечатку префикса: ТОЛЬКО латиница — названия у клиента бывают
+# целиком капсом кириллицей («ENG ДЕЙСТВИЯ ДЕЖУРНОГО...»), их не тревожить.
+_SUSPICIOUS_RE = re.compile(r"^[A-Z]{2,6}$")
+
+
+def parse_filename(file_name: str) -> dict:
+    """Разбор префиксов департаментов в имени файла (№11).
+
+    «FO, HSKP, ENG, RES Вывод номера из обращения (ремонт, OOS, ООО).docx» →
+    роли по реестру prefixes. Разбор идёт по токенам через запятую и
+    ОСТАНАВЛИВАЕТСЯ на первом токене, который не префикс (взяв его первое
+    слово, если оно префикс) — запятые внутри названия не ломают разбор.
+
+    Возвращает {"roles": list[str] | None, "title": str, "suspicious": str | None}:
+      roles None — известных префиксов нет вовсе (≠ ["all_staff"], фолбэк
+        решает вызывающий);
+      title — название без префиксов (только для показа сотруднику,
+        идентичность документа — всегда полное имя файла);
+      suspicious — латинская аббревиатура сразу после известных префиксов,
+        которой нет в реестре (вероятная опечатка — сообщить HR).
+    """
+    prefixes = load_roles_config().get("prefixes", {})
+    stem = (file_name.rsplit(".", 1)[0] if "." in file_name else file_name).strip()
+    found: list[str] = []
+    title, suspicious = stem, None
+    if prefixes:
+        parts = stem.split(",")
+        for i, part in enumerate(parts):
+            token = part.strip()
+            if token.upper() in prefixes:            # чистый токен: «FO»
+                found.append(prefixes[token.upper()])
+                title = ",".join(parts[i + 1:]).strip()
+                continue
+            head, _, rest = token.partition(" ")
+            if head.upper() in prefixes:             # хвост: «RES Вывод (ремонт»
+                found.append(prefixes[head.upper()])
+                title = ",".join([rest] + parts[i + 1:]).strip()
+            else:
+                title = ",".join(parts[i:]).strip()
+                if found and _SUSPICIOUS_RE.match(head):
+                    suspicious = head
+            break
+    roles = list(dict.fromkeys(found)) or None
+    return {"roles": roles, "title": title if roles else stem,
+            "suspicious": suspicious}
+
+
+def display_name(file_name: str) -> str:
+    """Название документа для показа сотруднику — без префиксов департаментов."""
+    return parse_filename(file_name)["title"] or file_name
 
 
 def role_mask(chunks: list[dict], role_id: str | None) -> np.ndarray:

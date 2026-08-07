@@ -33,6 +33,8 @@ def env(tmp_path, monkeypatch):
             "admin_reception": "Администратор ресепшн (СПиР)",
             "all_staff": "Все сотрудники",
         },
+        "prefixes": {"HSKP": "housekeeper", "FO": "admin_reception",
+                     "RES": "reservations", "ALL": "all_staff"},
         "folders": {},
     }, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(roles, "CONFIG_PATH", str(cfg))
@@ -129,3 +131,130 @@ def test_start_onboarding_without_courses(tmp_path, monkeypatch):
     db.add_employee("u5", added_by="test")
     assert sm.start_onboarding("u5", "d5") is None
     assert db.get_session("u5") is None
+
+
+# ── №11: курс назначается по роли (префиксы в имени файла) ───────────────────
+
+def _add_course(doc_name, doc_id):
+    cid = db.save_draft_course(doc_name, doc_id,
+                               json.dumps(QUESTIONS, ensure_ascii=False))
+    db.activate_course_by_id(cid, "hr1")
+    return cid
+
+
+def test_session_starts_with_sentinel_course(env):
+    sm.process_message("u1", "привет", "d1", [], None)
+    assert db.get_session("u1")["course_id"] == 0     # курс до выбора роли не назначен
+
+
+def test_course_matched_by_role(env):
+    _add_course("RES Брони.docx", "d-res")
+    fo_id = _add_course("FO Ресепшн.docx", "d-fo")
+    sm.process_message("u1", "привет", "d1", [], None)
+    reply = sm.process_message("u1", "2", "d1", [], None)   # admin_reception
+    session = db.get_session("u1")
+    assert session["course_id"] == fo_id                    # не RES-курс
+    assert session["state"] == "READING"
+    assert "Ресепшн" in reply and "FO" not in reply         # display_name без префикса
+
+
+def test_all_staff_course_matches_any_role(env):
+    # Единственный курс «Стандарты.docx» без префикса = all_staff
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)           # housekeeper
+    session = db.get_session("u1")
+    assert session["state"] == "READING"
+    assert session["course_id"] == db.get_course_by_doc_name("Стандарты.docx")["id"]
+
+
+def test_no_course_for_role_notifies_hr_once(env, monkeypatch):
+    notes = []
+    monkeypatch.setattr(sm, "notify_hr", lambda text: notes.append(text))
+    std = db.get_course_by_doc_name("Стандарты.docx")["id"]
+    db.create_session("u1", "d1", std, state="DONE")        # all_staff-курс пройден
+    _add_course("RES Брони.docx", "d-res")                  # курс чужой роли
+
+    sm.process_message("u1", "привет", "d1", [], None)
+    reply = sm.process_message("u1", "2", "d1", [], None)   # admin_reception
+    assert "нет назначенных курсов" in reply
+    assert len(notes) == 1 and "admin_reception" not in notes[0]  # русское имя роли
+    assert db.get_session("u1") is None                     # сессия-маркер закрыта
+
+    reply2 = sm.process_message("u1", "привет", "d1", [], None)
+    assert "нет назначенных курсов" in reply2
+    assert len(notes) == 1                                  # HR не спамится повторно
+
+
+def test_role_remembered_after_done(env):
+    fo_id = _add_course("FO Ресепшн.docx", "d-fo")
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "2", "d1", [], None)           # admin_reception → FO-курс
+    session = db.get_session("u1")
+    assert session["course_id"] == fo_id
+    db.update_session(session["id"], state="DONE")          # курс пройден
+
+    reply = sm.process_message("u1", "привет", "d1", [], None)
+    assert "1. Горничная" not in reply                      # меню НЕ показано
+    assert "помню" in reply
+    new = db.get_session("u1")
+    assert new["role"] == "admin_reception"
+    # следующий непройденный для роли — all_staff «Стандарты»
+    assert new["course_id"] == db.get_course_by_doc_name("Стандарты.docx")["id"]
+
+
+def test_legacy_all_done_message(env, monkeypatch):
+    monkeypatch.setattr(sm, "selectable_roles", lambda: [])
+    std = db.get_course_by_doc_name("Стандарты.docx")["id"]
+    db.create_session("u2", "d2", std, state="DONE")
+    reply = sm.process_message("u2", "привет", "d2", [], None)
+    assert "пройдены" in reply
+    assert db.get_session("u2") is None
+
+
+# ── Демо-фидбек 05.08: «Мои курсы», подсказки, подписи HR ────────────────────
+
+def test_my_courses_command_skips_rag(env):
+    _add_course("RES Брони.docx", "d-res")
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)          # housekeeper → Стандарты
+    reply = sm.process_message("u1", "Мои курсы", "d1", [], None)
+    assert "▶️ Стандарты — проходишь сейчас" in reply
+    assert "Брони" not in reply                            # курс чужой роли скрыт
+    assert env == {}                                       # RAG не вызывался
+
+
+def test_free_question_still_goes_to_rag(env):
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    reply = sm.process_message("u1", "какие курсы по уборке?", "d1", [], None)
+    assert reply == "MOCK_ANSWER"                          # substring ≠ команда
+
+
+def test_start_reading_shows_command_hints(env):
+    sm.process_message("u1", "привет", "d1", [], None)
+    reply = sm.process_message("u1", "1", "d1", [], None)
+    assert "Мои курсы" in reply and "Роль" in reply
+
+
+def test_finish_phase_notify_has_name(env, monkeypatch):
+    notes = []
+    monkeypatch.setattr(sm, "notify_hr", lambda text: notes.append(text))
+    db.add_employee("u1", full_name="Иван Иванов", work_position="Администратор")
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    sm.process_message("u1", "Готов", "d1", [], None)      # BASIC_TEST, 1 вопрос
+    sm.process_message("u1", "A", "d1", [], None)          # финиш базового
+    assert notes and "Иван Иванов, Администратор (ID: u1)" in notes[0]
+    assert "Допустить u1" in notes[0]                      # команда — по ID
+
+
+def test_waiting_hr_menu(env, monkeypatch):
+    monkeypatch.setattr(sm, "notify_hr", lambda text: None)
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    sm.process_message("u1", "Готов", "d1", [], None)
+    sm.process_message("u1", "A", "d1", [], None)          # → WAITING_HR
+    reply = sm.process_message("u1", "Мои курсы", "d1", [], None)
+    assert "📚 Твои курсы" in reply
+    reply2 = sm.process_message("u1", "что дальше?", "d1", [], None)
+    assert "Ожидаем решения HR" in reply2

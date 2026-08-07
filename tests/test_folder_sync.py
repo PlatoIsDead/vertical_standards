@@ -284,6 +284,66 @@ def test_walk_recursion_depth_and_role_mapped_skip(env, monkeypatch):
     assert all(s[1] == ("hk",) for s in spawned)            # роли корня
 
 
+# ── №11: скрытые файлы и префиксы департаментов в имени ──────────────────────
+
+def test_hidden_files_skipped_in_walk(env, monkeypatch):
+    tree = {("111", "file"): [
+        {"ID": "9", "NAME": ".DS_Store", "UPDATE_TIME": "T"},
+        {"ID": "10", "NAME": "._FO Внешний вид.docx", "UPDATE_TIME": "T"},
+        {"ID": "11", "NAME": "Живой.txt", "UPDATE_TIME": "T"},
+    ]}
+    monkeypatch.setattr(bot, "_list_children", _listing(tree))
+    trashed = []
+    FakeAsyncClient.routes["disk.file.markdeleted"] = (
+        lambda payload: trashed.append(str(payload["id"])) or {"result": True})
+    spawned = []
+
+    async def fake_process(file_id, file_name, roles, folder_id):
+        spawned.append(file_id)
+
+    monkeypatch.setattr(bot, "_process_and_release", fake_process)
+
+    async def run():
+        seen, visited = {}, set()
+        await bot._walk_folder(None, "111", ["hk"], 1, seen, visited)
+        for _ in range(6):
+            await asyncio.sleep(0)
+        return seen
+
+    seen = asyncio.run(run())
+    assert set(seen) == {"11"}            # мусор не в seen и не в обработке
+    assert spawned == ["11"]
+    assert sorted(trashed) == ["10", "9"]  # демо-фидбек E: мусор → корзина Диска
+
+
+def test_hidden_file_skipped_in_process(env):
+    # Путь вебхука: AppleDouble ._*.docx проходит ext-гейт, режется отдельно
+    asyncio.run(bot.process_new_document("12", "._Скрытый.docx", ["hk"], "111"))
+    assert not db.is_file_processed("12")
+    chunks, _ = store.load()
+    assert chunks == []
+
+
+def test_prefix_overrides_folder_roles(env, tmp_path, monkeypatch):
+    import app.roles as roles_mod
+    cfg = tmp_path / "roles.json"
+    cfg.write_text(json.dumps({
+        "roles": {"admin_reception": "СПиР", "reservations": "Брони",
+                  "all_staff": "Все"},
+        "prefixes": {"FO": "admin_reception", "RES": "reservations",
+                     "ALL": "all_staff"},
+        "folders": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(roles_mod, "CONFIG_PATH", str(cfg))
+
+    _ingest("401", "FO, RES Алгоритм.txt", "111", V1_TEXT)
+    chunks, _ = store.load()
+    assert chunks and all(
+        c["roles"] == ["admin_reception", "reservations"] for c in chunks)
+    # Идентичность НЕ меняется: doc_name = полное имя файла с префиксами
+    assert all(c["doc_name"] == "FO, RES Алгоритм.txt" for c in chunks)
+
+
 # ── Хук: файл документа при старте курса через "/" ───────────────────────────
 
 def test_new_session_triggers_course_file(env, monkeypatch):
