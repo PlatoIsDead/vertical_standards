@@ -344,6 +344,17 @@ def test_prefix_overrides_folder_roles(env, tmp_path, monkeypatch):
     assert all(c["doc_name"] == "FO, RES Алгоритм.txt" for c in chunks)
 
 
+def test_send_converts_markdown_to_bb(monkeypatch):
+    """Протокол 05.08: Bitrix не рендерит markdown — на выходе _send BB-код.
+    БЕЗ env-фикстуры: она подменяет _send заглушкой, а тут нужен настоящий."""
+    captured = {}
+    FakeAsyncClient.routes = {"imbot.message.add": (
+        lambda payload: captured.update(payload) or {"result": 1})}
+    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeAsyncClient)
+    asyncio.run(bot._send("u1", "Напиши *Готов* и жди.", "42", "cid"))
+    assert captured["MESSAGE"] == "Напиши [b]Готов[/b] и жди."
+
+
 # ── Хук: файл документа при старте курса через "/" ───────────────────────────
 
 def test_new_session_triggers_course_file(env, monkeypatch):

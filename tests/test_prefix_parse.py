@@ -92,6 +92,29 @@ def test_empty_prefixes_config(cfg, tmp_path, monkeypatch):
     assert parsed["roles"] is None            # без блока prefixes = как раньше
 
 
+def test_client_abbreviations_full_registry(tmp_path, monkeypatch):
+    """Письмо клиента 07.08: амперсанды (F&B, S&M), смешанный регистр (Rev,
+    Pur, Fin), синонимы SAL/S&M — реальный реестр из data/roles.json."""
+    p = tmp_path / "full.json"
+    p.write_text(json.dumps({
+        "roles": {},
+        "prefixes": {"F&B": "fnb", "CAT": "catering", "S&M": "sales",
+                     "SAL": "sales", "REV": "revenue", "PUR": "purchasing",
+                     "SEC": "security", "HR": "hr"},
+        "folders": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(roles, "CONFIG_PATH", str(p))
+
+    assert roles.parse_filename("F&B, CAT Банкеты.docx")["roles"] == \
+        ["fnb", "catering"]
+    assert roles.parse_filename("S&M Продажи.docx")["roles"] == ["sales"]
+    assert roles.parse_filename("SAL Продажи.docx")["roles"] == ["sales"]
+    assert roles.parse_filename("Rev Тарифы.docx")["roles"] == ["revenue"]
+    assert roles.parse_filename("Pur, SEC Приёмка товара.docx")["roles"] == \
+        ["purchasing", "security"]
+    assert roles.parse_filename("HR Онбординг.docx")["roles"] == ["hr"]
+
+
 def test_display_name(cfg):
     assert roles.display_name("Стандарты.docx") == "Стандарты"
     assert roles.display_name(

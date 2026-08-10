@@ -48,6 +48,7 @@ from app.hr_tools import (
     apply_replacement,
     build_history_text,
     build_report_text,
+    correct_option,
     format_question_full,
     parse_replacement,
     question_by_ref,
@@ -57,6 +58,7 @@ from app.roles import ALL_STAFF, display_name, load_roles_config, parse_filename
 from app.state_machine import (
     _last_known_role,
     course_roles,
+    md_to_bb,
     process_message,
     start_onboarding,
 )
@@ -464,7 +466,7 @@ async def _send(dialog_id: str, text: str, bot_id: str = None, client_id: str = 
     payload = {
         "BOT_ID": bot_id,
         "DIALOG_ID": dialog_id,
-        "MESSAGE": text,
+        "MESSAGE": md_to_bb(text),   # Bitrix понимает BB-код, не markdown
         "CLIENT_ID": client_id,
     }
     last_exc = None
@@ -745,10 +747,10 @@ async def hr_handler(request: Request):
                     lines = [f"📋 *{course['doc_name']}*\n"]
                     lines.append("*Базовые вопросы (1–5):*")
                     for i, q in enumerate(basic, 1):
-                        lines.append(f"{i}. {q['text']} → {q['correct']}")
+                        lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
                     lines.append("\n*Экзаменационные вопросы (6–15):*")
                     for i, q in enumerate(exam, 6):
-                        lines.append(f"{i}. {q['text']} → {q['correct']}")
+                        lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
                     lines.append(f"\nДля активации: Подтвердить {course_id}")
                     lines.append(f"Изменить вопрос: Изменить {course_id} {{номер 1–15}}")
                     text = "\n".join(lines)

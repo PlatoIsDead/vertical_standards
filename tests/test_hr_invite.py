@@ -161,6 +161,22 @@ def test_invite_remembered_role_sends_course_file(env, monkeypatch):
     assert called[0] == ("u500", session["course_id"])
 
 
+def test_questions_show_correct_option_text(env):
+    """«Буковки» (протокол 05.08): «Вопросы N» показывает текст правильного
+    варианта, а не голую букву."""
+    client, sent, course_id = env
+    qjson = json.dumps({"course_summary": "s", "basic_questions": [
+        {"id": 0, "text": "Что делать при пожаре?",
+         "options": ["A. Бежать", "B. Звонить 112", "C. Прятаться", "D. Кричать"],
+         "correct": "B", "explanation": ""}], "exam_questions": []},
+        ensure_ascii=False)
+    db.update_course_questions(course_id, qjson)
+    _post_hr(client, f"Вопросы {course_id}")
+    assert _wait_for(lambda: any(m[0] == "d9" for m in sent))
+    text = next(m for m in sent if m[0] == "d9")[1]
+    assert "→ B. Звонить 112" in text
+
+
 def test_non_hr_rejected(env):
     client, sent, _ = env
     _post_hr(client, "Курсы", from_user="777", dialog="d777")

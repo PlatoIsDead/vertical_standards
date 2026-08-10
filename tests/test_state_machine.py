@@ -258,3 +258,67 @@ def test_waiting_hr_menu(env, monkeypatch):
     assert "📚 Твои курсы" in reply
     reply2 = sm.process_message("u1", "что дальше?", "d1", [], None)
     assert "Ожидаем решения HR" in reply2
+
+
+# ── Протокол 05.08: BB-код, выбор курса ──────────────────────────────────────
+
+def test_md_to_bb():
+    assert sm.md_to_bb("Напиши *Готов* или *Роль*.") == \
+        "Напиши [b]Готов[/b] или [b]Роль[/b]."
+    assert sm.md_to_bb("2 * 3 = 6") == "2 * 3 = 6"          # незакрытая — не трогаем
+    assert sm.md_to_bb("*а\nб*") == "*а\nб*"                # перенос внутри — нет
+
+
+def test_notify_hr_converts_markdown(env, monkeypatch):
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+
+    def fake_post(url, json=None, timeout=None):
+        sent.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(sm.httpx, "post", fake_post)
+    monkeypatch.setenv("BITRIX_WEBHOOK_URL", "https://x/")
+    monkeypatch.setenv("HR_USER_IDS", "9")
+    sm.notify_hr("Напиши *Допустить 5*")
+    assert sent["MESSAGE"] == "Напиши [b]Допустить 5[/b]"
+
+
+def test_switch_course(env):
+    new_id = _add_course("Правила2.docx", "d2")             # all_staff, новейший
+    std_id = db.get_course_by_doc_name("Стандарты.docx")["id"]
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)           # housekeeper → Правила2
+    assert db.get_session("u1")["course_id"] == new_id
+
+    reply = sm.process_message("u1", "Мои курсы", "d1", [], None)
+    assert "1. ⏳ Стандарты" in reply and "Выбрать" in reply
+
+    reply = sm.process_message("u1", "Выбрать 1", "d1", [], None)
+    assert "🔄 Переключил курс" in reply and "Стандарты" in reply
+    session = db.get_session("u1")
+    assert session["course_id"] == std_id
+    assert session["state"] == "READING" and session["current_q_idx"] == 0
+    # Старый курс НЕ помечен пройденным — доступен к выбору обратно
+    reply = sm.process_message("u1", "Мои курсы", "d1", [], None)
+    assert "1. ⏳ Правила2" in reply and "✅" not in reply
+
+
+def test_switch_out_of_range_shows_list(env):
+    _add_course("Правила2.docx", "d2")
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    reply = sm.process_message("u1", "Выбрать 99", "d1", [], None)
+    assert "Такого номера нет" in reply and "📚 Твои курсы" in reply
+
+
+def test_switch_forbidden_during_test(env):
+    _add_course("Правила2.docx", "d2")
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    sm.process_message("u1", "Готов", "d1", [], None)       # BASIC_TEST
+    reply = sm.process_message("u1", "Выбрать 1", "d1", [], None)
+    assert "закончи текущий тест" in reply
+    assert db.get_session("u1")["state"] == "BASIC_TEST"    # состояние не тронуто

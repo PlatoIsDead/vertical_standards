@@ -66,6 +66,14 @@ def question_by_ref(questions: dict, q_num: int) -> dict | None:
     return q_list[idx] if idx < len(q_list) else None
 
 
+def correct_option(q: dict) -> str:
+    """«A» → «A. Бежать» из options — HR видит текст правильного ответа
+    («буковки», протокол 05.08). Кривой формат варианта → буква как есть."""
+    prefix = q.get("correct", "") + "."
+    return next((o.strip() for o in q.get("options", [])
+                 if o.strip().upper().startswith(prefix)), q.get("correct", "?"))
+
+
 def format_question_full(q: dict, q_num: int) -> str:
     phase, _ = resolve_question_ref(q_num)
     label = "базовый тест" if phase == "basic" else "экзамен"
@@ -178,31 +186,43 @@ def build_history_text(employee_label: str, sessions: list[dict],
     return "\n".join(lines).strip()
 
 
+def _report_line(r: dict, employees_by_uid: dict[str, dict]) -> str:
+    emp = employees_by_uid.get(str(r["user_id"]))
+    if emp:
+        inner = ", ".join(x for x in (emp.get("work_position"),
+                                      emp.get("email")) if x)
+        label = f"{emp.get('full_name') or r['user_id']} ({inner or '—'})"
+    else:
+        label = f"ID {r['user_id']}"  # legacy-сессия без записи в employees
+    try:
+        questions = json.loads(r.get("questions_json") or "{}")
+    except json.JSONDecodeError:
+        questions = {}
+    date = (r.get("updated_at") or "")[:10]
+    line = f"• {label} — «{r['doc_name']}»: {_session_status(r, questions)}"
+    if date:
+        line += f", {date}"
+    return line
+
+
 def build_report_text(rows: list[dict], employees_by_uid: dict[str, dict]) -> str:
-    """Сводка по всем сессиям (последние 30): кто (ФИО, должность, роль),
-    курс, этап, баллы. Роль = «отдел» до №8 (аббревиатуры клиента)."""
+    """Сводка по последним 30 сессиям, сгруппированная СЕКЦИЯМИ по отделам
+    (роль сессии; роль = «отдел» до №8 — протокол 05.08 «аналитика по
+    отделам»). «Без роли» — последней. Роль в строке не дублируется."""
     if not rows:
         return "Сессий обучения пока нет."
+    shown = rows[:30]
+    groups: dict[str, list[dict]] = {}
+    for r in shown:
+        groups.setdefault(r.get("role") or "", []).append(r)
+    ordered = sorted((k for k in groups if k), key=role_name)
+    if "" in groups:
+        ordered.append("")
     lines = ["📊 Отчёт по обучению:", ""]
-    for r in rows[:30]:
-        emp = employees_by_uid.get(str(r["user_id"]))
-        if emp:
-            inner = ", ".join(x for x in (emp.get("work_position"),
-                                          emp.get("email")) if x)
-            label = f"{emp.get('full_name') or r['user_id']} ({inner or '—'})"
-        else:
-            label = f"ID {r['user_id']}"  # legacy-сессия без записи в employees
-        if r.get("role"):
-            label += f" · {role_name(r['role'])}"
-        try:
-            questions = json.loads(r.get("questions_json") or "{}")
-        except json.JSONDecodeError:
-            questions = {}
-        date = (r.get("updated_at") or "")[:10]
-        line = f"• {label} — «{r['doc_name']}»: {_session_status(r, questions)}"
-        if date:
-            line += f", {date}"
-        lines.append(line)
+    for role in ordered:
+        lines.append(f"— {role_name(role) if role else 'Без роли'} —")
+        lines += [_report_line(r, employees_by_uid) for r in groups[role]]
+        lines.append("")
     if len(rows) > 30:
-        lines += ["", f"…показаны последние 30 сессий из {len(rows)}"]
-    return "\n".join(lines)
+        lines.append(f"…показаны последние 30 сессий из {len(rows)}")
+    return "\n".join(lines).strip()

@@ -146,8 +146,9 @@ def test_report_labels():
     assert "ID 42" in text and "сдаёт экзамен" in text
 
 
-def test_report_label_with_position_and_role(tmp_path, monkeypatch):
-    """Демо-фидбек C: ФИО (должность, email) · РольРус."""
+def test_report_label_with_position_and_role_section(tmp_path, monkeypatch):
+    """Демо-фидбек C + протокол 05.08: ФИО (должность, email), роль —
+    заголовком секции (не дублируется в строке)."""
     import json as _json
 
     import app.roles as roles
@@ -162,7 +163,40 @@ def test_report_label_with_position_and_role(tmp_path, monkeypatch):
                     "email": "ivan@x.ru", "work_position": "Администратор"}}
     row = dict(_row("500", "READING"), role="reservations")
     text = build_report_text([row], emps)
-    assert "Иван Иванов (Администратор, ivan@x.ru) · Отдел бронирования" in text
+    assert "— Отдел бронирования —" in text
+    assert "Иван Иванов (Администратор, ivan@x.ru)" in text
+    assert "· Отдел бронирования" not in text        # в строке не дублируется
+
+
+def test_report_grouped_by_role(tmp_path, monkeypatch):
+    import json as _json
+
+    import app.roles as roles
+    cfg = tmp_path / "roles.json"
+    cfg.write_text(_json.dumps({
+        "roles": {"reservations": "Отдел бронирования",
+                  "housekeeper": "Горничные"},
+        "prefixes": {}, "folders": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(roles, "CONFIG_PATH", str(cfg))
+
+    rows = [dict(_row("1", "READING"), role="reservations"),
+            dict(_row("2", "READING"), role="housekeeper"),
+            _row("3", "READING")]                     # без роли
+    text = build_report_text(rows, {})
+    assert "— Горничные —" in text and "— Отдел бронирования —" in text
+    assert text.rstrip().split("\n")[-2] == "— Без роли —"  # секция последняя
+    assert text.count("•") == 3
+
+
+def test_correct_option():
+    from app.hr_tools import correct_option
+    q = {"correct": "B", "options": ["A. Бежать", "B. Звонить 112", "C. Ждать",
+                                    "D. Кричать"]}
+    assert correct_option(q) == "B. Звонить 112"
+    assert correct_option({"correct": "A", "options": ["1) кривой формат"]}) == "A"
+    assert correct_option({"correct": "C", "options": ["c. нижний регистр"]}) == \
+        "c. нижний регистр"
 
 
 def test_report_truncates_to_30():

@@ -46,6 +46,16 @@ from app.roles import (
 
 load_dotenv()
 
+# Чат Bitrix НЕ рендерит markdown (протокол 05.08, «артефакты-буковки») —
+# конвертация *x* → [b]x[/b] СТРОГО на выходе (_send / notify_hr), внутренние
+# тексты остаются со звёздочками. Незакрытая * и переносы внутри не трогаются.
+_BOLD_RE = re.compile(r"\*([^*\n]+)\*")
+
+
+def md_to_bb(text: str) -> str:
+    """*жирный* → [b]жирный[/b] для imbot.message.add (BB-код Bitrix)."""
+    return _BOLD_RE.sub(r"[b]\1[/b]", text)
+
 
 def process_message(user_id: str, message: str, dialog_id: str,
                      chunks: list, embeddings) -> str:
@@ -277,8 +287,10 @@ def _start_reading(session: dict, course: dict) -> str:
     return "\n".join(lines)
 
 
-def _my_courses_text(user_id: str, role_id: str | None) -> str:
-    """«Мои курсы»: список активных курсов роли со статусами (демо-фидбек B)."""
+def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
+    """«Мои курсы»: текст списка + курсы, ДОСТУПНЫЕ к выбору (не текущий,
+    не пройденные). Нумерация в тексте = индексы списка — единый источник
+    для «Выбрать N» (протокол 05.08: выбор курса сотрудником)."""
     courses = get_active_courses()
     done = _done_course_ids(user_id)
     session = get_session(user_id)
@@ -286,7 +298,9 @@ def _my_courses_text(user_id: str, role_id: str | None) -> str:
     mine = [c for c in courses
             if role_id is None or {role_id, ALL_STAFF} & set(course_roles(c))]
     if not mine:
-        return "Для твоей роли пока нет активных курсов."
+        return "Для твоей роли пока нет активных курсов.", []
+    selectable = [c for c in mine
+                  if c["id"] != current_id and c["id"] not in done]
     lines = ["📚 Твои курсы:", ""]
     for c in mine:
         name = display_name(c["doc_name"])
@@ -295,17 +309,41 @@ def _my_courses_text(user_id: str, role_id: str | None) -> str:
         elif c["id"] in done:
             lines.append(f"✅ {name} — пройден")
         else:
-            lines.append(f"⏳ {name} — будет предложен после текущего")
-    return "\n".join(lines)
+            lines.append(f"{selectable.index(c) + 1}. ⏳ {name}")
+    if selectable:
+        lines += ["", "Переключиться на другой курс: напиши *Выбрать {номер}*."]
+    return "\n".join(lines), selectable
+
+
+def _my_courses_text(user_id: str, role_id: str | None) -> str:
+    return my_courses(user_id, role_id)[0]
 
 
 _MENU_COMMANDS = ("мои курсы", "курсы", "меню")
+_SWITCH_RE = re.compile(r"^выбрать\s+(\d+)$")
+
+
+def _handle_course_switch(session: dict, n: int) -> str:
+    """«Выбрать N»: переключение текущей READING-сессии на другой курс.
+    Старый курс НЕ помечается пройденным (done — только через экзамен)."""
+    text, selectable = my_courses(session["user_id"], session.get("role"))
+    if not selectable:
+        return text
+    if not (1 <= n <= len(selectable)):
+        return f"Такого номера нет.\n\n{text}"
+    course = selectable[n - 1]
+    update_session(session["id"], course_id=course["id"],
+                   state="READING", q_idx=0)
+    return "🔄 Переключил курс.\n\n" + _start_reading(session, course)
 
 
 def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> str:
     cmd = message.strip().lower()
     if cmd in _MENU_COMMANDS:
         return _my_courses_text(session["user_id"], session.get("role"))
+    m_switch = _SWITCH_RE.match(cmd)
+    if m_switch:
+        return _handle_course_switch(session, int(m_switch.group(1)))
     if cmd == "роль":
         update_session(session["id"], state="ROLE_SELECT")
         return _start_role_select()
@@ -343,6 +381,11 @@ def _handle_test(session: dict, message: str, phase: str) -> str:
         return _finish_phase(session, phase, questions)
 
     current_q = q_list[q_idx]
+
+    if message.strip().lower().startswith("выбрать"):
+        return ("⏳ Сначала закончи текущий тест — ответь на вопрос буквой A–D.\n\n"
+                + format_question(current_q, q_idx, total, phase))
+
     letter = parse_answer(message)
 
     if letter is None:
@@ -441,8 +484,12 @@ def _finish_phase(session: dict, phase: str, questions: dict,
 
 
 def _handle_waiting_hr(session: dict, message: str) -> str:
-    if message.strip().lower() in _MENU_COMMANDS:
+    cmd = message.strip().lower()
+    if cmd in _MENU_COMMANDS:
         return _my_courses_text(session["user_id"], session.get("role"))
+    if cmd.startswith("выбрать"):
+        return ("⏳ Дождись решения HR по текущему курсу — "
+                "потом можно будет переключиться.")
     return ("⏳ Ожидаем решения HR о допуске к экзамену. Скоро получишь уведомление.\n"
             "Посмотреть свои курсы: *Мои курсы*")
 
@@ -520,7 +567,7 @@ def notify_hr(message: str) -> None:
                 resp = httpx.post(
                     webhook_url + "imbot.message.add",
                     json={"BOT_ID": bot_id, "DIALOG_ID": f"u{hr_id}",
-                          "MESSAGE": message, "CLIENT_ID": client_id},
+                          "MESSAGE": md_to_bb(message), "CLIENT_ID": client_id},
                     timeout=15.0,
                 )
                 print(f"[notify_hr] → HR {hr_id}: {resp.status_code} (attempt {attempt})")
