@@ -92,6 +92,21 @@ def init_db() -> None:
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS managers (
+                email    TEXT PRIMARY KEY,
+                level    INTEGER NOT NULL DEFAULT 1,
+                added_by TEXT,
+                added_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS escalations (
+                user_id     TEXT NOT NULL,
+                course_id   INTEGER NOT NULL,
+                stage       INTEGER NOT NULL,
+                notified_at TEXT,
+                PRIMARY KEY (user_id, course_id, stage)
+            );
         """)
         _ensure_column(conn, "sessions", "role", "TEXT")
         # №4: архив курса при удалении файла; детект новой версии при том же file_id
@@ -120,6 +135,21 @@ def init_db() -> None:
                     " VALUES (?, 'hr-seed')",
                     (uid.strip(),),
                 )
+        # №9: временный сид реестра руководителей (клиент заменит HR-командами)
+        conn.execute(
+            "INSERT OR IGNORE INTO managers (email, added_by) VALUES (?, 'seed')",
+            ("n.sharapov@proptech.digital",),
+        )
+        # №9: baseline дедлайнов — ОДИН раз при первом старте после деплоя:
+        # сроки существующих курсов тикают с этой даты, а не с approved_at
+        # (иначе всё старое «просрочено» пачкой в день деплоя)
+        if conn.execute(
+            "SELECT value FROM meta WHERE key = 'deadlines_baseline'"
+        ).fetchone() is None:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('deadlines_baseline', ?)",
+                (datetime.utcnow().isoformat(),),
+            )
 
 
 # ── Courses ──────────────────────────────────────────────────────────────────
@@ -444,6 +474,75 @@ def get_employee(bitrix_uid: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute(
             "SELECT * FROM employees WHERE bitrix_uid = ?", (str(bitrix_uid),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ── Managers + escalations (№9: реестр руководителей, дедлайны) ──────────────
+
+def add_manager(email: str, added_by: str = None, level: int = 1) -> bool:
+    """False = уже в реестре (INSERT OR IGNORE). level: 1 руководитель, 2 «выше»."""
+    with _conn() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO managers (email, level, added_by, added_at)
+               VALUES (?, ?, ?, ?)""",
+            (email.strip().lower(), level, added_by,
+             datetime.utcnow().isoformat()),
+        )
+        return cur.rowcount > 0
+
+
+def remove_manager(email: str) -> bool:
+    with _conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM managers WHERE email = ?", (email.strip().lower(),)
+        )
+        return cur.rowcount > 0
+
+
+def get_managers() -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM managers ORDER BY level, added_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_escalated(stage: int) -> set:
+    """Пары (user_id, course_id), уже эскалированные на этой ступени."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT user_id, course_id FROM escalations WHERE stage = ?", (stage,)
+        ).fetchall()
+        return {(str(r["user_id"]), r["course_id"]) for r in rows}
+
+
+def mark_escalated(user_id: str, course_id: int, stage: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO escalations
+               (user_id, course_id, stage, notified_at) VALUES (?, ?, ?, ?)""",
+            (str(user_id), course_id, stage, datetime.utcnow().isoformat()),
+        )
+
+
+def delete_session_answers(session_id: int, phase: str) -> None:
+    """Стереть ответы фазы (пересдача: только exam — basic не трогается)."""
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM answers WHERE session_id = ? AND phase = ?",
+            (session_id, phase),
+        )
+
+
+def get_last_done_session(user_id: str) -> dict | None:
+    """Последняя завершённая сессия НАСТОЯЩЕГО курса (course_id=0 — служебные
+    маркеры «нет курсов для роли» из №11, их не пересдают)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE user_id = ? AND state = 'DONE'"
+            " AND course_id != 0 ORDER BY id DESC LIMIT 1",
+            (str(user_id),),
         ).fetchone()
         return dict(row) if row else None
 

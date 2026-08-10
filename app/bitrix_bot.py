@@ -3,22 +3,28 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
 import app.index_store as index_store
-from app import gamification
+from app import deadlines, gamification
 from app.db import (
     activate_course_by_id,
     add_employee,
+    add_manager,
+    get_active_courses,
     count_processed_by_doc_name,
     get_all_employees,
     get_course_by_doc_name,
     get_course_by_id,
     get_course_questions,
     get_employee_by_email,
+    get_escalated,
+    get_managers,
+    get_meta,
     get_pending_courses,
     get_processed_by_folders,
     get_processed_file,
@@ -32,12 +38,15 @@ from app.db import (
     is_employee_allowed,
     is_file_processed,
     is_user_seen,
+    mark_escalated,
     mark_file_processed,
     mark_user_seen,
+    remove_manager,
     remove_processed_file,
     save_draft_course,
     seen_users_empty,
     set_course_archived,
+    set_meta,
     update_course_questions,
     update_session_by_user,
     update_user_departments,
@@ -77,6 +86,10 @@ HR_CLIENT_ID = os.getenv("HR_CLIENT_ID", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "300"))  # default 5 min
 USER_POLL_INTERVAL = int(os.getenv("USER_POLL_INTERVAL_SEC", "600"))  # опрос отделов
 RATING_CHECK_INTERVAL = 3600  # ежечасная проверка «пора ли постить рейтинг» (№5)
+# №9: неделя на курс; напоминания раз в день; эскалация ступень 2 = 2 срока
+ESCALATION_DAYS = int(os.getenv("ESCALATION_DAYS", "7"))
+REMINDER_HOUR_MSK = int(os.getenv("REMINDER_HOUR_MSK", "9"))
+ESCALATION_CHECK_INTERVAL = 3600
 
 # Initialise DB and load RAG index at startup
 init_db()
@@ -86,6 +99,8 @@ chunks, embeddings = load_index()
 _poller_task = None
 _user_poller_task = None
 _rating_task = None
+_reminder_task = None
+_escalation_task = None
 _processing: set[str] = set()  # file IDs currently being processed
 
 # Dedup of inbound messages: retried sends delay replies, so users resend the same
@@ -101,7 +116,7 @@ _pending_edits: dict[str, dict] = {}
 # Начало любого из этих слов = команда; при живом pending команда важнее правки
 _HR_COMMAND_PREFIXES = ("курсы", "курс", "список", "подтвердить", "допустить",
                         "пригласить", "вопросы", "изменить", "история",
-                        "отчёт", "отчет")
+                        "отчёт", "отчет", "руководители", "руководитель")
 
 
 def _get_pending(user_id: str) -> dict | None:
@@ -132,9 +147,125 @@ def _is_duplicate(user_id: str, dialog_id: str, question: str) -> bool:
 @app.on_event("startup")
 async def start_disk_poller():
     global _poller_task, _user_poller_task, _rating_task
+    global _reminder_task, _escalation_task
     _poller_task = asyncio.create_task(_disk_poll_loop())
     _user_poller_task = asyncio.create_task(_user_poll_loop())
     _rating_task = asyncio.create_task(_weekly_rating_loop())
+    _reminder_task = asyncio.create_task(_reminder_loop())
+    _escalation_task = asyncio.create_task(_escalation_loop())
+
+
+# ── №9: дедлайны — напоминания сотрудникам и эскалации руководителям ─────────
+
+def _deadline_items() -> list[dict]:
+    """Незакрытые назначения с дедлайнами (sync — звать через to_thread)."""
+    baseline = get_meta("deadlines_baseline") or ""
+    employees = get_all_employees()
+    courses = get_active_courses()          # архивные уже исключены
+    sessions_by_uid = {str(e["bitrix_uid"]):
+                       get_sessions_by_user(str(e["bitrix_uid"]))
+                       for e in employees}
+    roles_by_uid = {str(e["bitrix_uid"]): _last_known_role(str(e["bitrix_uid"]))
+                    for e in employees}
+    return deadlines.assignments_with_deadlines(
+        employees, courses, sessions_by_uid, roles_by_uid,
+        baseline, datetime.utcnow(), ESCALATION_DAYS)
+
+
+async def _reminder_loop():
+    print(f"[reminder] Started — daily ~{REMINDER_HOUR_MSK}:00 МСК "
+          f"(check hourly), deadline {ESCALATION_DAYS}d")
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await _maybe_send_reminders()
+        except Exception as exc:
+            print(f"[reminder] ERROR: {exc!r}")
+
+
+async def _maybe_send_reminders(now_utc: "datetime | None" = None):
+    """Раз в день после REMINDER_HOUR_MSK: каждому сотруднику — его
+    непройденные курсы с остатком дней. Идемпотентность — meta-дата (МСК)."""
+    now_utc = now_utc or datetime.utcnow()
+    now_msk = now_utc + timedelta(hours=3)
+    if now_msk.hour < REMINDER_HOUR_MSK:
+        return
+    today = now_msk.date().isoformat()
+    if await asyncio.to_thread(get_meta, "reminder_last_date") == today:
+        return
+    items = await asyncio.to_thread(_deadline_items)
+    by_uid: dict[str, list] = {}
+    for it in items:
+        by_uid.setdefault(it["uid"], []).append(it)
+    sent = 0
+    for uid, uid_items in by_uid.items():
+        text = deadlines.build_reminder_text(uid_items)
+        if text:
+            await _send(f"u{uid}", text, BOT_ID)
+            sent += 1
+    # Метка ПОСЛЕ отправки: упали посреди — следующий час дошлёт (риск
+    # частичного дубля меньше, чем потерянный день напоминаний)
+    await asyncio.to_thread(set_meta, "reminder_last_date", today)
+    print(f"[reminder] sent to {sent} employees")
+
+
+async def _escalation_loop():
+    print(f"[escalation] Started — stage1 {ESCALATION_DAYS}d / "
+          f"stage2 {2 * ESCALATION_DAYS}d, check hourly")
+    while True:
+        await asyncio.sleep(ESCALATION_CHECK_INTERVAL)
+        try:
+            await _check_escalations()
+        except Exception as exc:
+            print(f"[escalation] ERROR: {exc!r}")
+
+
+async def _check_escalations(now_utc: "datetime | None" = None):
+    now_utc = now_utc or datetime.utcnow()
+    items = await asyncio.to_thread(_deadline_items)
+    if not items:
+        return
+    employees = {str(e["bitrix_uid"]): e
+                 for e in await asyncio.to_thread(get_all_employees)}
+    managers = await asyncio.to_thread(get_managers)
+    for stage in (1, 2):
+        already = await asyncio.to_thread(get_escalated, stage)
+        due = deadlines.find_due_escalations(items, already, stage, now_utc,
+                                             ESCALATION_DAYS)
+        if not due:
+            continue
+        text = deadlines.build_escalation_message(due, employees, stage,
+                                                  ESCALATION_DAYS)
+        recipients = [m for m in managers
+                      if m["level"] == (1 if stage == 1 else 2)]
+        fallback_l1 = stage == 2 and not recipients
+        if fallback_l1:
+            recipients = [m for m in managers if m["level"] == 1]
+        resolved, missing = [], []
+        for m in recipients:
+            # httpx.HTTPError НЕ ловим точечно: транзиентный сбой прерывает
+            # весь цикл (уйдёт в _escalation_loop) — эскалации не помечены,
+            # следующий час доставит
+            user = await _bitrix_user_by_email(m["email"])
+            (resolved if user else missing).append((m["email"], user))
+        for _email, user in resolved:
+            await _send(f"u{user['ID']}", text, HR_BOT_ID)
+        if missing or not resolved or fallback_l1:
+            note = ""
+            if missing:
+                note += ("⚠️ Не найдены на портале: "
+                         + ", ".join(e for e, _ in missing) + "\n")
+            if fallback_l1:
+                note += ("ℹ️ Старших руководителей в реестре нет — "
+                         "эскалация 2-й ступени уходит руководителям.\n")
+            for hr_id in _hr_ids():
+                await _send(str(hr_id), (note + "\n" + text) if note else text,
+                            HR_BOT_ID)
+        for it in due:                       # помечаем ПОСЛЕ доставки
+            await asyncio.to_thread(mark_escalated, it["uid"],
+                                    it["course"]["id"], stage)
+        print(f"[escalation] stage {stage}: {len(due)} пар, "
+              f"{len(resolved)} руководителей")
 
 
 async def _weekly_rating_loop():
@@ -836,6 +967,33 @@ async def hr_handler(request: Request):
                      for e in await asyncio.to_thread(get_all_employees)}
         text = build_report_text(rows, employees)
 
+    elif msg_lower.startswith("руководител"):
+        parts = question.split()
+        email = _extract_email(question)
+        sub = parts[1].lower() if len(parts) >= 2 else ""
+        if len(parts) == 1:
+            managers = await asyncio.to_thread(get_managers)
+            if managers:
+                mlines = ["👥 Руководители (получают эскалации):"]
+                for m in managers:
+                    tag = " (старший)" if m["level"] == 2 else ""
+                    mlines.append(f"• {m['email']}{tag}")
+                text = "\n".join(mlines)
+            else:
+                text = "Реестр руководителей пуст."
+        elif sub == "добавить" and email:
+            level = 2 if "старш" in msg_lower else 1
+            added = await asyncio.to_thread(add_manager, email, user_id, level)
+            text = (f"✅ {email} добавлен{' (старший)' if level == 2 else ''}."
+                    if added else f"ℹ️ {email} уже в списке.")
+        elif sub == "удалить" and email:
+            removed = await asyncio.to_thread(remove_manager, email)
+            text = (f"✅ {email} удалён." if removed
+                    else f"⚠️ {email} не найден в списке.")
+        else:
+            text = ("❌ Формат: Руководители | Руководитель добавить {email} "
+                    "[старший] | Руководитель удалить {email}")
+
     else:
         text = (
             "Доступные команды:\n"
@@ -846,7 +1004,9 @@ async def hr_handler(request: Request):
             "• *Пригласить {email}* — дать доступ и начать обучение\n"
             "• *Допустить {email или ID}* — допустить сотрудника к экзамену\n"
             "• *История {email или ID}* — вопросы и ответы сотрудника\n"
-            "• *Отчёт* — сводка: кто прошёл обучение и с каким результатом"
+            "• *Отчёт* — сводка: кто прошёл обучение и с каким результатом\n"
+            "• *Руководители* — реестр получателей эскалаций\n"
+            "• *Руководитель добавить/удалить {email} [старший]* — правка реестра"
         )
 
     asyncio.create_task(_send(dialog_id, text, HR_BOT_ID, client_id))

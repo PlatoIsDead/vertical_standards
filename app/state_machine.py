@@ -21,10 +21,12 @@ from dotenv import load_dotenv
 
 from app.db import (
     create_session,
+    delete_session_answers,
     get_active_courses,
     get_course_by_id,
     get_course_questions,
     get_employee,
+    get_last_done_session,
     get_session,
     get_session_answers,
     get_session_by_id,
@@ -73,6 +75,16 @@ def process_message(user_id: str, message: str, dialog_id: str,
                 "🔒 Доступ к обучению открывает HR-менеджер.\n"
                 "Обратись к нему, чтобы начать обучение."
             )
+        # №9: пересдача и развилка после провала — ДО назначения нового курса
+        # (иначе любое сообщение молча назначит следующий курс, и «Пересдать»
+        # уйдёт в RAG).
+        cmd = message.strip().lower()
+        if cmd in ("пересдать", "пересдача"):
+            return _handle_retake(user_id)
+        if cmd != "далее":
+            fork = _retake_fork_text(user_id)
+            if fork:
+                return fork
         active_courses = get_active_courses()
         if not active_courses:
             return (
@@ -138,6 +150,51 @@ def start_onboarding(user_id: str, dialog_id: str) -> str | None:
                 "За новым обучением обратись к HR.")
     session = create_session(user_id, dialog_id, course["id"])
     return _start_reading(session, course)
+
+
+# ── Пересдача экзамена (№9) ──────────────────────────────────────────────────
+
+def _exam_pass_threshold(questions: dict) -> int:
+    return round(len(questions.get("exam_questions", [])) * 0.7)
+
+
+def _retake_fork_text(user_id: str) -> str | None:
+    """Развилка после провала: последняя завершённая сессия не сдана →
+    предложить «Пересдать / Далее» вместо молчаливого назначения следующего
+    курса (№11 назначал бы его любым сообщением)."""
+    last = get_last_done_session(user_id)
+    if last is None:
+        return None
+    questions = get_course_questions(last["course_id"])
+    exam_q = questions.get("exam_questions", [])
+    if not exam_q or last["score_exam"] >= _exam_pass_threshold(questions):
+        return None
+    course = get_course_by_id(last["course_id"])
+    name = display_name(course["doc_name"]) if course else "прошлый курс"
+    return (f"📝 Ты не сдал экзамен «{name}» "
+            f"({last['score_exam']}/{len(exam_q)}).\n"
+            "Напиши *Пересдать* — пройти экзамен ещё раз, "
+            "или *Далее* — перейти к следующему курсу.")
+
+
+def _handle_retake(user_id: str) -> str:
+    last = get_last_done_session(user_id)
+    if last is None:
+        return ("У тебя нет завершённого экзамена. Напиши любое сообщение, "
+                "чтобы начать обучение.")
+    questions = get_course_questions(last["course_id"])
+    exam_q = questions.get("exam_questions", [])
+    if not exam_q:
+        return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
+    if last["score_exam"] >= _exam_pass_threshold(questions):
+        return (f"🎉 Экзамен уже сдан ({last['score_exam']}/{len(exam_q)}). "
+                "Пересдача не нужна.")
+    # ЛОВУШКА answers: _finish_phase считает ВСЕ строки фазы — без удаления
+    # старых ответов две попытки схлопнулись бы в один счёт.
+    delete_session_answers(last["id"], "exam")
+    update_session(last["id"], state="EXAM", q_idx=0, score_exam=0)
+    return ("🔁 Пересдача экзамена — вперёд!\n\n"
+            + format_question(exam_q[0], 0, len(exam_q), "exam"))
 
 
 # ── Назначение курса по роли (№11: префиксы в имени файла) ────────────────────
@@ -344,6 +401,11 @@ def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> st
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    if cmd in ("пересдать", "пересдача"):
+        # Реактивация DONE-сессии при живой текущей дала бы ДВЕ активные —
+        # get_session вернул бы не ту. Пересдача — только между курсами.
+        return ("Сначала закончи текущий курс — пересдать прошлый экзамен "
+                "можно будет после него.")
     if cmd == "роль":
         update_session(session["id"], state="ROLE_SELECT")
         return _start_role_select()
@@ -475,11 +537,13 @@ def _finish_phase(session: dict, phase: str, questions: dict,
         # передаём свежий correct_count. Функция глотает ошибки: экзамен не роняем.
         post_exam_congratulation(session["user_id"], questions,
                                  correct_count, basic_score)
+    retake_hint = ("" if passed else
+                   "\nНапиши *Пересдать*, чтобы пройти экзамен ещё раз.")
     return prefix + (
         f"🎓 Экзамен завершён!\n\n"
         f"Экзамен: *{correct_count}/{total}* — {grade}\n"
         f"Базовый тест: {basic_score}/{basic_total}\n\n"
-        "Результаты отправлены HR. Спасибо!"
+        "Результаты отправлены HR. Спасибо!" + retake_hint
     )
 
 

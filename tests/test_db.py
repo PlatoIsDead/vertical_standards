@@ -176,6 +176,51 @@ def test_hr_seed_empty_env_noop(tmp_path, monkeypatch):
     assert db.get_all_employees() == []
 
 
+# ── №9 v2: baseline, реестр руководителей, эскалации ─────────────────────────
+
+def test_deadlines_baseline_set_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+    first = db.get_meta("deadlines_baseline")
+    assert first
+    db.init_db()
+    assert db.get_meta("deadlines_baseline") == first        # не перезаписан
+
+
+def test_managers_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+    assert db.get_managers()[0]["email"] == "n.sharapov@proptech.digital"  # сид
+    assert db.add_manager("Chief@X.ru", "9", level=2)         # нормализация
+    assert not db.add_manager("chief@x.ru", "9")              # дубль
+    assert db.get_managers()[-1]["level"] == 2
+    assert db.remove_manager("chief@x.ru")
+    assert not db.remove_manager("chief@x.ru")
+
+
+def test_escalations_marked_per_stage(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+    db.mark_escalated("10", 1, 1)
+    db.mark_escalated("10", 1, 1)                             # идемпотентно
+    assert db.get_escalated(1) == {("10", 1)}
+    assert db.get_escalated(2) == set()
+
+
+def test_last_done_session_skips_marker(tmp_path, monkeypatch):
+    """Маркеры «нет курсов» (course_id=0) не считаются пересдаваемыми."""
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+    cid = db.save_draft_course("Док.docx", "1", "{}")
+    db.create_session("u1", "d1", cid, state="DONE")
+    db.create_session("u1", "d1", 0, state="DONE")            # маркер позже
+    assert db.get_last_done_session("u1")["course_id"] == cid
+
+
 def test_update_session_course_id(tmp_path, monkeypatch):
     """Сентинел 0 на этапе ROLE_SELECT → реальный курс после выбора роли."""
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "new.db"))
