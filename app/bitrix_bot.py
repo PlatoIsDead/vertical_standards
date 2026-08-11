@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -62,10 +63,19 @@ from app.hr_tools import (
     parse_replacement,
     question_by_ref,
 )
+from app import keyboards
 from app.rag import load_index
-from app.roles import ALL_STAFF, display_name, load_roles_config, parse_filename
+from app.report_excel import build_report_xlsx
+from app.roles import (
+    ALL_STAFF,
+    display_name,
+    load_roles_config,
+    parse_filename,
+    selectable_roles,
+)
 from app.state_machine import (
     _last_known_role,
+    _retake_fork_text,
     course_roles,
     md_to_bb,
     process_message,
@@ -90,6 +100,11 @@ RATING_CHECK_INTERVAL = 3600  # ежечасная проверка «пора �
 ESCALATION_DAYS = int(os.getenv("ESCALATION_DAYS", "7"))
 REMINDER_HOUR_MSK = int(os.getenv("REMINDER_HOUR_MSK", "9"))
 ESCALATION_CHECK_INTERVAL = 3600
+# №10: ПРИВАТНАЯ папка Диска для xlsx-отчётов (ФИО+результаты — не класть
+# в MONITOR_FOLDER_ID, её видят сотрудники). Пусто = отчёт только текстом.
+REPORTS_FOLDER_ID = os.getenv("REPORTS_FOLDER_ID", "")
+# №7: инлайн-кнопки employee-бота — выключены до живой проверки на сервере
+BUTTONS_ENABLED = os.getenv("BUTTONS_ENABLED", "0") == "1"
 
 # Initialise DB and load RAG index at startup
 init_db()
@@ -586,7 +601,8 @@ async def _notify_hr_about_user(user: dict, transfer: bool):
         await _send(str(hr_id), text, HR_BOT_ID)
 
 
-async def _send(dialog_id: str, text: str, bot_id: str = None, client_id: str = "") -> None:
+async def _send(dialog_id: str, text: str, bot_id: str = None,
+                client_id: str = "", keyboard: list | None = None) -> None:
     # Network to portal.becar.ru flaps (ConnectTimeout then 200 within seconds),
     # so retry with backoff to land in a live window instead of dropping the reply.
     bot_id = bot_id or BOT_ID
@@ -600,6 +616,8 @@ async def _send(dialog_id: str, text: str, bot_id: str = None, client_id: str = 
         "MESSAGE": md_to_bb(text),   # Bitrix понимает BB-код, не markdown
         "CLIENT_ID": client_id,
     }
+    if keyboard:                     # №7: ключ отсутствует вовсе при None
+        payload["KEYBOARD"] = keyboard
     last_exc = None
     for attempt in range(1, 6):  # up to 5 attempts: backoff 2,4,6,8s
         try:
@@ -615,6 +633,54 @@ async def _send(dialog_id: str, text: str, bot_id: str = None, client_id: str = 
             if attempt < 5:
                 await asyncio.sleep(2 * attempt)
     print(f"BITRIX SEND ERROR after 5 attempts (dialog={dialog_id}): {last_exc!r}")
+
+
+async def _handle_employee_message(user_id: str, question: str,
+                                   dialog_id: str, client_id: str,
+                                   bot_id: str = None) -> None:
+    """Общий путь employee-бота: текст из чата ("/") и нажатие кнопки
+    ("/command", №7) обрабатываются одинаково."""
+    if _is_duplicate(user_id, dialog_id, question):
+        print(f"DEDUP skip (dialog={dialog_id}): {question!r}")
+        return
+
+    # №11: сессия может появиться с course_id=0 (этап выбора роли) — файл
+    # документа шлём в момент НАЗНАЧЕНИЯ курса, а не появления сессии.
+    before = await asyncio.to_thread(get_session, user_id)
+    try:
+        text = await asyncio.to_thread(
+            process_message, user_id, question, dialog_id, chunks, embeddings
+        )
+    except Exception as exc:
+        import traceback
+        print(f"process_message ERROR: {exc}\n{traceback.format_exc()}")
+        text = (
+            "⚠️ Сервис ИИ временно недоступен из-за проблем со связью. "
+            "Попробуй, пожалуйста, ещё раз через минуту."
+        )
+
+    # Курс назначен этим сообщением → приложить файл документа (№4)
+    after = None
+    if not (before and before["course_id"]):
+        after = await asyncio.to_thread(get_session, user_id)
+        if after and after["course_id"]:
+            asyncio.create_task(
+                _send_course_file(dialog_id, after["course_id"])
+            )
+
+    # №7: клавиатура — по СВЕЖЕМУ состоянию сессии (FSM не трогаем)
+    keyboard = None
+    if BUTTONS_ENABLED:
+        if after is None:
+            after = await asyncio.to_thread(get_session, user_id)
+        fork = False
+        if after is None:
+            fork = (await asyncio.to_thread(_retake_fork_text, user_id)
+                    is not None)
+        keyboard = keyboards.for_session(after, fork, selectable_roles())
+
+    asyncio.create_task(_send(dialog_id, text, bot_id or BOT_ID, client_id,
+                              keyboard=keyboard))
 
 
 @app.post("/")
@@ -636,35 +702,34 @@ async def bot_handler(request: Request):
     if not question or not dialog_id:
         return {"status": "ok"}
 
-    if _is_duplicate(user_id, dialog_id, question):
-        print(f"DEDUP skip (dialog={dialog_id}): {question!r}")
-        return {"status": "ok"}
+    await _handle_employee_message(user_id, question, dialog_id, client_id,
+                                   bot_id)
+    return {"status": "ok"}
 
-    # ── Employee onboarding / RAG ─────────────────────────────────────────────
-    # №11: сессия может появиться с course_id=0 (этап выбора роли) — файл
-    # документа шлём в момент НАЗНАЧЕНИЯ курса, а не появления сессии.
-    before = await asyncio.to_thread(get_session, user_id)
-    try:
-        text = await asyncio.to_thread(
-            process_message, user_id, question, dialog_id, chunks, embeddings
-        )
-    except Exception as exc:
-        import traceback
-        print(f"process_message ERROR: {exc}\n{traceback.format_exc()}")
-        text = (
-            "⚠️ Сервис ИИ временно недоступен из-за проблем со связью. "
-            "Попробуй, пожалуйста, ещё раз через минуту."
-        )
 
-    # Курс назначен этим сообщением → приложить файл документа (№4)
-    if not (before and before["course_id"]):
-        after = await asyncio.to_thread(get_session, user_id)
-        if after and after["course_id"]:
-            asyncio.create_task(
-                _send_course_file(dialog_id, after["course_id"])
-            )
+@app.post("/command")
+async def command_handler(request: Request):
+    """ONIMCOMMANDADD: нажатие кнопки (№7). Формат полей в выжимке доков не
+    описан — логируем ВСЁ, поля достаём двумя известными путями; расхождение
+    правится по живому логу."""
+    form = await request.form()
+    event = (form.get("event") or "").upper()
+    print(f"[command] event={event!r} fields={dict(form)}")
+    if event != "ONIMCOMMANDADD":
+        return {"status": "ignored"}
 
-    asyncio.create_task(_send(dialog_id, text, bot_id, client_id))
+    params = (form.get("data[COMMAND][0][COMMAND_PARAMS]")
+              or form.get("data[PARAMS][COMMAND_PARAMS]") or "").strip()
+    dialog_id = (form.get("data[COMMAND][0][DIALOG_ID]")
+                 or form.get("data[PARAMS][DIALOG_ID]") or "")
+    user_id = (form.get("data[COMMAND][0][USER_ID]")
+               or form.get("data[USER][ID]") or "").strip()
+    client_id = form.get("auth[application_token]", "")
+
+    if not params or not dialog_id or not user_id:
+        return {"status": "no_data"}
+
+    await _handle_employee_message(user_id, params, dialog_id, client_id)
     return {"status": "ok"}
 
 
@@ -966,6 +1031,13 @@ async def hr_handler(request: Request):
         employees = {e["bitrix_uid"]: e
                      for e in await asyncio.to_thread(get_all_employees)}
         text = build_report_text(rows, employees)
+        # №10: полная матрица — файлом (текст выше усечён 30 строками)
+        if REPORTS_FOLDER_ID:
+            asyncio.create_task(_build_and_send_report(dialog_id))
+            text += "\n\n📎 Полная матрица — сейчас пришлю файлом Excel."
+        else:
+            text += ("\n\n⚙️ Укажи REPORTS_FOLDER_ID в .env (приватная папка "
+                     "Диска) — буду присылать полную матрицу файлом Excel.")
 
     elif msg_lower.startswith("руководител"):
         parts = question.split()
@@ -1277,17 +1349,12 @@ def _embed_texts(texts: list[str]) -> "np.ndarray":  # noqa: F821
     return np.array(vecs, dtype=np.float32)
 
 
-async def _send_course_file(dialog_id: str, course_id: int) -> None:
-    """Приложить файл документа в чат при старте курса (№4).
+async def _commit_disk_file(dialog_id: str, disk_file_id) -> None:
+    """Файл с Диска в чат: im.dialog.get → im.disk.file.commit (каскад №4).
 
     Методы im.disk.* без детальных секций в выжимке доков — каскад попыток;
-    любой фейл тихо игнорируется: ссылка на документ уже есть в тексте
-    _start_reading, старт курса ломать нельзя."""
+    любой фейл тихо логируется (best-effort)."""
     try:
-        course = await asyncio.to_thread(get_course_by_id, course_id)
-        doc_id = (course or {}).get("doc_id")
-        if not doc_id:
-            return
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 BITRIX_WEBHOOK_URL + "im.dialog.get", json={"DIALOG_ID": dialog_id}
@@ -1296,17 +1363,64 @@ async def _send_course_file(dialog_id: str, course_id: int) -> None:
             dialog = r.json().get("result") or {}
             chat_id = dialog.get("chat_id") or dialog.get("id") or dialog.get("ID")
             if not chat_id:
-                print(f"[course-file] no chat_id for {dialog_id}: {dialog}")
+                print(f"[disk-commit] no chat_id for {dialog_id}: {dialog}")
                 return
             for id_key in ("UPLOAD_ID", "DISK_ID"):
                 r2 = await client.post(
                     BITRIX_WEBHOOK_URL + "im.disk.file.commit",
-                    json={"CHAT_ID": chat_id, id_key: int(doc_id)},
+                    json={"CHAT_ID": chat_id, id_key: int(disk_file_id)},
                 )
                 if r2.status_code == 200 and r2.json().get("result"):
-                    print(f"[course-file] sent doc {doc_id} to {dialog_id} ({id_key})")
+                    print(f"[disk-commit] sent file {disk_file_id} "
+                          f"to {dialog_id} ({id_key})")
                     return
-                print(f"[course-file] {id_key} attempt failed: "
+                print(f"[disk-commit] {id_key} attempt failed: "
                       f"{r2.status_code} {r2.text[:200]}")
     except Exception as exc:
-        print(f"[course-file] fallback to link: {exc!r}")
+        print(f"[disk-commit] failed for {dialog_id}: {exc!r}")
+
+
+async def _send_course_file(dialog_id: str, course_id: int) -> None:
+    """Приложить файл документа в чат при старте курса (№4): фейл тихий —
+    ссылка на документ уже есть в тексте _start_reading."""
+    course = await asyncio.to_thread(get_course_by_id, course_id)
+    doc_id = (course or {}).get("doc_id")
+    if doc_id:
+        await _commit_disk_file(dialog_id, doc_id)
+
+
+async def _build_and_send_report(dialog_id: str) -> None:
+    """№10: xlsx-матрица → приватная папка Диска → в чат HR. Best-effort:
+    любой фейл — лог, HR уже получил текстовую сводку."""
+    try:
+        rows = await asyncio.to_thread(get_report_rows)
+        employees = {str(e["bitrix_uid"]): e
+                     for e in await asyncio.to_thread(get_all_employees)}
+        courses = await asyncio.to_thread(get_active_courses)
+        data = await asyncio.to_thread(build_report_xlsx, rows, employees,
+                                       courses)
+        name = "Отчёт по обучению.xlsx"
+        old_id = await asyncio.to_thread(get_meta, "last_report_file_id")
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            if old_id:
+                try:
+                    await client.post(
+                        BITRIX_WEBHOOK_URL + "disk.file.markdeleted",
+                        json={"id": old_id})
+                except Exception:
+                    pass          # удалён руками / уже в корзине — не важно
+            r = await client.post(
+                BITRIX_WEBHOOK_URL + "disk.folder.uploadfile",
+                json={"id": REPORTS_FOLDER_ID,
+                      "data": {"NAME": name},
+                      "fileContent": [name, base64.b64encode(data).decode()],
+                      "generateUniqueName": True})
+        file_id = (r.json().get("result") or {}).get("ID")
+        if not file_id:
+            print(f"[report-xlsx] upload failed: {r.status_code} {r.text[:200]}")
+            return
+        await asyncio.to_thread(set_meta, "last_report_file_id", str(file_id))
+        await _commit_disk_file(dialog_id, file_id)
+    except Exception as exc:
+        import traceback
+        print(f"[report-xlsx] ERROR: {exc}\n{traceback.format_exc()}")

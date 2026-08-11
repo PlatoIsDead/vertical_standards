@@ -12,6 +12,7 @@ ROLE_SELECT: сотрудник выбирает роль цифрой; RAG-от
 
 Entry point: process_message() — synchronous, designed to be called via asyncio.to_thread().
 """
+import json
 import os
 import re
 import time
@@ -31,6 +32,7 @@ from app.db import (
     get_session_answers,
     get_session_by_id,
     get_sessions_by_user,
+    get_user_departments,
     is_employee_allowed,
     log_answer,
     update_session,
@@ -42,6 +44,7 @@ from app.roles import (
     display_name,
     load_roles_config,
     parse_filename,
+    role_for_departments,
     role_name,
     selectable_roles,
 )
@@ -91,9 +94,13 @@ def process_message(user_id: str, message: str, dialog_id: str,
                 "Добро пожаловать! Активных курсов обучения пока нет.\n"
                 "Обратитесь к HR-менеджеру для назначения обучения."
             )
-        # №11: курс — после роли. Роль из прошлой сессии или через меню;
-        # до выбора сессия с сентинелом course_id=0.
+        # №11/№8: курс — после роли. Приоритет: отдел Битрикса → память
+        # прошлой сессии → меню; до выбора сессия с сентинелом course_id=0.
         if selectable_roles():
+            auto_role = _role_from_profile(user_id)
+            if auto_role:
+                return _assign_course(user_id, dialog_id, auto_role, None,
+                                      by_department=True)
             role = _last_known_role(user_id)
             if role:
                 return _assign_course(user_id, dialog_id, role, None,
@@ -137,8 +144,12 @@ def start_onboarding(user_id: str, dialog_id: str) -> str | None:
     courses = get_active_courses()
     if not courses:
         return None
-    # Зеркало ветки session is None в process_message (№11)
+    # Зеркало ветки session is None в process_message (№11/№8)
     if selectable_roles():
+        auto_role = _role_from_profile(user_id)
+        if auto_role:
+            return _assign_course(user_id, dialog_id, auto_role, None,
+                                  by_department=True)
         role = _last_known_role(user_id)
         if role:
             return _assign_course(user_id, dialog_id, role, None, remembered=True)
@@ -231,8 +242,43 @@ def _last_known_role(user_id: str) -> str | None:
     return None
 
 
+def _live_departments(user_id: str) -> list | None:
+    """user.get по ID (сотрудник вне WATCH_DEPARTMENT_IDS не попадает в
+    seen_portal_users). Любой сбой → None: флап сети не ломает онбординг."""
+    webhook_url = os.getenv("BITRIX_WEBHOOK_URL", "")
+    if not webhook_url:
+        return None
+    try:
+        resp = httpx.post(webhook_url + "user.get",
+                          json={"ID": str(user_id)}, timeout=15.0)
+        result = resp.json().get("result", [])
+        if result:
+            return list(result[0].get("UF_DEPARTMENT") or [])
+    except Exception as exc:
+        print(f"[autorole] user.get failed for {user_id}: {exc!r}")
+    return None
+
+
+def _role_from_profile(user_id: str) -> str | None:
+    """№8: авто-роль из отдела Битрикса. ГЛАВНЕЕ памяти сессии (перевод в
+    другой отдел должен сменить роль). Пустой маппинг departments → None
+    без сетевых вызовов."""
+    if not load_roles_config().get("departments"):
+        return None
+    deps_json = get_user_departments(user_id)
+    if deps_json is not None:
+        try:
+            deps = json.loads(deps_json)
+        except (ValueError, TypeError):
+            deps = []
+    else:
+        deps = _live_departments(user_id) or []
+    return role_for_departments(deps)
+
+
 def _assign_course(user_id: str, dialog_id: str, role_id: str,
-                   session: dict | None, remembered: bool = False) -> str:
+                   session: dict | None, remembered: bool = False,
+                   by_department: bool = False) -> str:
     """Назначить первый подходящий курс (роль/all_staff, непройденный).
 
     session — живая ROLE_SELECT-сессия (course_id=0) либо None (роль вспомнили
@@ -268,6 +314,8 @@ def _assign_course(user_id: str, dialog_id: str, role_id: str,
     role_line = f"✅ Твоя роль: *{role_name(role_id)}*"
     if remembered:
         role_line += " (помню с прошлого обучения; сменить — команда «Роль»)"
+    elif by_department:
+        role_line += " (по отделу; сменить — команда «Роль»)"
     return role_line + "\n\n" + _start_reading(session, course)
 
 

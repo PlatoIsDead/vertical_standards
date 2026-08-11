@@ -45,6 +45,15 @@ def roles_for_folder(folder_id: str) -> list[str]:
     return list(load_roles_config().get("folders", {}).get(str(folder_id), []))
 
 
+def role_for_departments(dep_ids: list) -> str | None:
+    """№8: роль по отделам Битрикса (roles.json departments, ключи-строки).
+    Все отделы юзера мапятся в ОДНУ роль → она; в разные / ни одного
+    замапленного / пустой маппинг → None (фолбэк: память сессии или меню)."""
+    cfg = load_roles_config().get("departments", {})
+    found = {cfg.get(str(d)) for d in dep_ids} - {None}
+    return found.pop() if len(found) == 1 else None
+
+
 # Кандидат в опечатку префикса: ТОЛЬКО латиница — названия у клиента бывают
 # целиком капсом кириллицей («ENG ДЕЙСТВИЯ ДЕЖУРНОГО...»), их не тревожить.
 _SUSPICIOUS_RE = re.compile(r"^[A-Z]{2,6}$")
