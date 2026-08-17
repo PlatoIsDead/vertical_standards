@@ -37,6 +37,7 @@ from app.db import (
     log_answer,
     update_session,
 )
+from app import keyboards
 from app.gamification import post_exam_congratulation
 from app.rag import answer as rag_answer
 from app.roles import (
@@ -553,12 +554,19 @@ def _finish_phase(session: dict, phase: str, questions: dict,
         total = len(questions.get("basic_questions", []))
         update_session(session["id"], state="WAITING_HR", q_idx=0,
                        score_basic=correct_count)
+        # Флаг кнопок читаем env-ом в момент вызова: state_machine не может
+        # импортировать bitrix_bot.BUTTONS_ENABLED (циклический импорт).
+        admit_kb = (keyboards.hr_admit(session["user_id"])
+                    if os.getenv("BUTTONS_ENABLED", "0") == "1" else None)
         notify_hr(
             f"📋 Сотрудник {_employee_label(session['user_id'])} "
             f"завершил базовый тест.\n"
             f"Результат: {correct_count}/{total}\n\n"
             f"Чтобы допустить к экзамену, напиши:\n"
-            f"Допустить {session['user_id']}"
+            f"Допустить {session['user_id']}",
+            # kwarg только при реальной клавиатуре — двойники notify_hr в
+            # тестах без параметра keyboard остаются валидными
+            **({"keyboard": admit_kb} if admit_kb else {}),
         )
         return prefix + (
             f"🏁 Базовый тест завершён! Результат: *{correct_count}/{total}*\n\n"
@@ -657,7 +665,7 @@ def parse_answer(message: str) -> str | None:
     return first
 
 
-def notify_hr(message: str) -> None:
+def notify_hr(message: str, keyboard: list | None = None) -> None:
     """Send a message to all HR users via the HR bot."""
     webhook_url = os.getenv("BITRIX_WEBHOOK_URL", "")
     hr_ids_str = os.getenv("HR_USER_IDS", "")
@@ -672,14 +680,17 @@ def notify_hr(message: str) -> None:
 
     hr_ids = [x.strip() for x in hr_ids_str.split(",") if x.strip()]
     for hr_id in hr_ids:
+        payload = {"BOT_ID": bot_id, "DIALOG_ID": f"u{hr_id}",
+                   "MESSAGE": md_to_bb(message), "CLIENT_ID": client_id}
+        if keyboard:  # инвариант №7: ключ отсутствует вовсе при None
+            payload["KEYBOARD"] = keyboard
         # Same flapping network as _send — retry with backoff so HR notifications
         # aren't silently lost on a transient ConnectTimeout.
         for attempt in range(1, 6):
             try:
                 resp = httpx.post(
                     webhook_url + "imbot.message.add",
-                    json={"BOT_ID": bot_id, "DIALOG_ID": f"u{hr_id}",
-                          "MESSAGE": md_to_bb(message), "CLIENT_ID": client_id},
+                    json=payload,
                     timeout=15.0,
                 )
                 print(f"[notify_hr] → HR {hr_id}: {resp.status_code} (attempt {attempt})")

@@ -74,10 +74,12 @@ from app.roles import (
     selectable_roles,
 )
 from app.state_machine import (
+    _MENU_COMMANDS,
     _last_known_role,
     _retake_fork_text,
     course_roles,
     md_to_bb,
+    my_courses,
     process_message,
     start_onboarding,
 )
@@ -216,7 +218,8 @@ async def _maybe_send_reminders(now_utc: "datetime | None" = None):
     for uid, uid_items in by_uid.items():
         text = deadlines.build_reminder_text(uid_items)
         if text:
-            await _send(f"u{uid}", text, BOT_ID)
+            await _send(f"u{uid}", text, BOT_ID,
+                        **_kb_kwargs(await _session_keyboard(uid)))
             sent += 1
     # Метка ПОСЛЕ отправки: упали посреди — следующий час дошлёт (риск
     # частичного дубля меньше, чем потерянный день напоминаний)
@@ -591,14 +594,23 @@ async def _notify_hr_about_user(user: dict, transfer: bool):
     fio = (f"{user.get('NAME', '')} {user.get('LAST_NAME', '')}".strip()
            or f"ID {user.get('ID')}")
     email = (user.get("EMAIL") or "").strip().lower()
+    kb = None
     if transfer:
         text = f"🔄 {fio} сменил отдел. Если поменялась роль — пусть напишет боту «Роль»."
     else:
         text = f"👤 Новый сотрудник: {fio} ({email or 'email не указан'})."
         if email:
             text += f"\nПригласить в обучение: Пригласить {email}"
+            kb = keyboards.hr_invite(email) if BUTTONS_ENABLED else None
     for hr_id in _hr_ids():
-        await _send(str(hr_id), text, HR_BOT_ID)
+        await _send(str(hr_id), text, HR_BOT_ID, **_kb_kwargs(kb))
+
+
+def _kb_kwargs(keyboard: list | None) -> dict:
+    """kwargs для _send: ключ keyboard — только при реальной клавиатуре.
+    Тестовые двойники _send без параметра keyboard остаются валидными,
+    а при выключенном флаге вызовы _send не меняются вовсе."""
+    return {"keyboard": keyboard} if keyboard else {}
 
 
 async def _send(dialog_id: str, text: str, bot_id: str = None,
@@ -633,6 +645,18 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
             if attempt < 5:
                 await asyncio.sleep(2 * attempt)
     print(f"BITRIX SEND ERROR after 5 attempts (dialog={dialog_id}): {last_exc!r}")
+
+
+async def _session_keyboard(user_id: str) -> list | None:
+    """Клавиатура по ТЕКУЩЕМУ состоянию сессии — для проактивных отправок
+    (напоминания №9): кнопки всегда совпадают с тем, что FSM сейчас поймёт."""
+    if not BUTTONS_ENABLED:
+        return None
+    session = await asyncio.to_thread(get_session, user_id)
+    fork = False
+    if session is None:
+        fork = (await asyncio.to_thread(_retake_fork_text, user_id)) is not None
+    return keyboards.for_session(session, fork, selectable_roles())
 
 
 async def _handle_employee_message(user_id: str, question: str,
@@ -678,6 +702,13 @@ async def _handle_employee_message(user_id: str, question: str,
             fork = (await asyncio.to_thread(_retake_fork_text, user_id)
                     is not None)
         keyboard = keyboards.for_session(after, fork, selectable_roles())
+        # Ответ на «Мои курсы» в READING → кнопки «Выбрать N» поверх ряда
+        if (after and after["state"] == "READING"
+                and question.strip().lower() in _MENU_COMMANDS):
+            _, selectable = await asyncio.to_thread(
+                my_courses, user_id, after.get("role"))
+            if selectable:
+                keyboard = keyboards.with_switch(keyboard, len(selectable))
 
     asyncio.create_task(_send(dialog_id, text, bot_id or BOT_ID, client_id,
                               keyboard=keyboard))
@@ -729,7 +760,14 @@ async def command_handler(request: Request):
     if not params or not dialog_id or not user_id:
         return {"status": "no_data"}
 
-    await _handle_employee_message(user_id, params, dialog_id, client_id)
+    # Роутинг по ИМЕНИ команды: hrsay → HR-бот, say/нет поля → employee
+    # (BOT_ID в событии не гарантирован; поле имени — те же два кандидата).
+    command_name = (form.get("data[COMMAND][0][COMMAND]")
+                    or form.get("data[PARAMS][COMMAND]") or "").strip().lower()
+    if command_name == "hrsay":
+        await _handle_hr_message(user_id, params, dialog_id, client_id)
+    else:
+        await _handle_employee_message(user_id, params, dialog_id, client_id)
     return {"status": "ok"}
 
 
@@ -763,8 +801,9 @@ async def _broadcast_course(course: dict, uids: list[str]) -> None:
     BOT_CLIENT_ID из .env. Последовательно: _send ретраит до 5 раз на флапе."""
     text = (f"📚 Тебе доступен новый курс: *{display_name(course['doc_name'])}*\n"
             "Напиши мне любое сообщение, чтобы начать обучение.")
+    kb = keyboards.start_button("Начать обучение") if BUTTONS_ENABLED else None
     for uid in uids:
-        await _send(f"u{uid}", text, BOT_ID)
+        await _send(f"u{uid}", text, BOT_ID, **_kb_kwargs(kb))
 
 
 @app.post("/hr")
@@ -783,11 +822,20 @@ async def hr_handler(request: Request):
     if not question or not dialog_id:
         return {"status": "ok"}
 
+    await _handle_hr_message(user_id, question, dialog_id, client_id)
+    return {"status": "ok"}
+
+
+async def _handle_hr_message(user_id: str, question: str,
+                             dialog_id: str, client_id: str) -> None:
+    """Общий путь HR-бота: текст из чата ("/hr") и нажатие HR-кнопки
+    ("/command", команда hrsay) обрабатываются одинаково."""
     if _is_duplicate(user_id, dialog_id, question):
         print(f"DEDUP skip HR (dialog={dialog_id}): {question!r}")
-        return {"status": "ok"}
+        return
 
-    # Гейт: HR-боту командуют только HR (пустой HR_USER_IDS = гейт выключен, dev)
+    # Гейт: HR-боту командуют только HR (пустой HR_USER_IDS = гейт выключен,
+    # dev). Кнопки идут тем же путём — чужое нажатие отбивается здесь же.
     hr_ids = _hr_ids()
     if hr_ids and user_id not in hr_ids:
         print(f"HR GATE reject user={user_id!r}")
@@ -795,8 +843,9 @@ async def hr_handler(request: Request):
             dialog_id, "⛔ Команды HR-бота доступны только HR-менеджерам.",
             HR_BOT_ID, client_id,
         ))
-        return {"status": "ok"}
+        return
 
+    kb: list | None = None  # клавиатура ветки; уходит только при BUTTONS_ENABLED
     msg_lower = question.lower()
 
     # ── Двухшаговая правка вопроса: живой pending перехватывает сообщение ────
@@ -806,11 +855,14 @@ async def hr_handler(request: Request):
             _pending_edits.pop(user_id, None)
             asyncio.create_task(_send(dialog_id, "Правка отменена.",
                                       HR_BOT_ID, client_id))
-            return {"status": "ok"}
+            return
         if not msg_lower.startswith(_HR_COMMAND_PREFIXES):
             text = await _apply_pending_edit(user_id, pending, question)
-            asyncio.create_task(_send(dialog_id, text, HR_BOT_ID, client_id))
-            return {"status": "ok"}
+            if BUTTONS_ENABLED and text.startswith("❌ Не понял"):
+                kb = keyboards.hr_cancel_edit()
+            asyncio.create_task(_send(dialog_id, text, HR_BOT_ID, client_id,
+                                      **_kb_kwargs(kb)))
+            return
         _pending_edits.pop(user_id, None)  # команда важнее забытой правки
 
     if msg_lower in ("курсы", "курс", "список"):
@@ -825,6 +877,7 @@ async def hr_handler(request: Request):
                 lines.append(f"*{name}*")
                 lines.append(f"  👁 Вопросы {n}   ✅ Подтвердить {n}\n")
             text = "\n".join(lines)
+            kb = keyboards.hr_course_list([c["id"] for c in pending])
 
     elif msg_lower.startswith("подтвердить"):
         parts = question.split()
@@ -887,8 +940,13 @@ async def hr_handler(request: Request):
                         else:
                             # Автостарт идёт от EMPLOYEE-бота: client_id формы
                             # принадлежит HR-боту — _send возьмёт BOT_CLIENT_ID из .env
-                            asyncio.create_task(_send(f"u{uid}", first_msg, BOT_ID))
                             new_session = await asyncio.to_thread(get_session, uid)
+                            start_kb = (keyboards.for_session(
+                                new_session, False, selectable_roles())
+                                if BUTTONS_ENABLED else None)
+                            asyncio.create_task(_send(f"u{uid}", first_msg,
+                                                      BOT_ID,
+                                                      **_kb_kwargs(start_kb)))
                             # №11: course_id=0 = этап выбора роли, файл уйдёт
                             # после выбора (хук в bot_handler)
                             if new_session and new_session["course_id"]:
@@ -915,10 +973,13 @@ async def hr_handler(request: Request):
             if found:
                 emp_dialog = await asyncio.to_thread(get_session_dialog_id, target_uid)
                 if emp_dialog:
+                    start_kb = (keyboards.start_button("Начать экзамен")
+                                if BUTTONS_ENABLED else None)
                     await _send(
                         emp_dialog,
                         "🎓 HR допустил тебя к экзамену! Напиши что-нибудь, чтобы начать.",
                         BOT_ID, client_id,
+                        **_kb_kwargs(start_kb),
                     )
                 text = f"✅ Сотрудник {target_uid} допущен к экзамену."
             else:
@@ -950,6 +1011,7 @@ async def hr_handler(request: Request):
                     lines.append(f"\nДля активации: Подтвердить {course_id}")
                     lines.append(f"Изменить вопрос: Изменить {course_id} {{номер 1–15}}")
                     text = "\n".join(lines)
+                    kb = keyboards.hr_course_actions(course_id)
             except ValueError:
                 text = "❌ Укажи числовой номер курса: Вопросы {N}"
 
@@ -986,6 +1048,7 @@ async def hr_handler(request: Request):
                         + "\n\n(Пояснение необязательно; без него старое "
                           "пояснение удаляется.)\nОтмена — выйти без изменений."
                     )
+                    kb = keyboards.hr_cancel_edit()
 
     elif msg_lower.startswith("история"):
         parts = question.split()
@@ -1080,9 +1143,12 @@ async def hr_handler(request: Request):
             "• *Руководители* — реестр получателей эскалаций\n"
             "• *Руководитель добавить/удалить {email} [старший]* — правка реестра"
         )
+        kb = keyboards.hr_main_menu()
 
-    asyncio.create_task(_send(dialog_id, text, HR_BOT_ID, client_id))
-    return {"status": "ok"}
+    if not BUTTONS_ENABLED:
+        kb = None
+    asyncio.create_task(_send(dialog_id, text, HR_BOT_ID, client_id,
+                              **_kb_kwargs(kb)))
 
 
 @app.post("/disk-webhook")
@@ -1319,8 +1385,11 @@ async def process_new_document(file_id: str, file_name: str,
                 "такого департамента нет в реестре ролей (data/roles.json). "
                 "Проверь имя файла."
             )
+        notify_kb = (keyboards.hr_course_actions(course_id)
+                     if BUTTONS_ENABLED else None)
         for hr_id in hr_ids:
-            await _send(str(hr_id), notify_text, HR_BOT_ID)
+            await _send(str(hr_id), notify_text, HR_BOT_ID,
+                        **_kb_kwargs(notify_kb))
         print(f"[process_new_document] DONE course_id={course_id}, HR notified: {hr_ids}")
 
     except Exception as exc:

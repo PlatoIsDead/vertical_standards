@@ -1,0 +1,364 @@
+"""Кнопки везде (PRPs/buttons-everywhere.md): HR-билдеры, роутинг /command
+по имени команды, клавиатуры HR-веток и проактивных отправок — за флагом
+BUTTONS_ENABLED. Паттерны — test_buttons.py."""
+import asyncio
+import time
+from datetime import datetime
+
+import pytest
+from fastapi.testclient import TestClient
+
+import app.bitrix_bot as bot
+import app.keyboards as kb
+import app.state_machine as sm
+
+
+def _wait_for(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+# ── Чистые билдеры ───────────────────────────────────────────────────────────
+
+def test_hr_main_menu():
+    menu = kb.hr_main_menu()
+    assert [b["TEXT"] for b in menu] == ["Курсы", "Отчёт", "Руководители"]
+    assert all(b["COMMAND"] == "hrsay" and b["COMMAND_PARAMS"] == b["TEXT"]
+               for b in menu)
+
+
+def test_hr_course_list_rows_and_cap():
+    rows = kb.hr_course_list([1, 2])
+    assert [b.get("TEXT", "NL") for b in rows] == \
+        ["Вопросы 1", "Подтвердить 1", "NL", "Вопросы 2", "Подтвердить 2"]
+    many = kb.hr_course_list(list(range(1, 26)))          # 25 курсов → кап 20
+    assert sum(1 for b in many if "TEXT" in b) == 40
+    assert sum(1 for b in many if b.get("TYPE") == "NEWLINE") == 19
+
+
+def test_hr_param_buttons():
+    assert kb.hr_invite("a@b.ru")[0]["COMMAND_PARAMS"] == "Пригласить a@b.ru"
+    assert kb.hr_admit("500")[0]["COMMAND_PARAMS"] == "Допустить 500"
+    assert kb.hr_cancel_edit()[0]["TEXT"] == "Отмена"
+    assert all(x[0]["COMMAND"] == "hrsay" for x in
+               (kb.hr_invite("a@b.ru"), kb.hr_admit("500"), kb.hr_cancel_edit()))
+
+
+def test_start_button():
+    btn = kb.start_button("Начать обучение")
+    assert btn[0]["TEXT"] == "Начать обучение"
+    assert btn[0]["COMMAND_PARAMS"] == "Начать"
+    assert btn[0]["COMMAND"] == "say"
+    assert btn[0]["DISPLAY"] == "BLOCK"
+
+
+def test_with_switch():
+    only = kb.with_switch(None, 2)
+    assert [b["TEXT"] for b in only] == ["Выбрать 1", "Выбрать 2"]
+    reading = kb.for_session({"state": "READING"})
+    merged = kb.with_switch(reading, 1)
+    assert merged[0]["TEXT"] == "Выбрать 1"
+    assert merged[1] == {"TYPE": "NEWLINE"}
+    assert [b["TEXT"] for b in merged if "TEXT" in b] == \
+        ["Выбрать 1", "Готов", "Мои курсы", "Роль"]
+
+
+# ── HR-ветки за флагом ───────────────────────────────────────────────────────
+
+@pytest.fixture
+def hr_env(monkeypatch):
+    captured = []
+
+    async def fake_send(dialog_id, text, bot_id=None, client_id="",
+                        keyboard=None):
+        captured.append({"dialog": dialog_id, "text": text,
+                         "keyboard": keyboard})
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    monkeypatch.setenv("HR_USER_IDS", "")      # гейт выключен (dev-режим)
+    bot._recent_msgs.clear()
+    bot._pending_edits.clear()
+    return TestClient(bot.app), captured
+
+
+def _post_hr(client, message, user="hr1", dialog="dhr"):
+    return client.post("/hr", data={
+        "data[PARAMS][MESSAGE]": message,
+        "data[PARAMS][DIALOG_ID]": dialog,
+        "data[PARAMS][FROM_USER_ID]": user,
+    })
+
+
+def test_hr_help_menu_keyboard(hr_env, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    client, captured = hr_env
+    _post_hr(client, "непонятная команда")
+    assert _wait_for(lambda: captured)
+    assert [b["TEXT"] for b in captured[0]["keyboard"]] == \
+        ["Курсы", "Отчёт", "Руководители"]
+
+
+def test_hr_no_keyboard_flag_off(hr_env):
+    client, captured = hr_env
+    _post_hr(client, "непонятная команда")
+    assert _wait_for(lambda: captured)
+    assert captured[0]["keyboard"] is None
+
+
+def test_hr_courses_keyboard(hr_env, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_pending_courses",
+                        lambda: [{"id": 3, "doc_name": "Док.docx"},
+                                 {"id": 7, "doc_name": "Док2.docx"}])
+    client, captured = hr_env
+    _post_hr(client, "Курсы")
+    assert _wait_for(lambda: captured)
+    assert [b.get("TEXT", "NL") for b in captured[0]["keyboard"]] == \
+        ["Вопросы 3", "Подтвердить 3", "NL", "Вопросы 7", "Подтвердить 7"]
+
+
+def test_hr_questions_keyboard(hr_env, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_course_by_id",
+                        lambda cid: {"id": cid, "doc_name": "Д"})
+    monkeypatch.setattr(bot, "get_course_questions",
+                        lambda cid: {"basic_questions": [],
+                                     "exam_questions": []})
+    client, captured = hr_env
+    _post_hr(client, "Вопросы 5")
+    assert _wait_for(lambda: captured)
+    assert [b["TEXT"] for b in captured[0]["keyboard"]] == \
+        ["Вопросы 5", "Подтвердить 5"]
+
+
+def test_hr_edit_step1_cancel_keyboard(hr_env, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    q = {"text": "?", "options": ["A. 1", "B. 2"], "correct": "A"}
+    monkeypatch.setattr(bot, "get_course_by_id",
+                        lambda cid: {"id": cid, "doc_name": "Д"})
+    monkeypatch.setattr(bot, "get_course_questions",
+                        lambda cid: {"basic_questions": [q],
+                                     "exam_questions": []})
+    client, captured = hr_env
+    _post_hr(client, "Изменить 5 1")
+    assert _wait_for(lambda: captured)
+    assert [b["TEXT"] for b in captured[0]["keyboard"]] == ["Отмена"]
+    # шаг 2, кривой формат → снова [Отмена]
+    _post_hr(client, "какой-то мусор")
+    assert _wait_for(lambda: len(captured) >= 2)
+    assert captured[1]["text"].startswith("❌ Не понял")
+    assert [b["TEXT"] for b in captured[1]["keyboard"]] == ["Отмена"]
+
+
+def test_hr_admit_sends_start_exam_button(hr_env, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "update_session_by_user", lambda uid, s, q: True)
+    monkeypatch.setattr(bot, "get_session_dialog_id", lambda uid: "d_emp")
+    client, captured = hr_env
+    _post_hr(client, "Допустить 500")
+    assert _wait_for(lambda: len(captured) >= 2)
+    emp = next(c for c in captured if c["dialog"] == "d_emp")
+    assert emp["keyboard"][0]["COMMAND_PARAMS"] == "Начать"
+    assert emp["keyboard"][0]["TEXT"] == "Начать экзамен"
+
+
+# ── /command: роутинг по имени команды ───────────────────────────────────────
+
+@pytest.fixture
+def cmd_router(monkeypatch):
+    calls = []
+
+    async def fake_hr(user_id, question, dialog_id, client_id):
+        calls.append(("hr", user_id, question, dialog_id))
+
+    async def fake_emp(user_id, question, dialog_id, client_id, bot_id=None):
+        calls.append(("emp", user_id, question, dialog_id))
+
+    monkeypatch.setattr(bot, "_handle_hr_message", fake_hr)
+    monkeypatch.setattr(bot, "_handle_employee_message", fake_emp)
+    return TestClient(bot.app), calls
+
+
+def test_command_hrsay_routes_to_hr(cmd_router):
+    client, calls = cmd_router
+    client.post("/command", data={
+        "event": "ONIMCOMMANDADD",
+        "data[COMMAND][0][COMMAND]": "hrsay",
+        "data[COMMAND][0][COMMAND_PARAMS]": "Курсы",
+        "data[COMMAND][0][DIALOG_ID]": "d9",
+        "data[COMMAND][0][USER_ID]": "u5",
+    })
+    assert calls == [("hr", "u5", "Курсы", "d9")]
+
+
+def test_command_say_and_missing_name_route_to_employee(cmd_router):
+    client, calls = cmd_router
+    client.post("/command", data={
+        "event": "ONIMCOMMANDADD",
+        "data[COMMAND][0][COMMAND]": "say",
+        "data[COMMAND][0][COMMAND_PARAMS]": "A",
+        "data[COMMAND][0][DIALOG_ID]": "d1",
+        "data[COMMAND][0][USER_ID]": "u1",
+    })
+    client.post("/command", data={           # поле имени не пришло вовсе
+        "event": "ONIMCOMMANDADD",
+        "data[PARAMS][COMMAND_PARAMS]": "B",
+        "data[PARAMS][DIALOG_ID]": "d2",
+        "data[USER][ID]": "u2",
+    })
+    assert calls == [("emp", "u1", "A", "d1"), ("emp", "u2", "B", "d2")]
+
+
+# ── notify_hr + кнопка «Допустить» из _finish_phase ──────────────────────────
+
+def test_notify_hr_keyboard_key(monkeypatch):
+    sent = []
+
+    def fake_post(url, json=None, timeout=None):
+        sent.append(json)
+
+        class R:
+            status_code = 200
+        return R()
+
+    monkeypatch.setattr(sm.httpx, "post", fake_post)
+    monkeypatch.setenv("BITRIX_WEBHOOK_URL", "http://x/")
+    monkeypatch.setenv("HR_USER_IDS", "77")
+    sm.notify_hr("тест")
+    assert "KEYBOARD" not in sent[0]          # ключа нет вовсе при None
+    sm.notify_hr("тест2", keyboard=[{"TEXT": "Допустить 5"}])
+    assert sent[1]["KEYBOARD"] == [{"TEXT": "Допустить 5"}]
+
+
+def test_finish_basic_admit_button_env_gated(monkeypatch):
+    monkeypatch.setattr(sm, "get_session_answers", lambda sid, phase: [])
+    monkeypatch.setattr(sm, "update_session", lambda *a, **kw: None)
+    monkeypatch.setattr(sm, "_employee_label", lambda uid: "X")
+    captured = {}
+    monkeypatch.setattr(
+        sm, "notify_hr",
+        lambda msg, keyboard=None: captured.update(kb=keyboard))
+    session = {"id": 1, "user_id": "500"}
+
+    monkeypatch.setenv("BUTTONS_ENABLED", "1")
+    sm._finish_phase(session, "basic", {"basic_questions": []})
+    assert captured["kb"] == kb.hr_admit("500")
+
+    monkeypatch.setenv("BUTTONS_ENABLED", "0")
+    sm._finish_phase(session, "basic", {"basic_questions": []})
+    assert captured["kb"] is None
+
+
+# ── Проактивные отправки employee-бота ───────────────────────────────────────
+
+@pytest.fixture
+def send_trap(monkeypatch):
+    captured = []
+
+    async def fake_send(dialog_id, text, bot_id=None, client_id="",
+                        keyboard=None):
+        captured.append({"dialog": dialog_id, "text": text,
+                         "keyboard": keyboard})
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    return captured
+
+
+def test_broadcast_course_start_button(send_trap, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, ["1", "2"]))
+    assert len(send_trap) == 2
+    assert all(c["keyboard"][0]["COMMAND_PARAMS"] == "Начать"
+               for c in send_trap)
+
+
+def test_broadcast_course_no_keyboard_flag_off(send_trap, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", False)
+    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, ["1"]))
+    assert send_trap[0]["keyboard"] is None
+
+
+def test_reminders_carry_state_keyboard(send_trap, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 1, "state": "READING"})
+    monkeypatch.setattr(bot, "_deadline_items", lambda: [{"uid": "9"}])
+    monkeypatch.setattr(bot.deadlines, "build_reminder_text",
+                        lambda items: "напоминание")
+    monkeypatch.setattr(bot, "get_meta", lambda k: None)
+    monkeypatch.setattr(bot, "set_meta", lambda k, v: None)
+    asyncio.run(bot._maybe_send_reminders(datetime(2026, 8, 17, 12, 0)))
+    assert send_trap and [b["TEXT"] for b in send_trap[0]["keyboard"]] == \
+        ["Готов", "Мои курсы", "Роль"]
+
+
+def test_notify_hr_about_user_invite_button(send_trap, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setenv("HR_USER_IDS", "77")
+    asyncio.run(bot._notify_hr_about_user(
+        {"ID": 5, "NAME": "Иван", "LAST_NAME": "Иванов", "EMAIL": "i@x.ru"},
+        transfer=False))
+    assert send_trap[0]["keyboard"][0]["COMMAND_PARAMS"] == "Пригласить i@x.ru"
+    # перевод отдела — кнопки нет (сотруднику самому писать «Роль»)
+    send_trap.clear()
+    asyncio.run(bot._notify_hr_about_user({"ID": 5}, transfer=True))
+    assert send_trap[0]["keyboard"] is None
+
+
+def test_invite_autostart_keyboard(hr_env, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "selectable_roles", lambda: [("a", "A"), ("b", "B")])
+
+    async def fake_lookup(email):
+        return {"ID": "500", "NAME": "Иван", "LAST_NAME": "Иванов",
+                "EMAIL": "ivan@x.ru"}
+
+    monkeypatch.setattr(bot, "_bitrix_user_by_email", fake_lookup)
+    monkeypatch.setattr(bot, "add_employee", lambda *a, **kw: None)
+    started = {}
+    monkeypatch.setattr(bot, "start_onboarding",
+                        lambda uid, d: started.update(uid=uid) or "Выбери роль")
+    monkeypatch.setattr(
+        bot, "get_session",
+        lambda uid: ({"course_id": 0, "state": "ROLE_SELECT"}
+                     if started else None))
+    client, captured = hr_env
+    _post_hr(client, "Пригласить ivan@x.ru")
+    assert _wait_for(lambda: any(c["dialog"] == "u500" for c in captured))
+    emp = next(c for c in captured if c["dialog"] == "u500")
+    assert [b["TEXT"] for b in emp["keyboard"]] == ["1", "2"]
+
+
+# ── «Выбрать N» после «Мои курсы» ────────────────────────────────────────────
+
+def _run_employee(question):
+    async def run():
+        await bot._handle_employee_message("u3", question, "d5", "")
+        await asyncio.sleep(0)
+    asyncio.run(run())
+
+
+def test_my_courses_switch_buttons(send_trap, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 1, "state": "READING",
+                                     "role": "fo"})
+    monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "список")
+    monkeypatch.setattr(bot, "my_courses",
+                        lambda uid, role: ("t", [{"id": 2}, {"id": 3}]))
+    bot._recent_msgs.clear()
+    _run_employee("Мои курсы")
+    keyboard = send_trap[0]["keyboard"]
+    assert [b["TEXT"] for b in keyboard[:2]] == ["Выбрать 1", "Выбрать 2"]
+    assert [b["TEXT"] for b in keyboard if "TEXT" in b][-3:] == \
+        ["Готов", "Мои курсы", "Роль"]
+
+    # обычный вопрос в READING → чистый ряд без «Выбрать»
+    send_trap.clear()
+    _run_employee("что такое чек-ин?")
+    assert [b["TEXT"] for b in send_trap[0]["keyboard"]] == \
+        ["Готов", "Мои курсы", "Роль"]
