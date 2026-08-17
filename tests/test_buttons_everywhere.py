@@ -253,6 +253,14 @@ def test_finish_basic_admit_button_env_gated(monkeypatch):
     assert captured["kb"] is None
 
 
+def test_bare_dialog():
+    """«uNNN» → 400 DIALOG_ID_EMPTY на портале (живой прогон 17.08)."""
+    assert sm.bare_dialog("u28528") == "28528"
+    assert sm.bare_dialog("28528") == "28528"
+    assert sm.bare_dialog("chat123") == "chat123"
+    assert sm.bare_dialog("uchk_u1") == "uchk_u1"   # не-числовой хвост не трогаем
+
+
 # ── Проактивные отправки employee-бота ───────────────────────────────────────
 
 @pytest.fixture

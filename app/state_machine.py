@@ -665,6 +665,15 @@ def parse_answer(message: str) -> str | None:
     return first
 
 
+def bare_dialog(dialog_id: str) -> str:
+    """Bitrix imbot принимает DIALOG_ID = числовой id юзера или chatNN.
+    Исторический префикс «u» (u28528) портал отвергает 400 DIALOG_ID_EMPTY
+    (вскрыто живьём 17.08) — срезаем в точках ОТПРАВКИ: это лечит и
+    легаси-«uNNN», уже записанные в dialog_id сессий БД."""
+    s = str(dialog_id)
+    return s[1:] if s.startswith("u") and s[1:].isdigit() else s
+
+
 def notify_hr(message: str, keyboard: list | None = None) -> None:
     """Send a message to all HR users via the HR bot."""
     webhook_url = os.getenv("BITRIX_WEBHOOK_URL", "")
@@ -680,7 +689,7 @@ def notify_hr(message: str, keyboard: list | None = None) -> None:
 
     hr_ids = [x.strip() for x in hr_ids_str.split(",") if x.strip()]
     for hr_id in hr_ids:
-        payload = {"BOT_ID": bot_id, "DIALOG_ID": f"u{hr_id}",
+        payload = {"BOT_ID": bot_id, "DIALOG_ID": bare_dialog(hr_id),
                    "MESSAGE": md_to_bb(message), "CLIENT_ID": client_id}
         if keyboard:  # инвариант №7: ключ отсутствует вовсе при None
             payload["KEYBOARD"] = keyboard
@@ -693,7 +702,9 @@ def notify_hr(message: str, keyboard: list | None = None) -> None:
                     json=payload,
                     timeout=15.0,
                 )
-                print(f"[notify_hr] → HR {hr_id}: {resp.status_code} (attempt {attempt})")
+                err = "" if resp.status_code == 200 else f" {resp.text[:200]}"
+                print(f"[notify_hr] → HR {hr_id}: {resp.status_code}"
+                      f" (attempt {attempt}){err}")
                 break
             except httpx.RequestError as exc:
                 print(f"[notify_hr] retry {attempt}/5 for HR {hr_id}: {exc!r}")

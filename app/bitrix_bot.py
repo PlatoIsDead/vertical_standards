@@ -77,6 +77,7 @@ from app.state_machine import (
     _MENU_COMMANDS,
     _last_known_role,
     _retake_fork_text,
+    bare_dialog,
     course_roles,
     md_to_bb,
     my_courses,
@@ -617,6 +618,7 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
                 client_id: str = "", keyboard: list | None = None) -> None:
     # Network to portal.becar.ru flaps (ConnectTimeout then 200 within seconds),
     # so retry with backoff to land in a live window instead of dropping the reply.
+    dialog_id = bare_dialog(dialog_id)   # «uNNN» → 400 DIALOG_ID_EMPTY
     bot_id = bot_id or BOT_ID
     # Proactive sends pass no client_id → fall back to the bot's token from .env,
     # otherwise Bitrix rejects imbot.message.add with 403.
@@ -637,7 +639,9 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
                 resp = await client.post(
                     BITRIX_WEBHOOK_URL + "imbot.message.add", json=payload
                 )
-            print(f"BITRIX SEND: {resp.status_code} → {dialog_id} (attempt {attempt})")
+            err = "" if resp.status_code == 200 else f" {resp.text[:200]}"
+            print(f"BITRIX SEND: {resp.status_code} → {dialog_id} "
+                  f"(attempt {attempt}){err}")
             return
         except Exception as exc:
             last_exc = exc
@@ -1424,6 +1428,7 @@ async def _commit_disk_file(dialog_id: str, disk_file_id) -> None:
     Методы im.disk.* без детальных секций в выжимке доков — каскад попыток;
     любой фейл тихо логируется (best-effort)."""
     try:
+        dialog_id = bare_dialog(dialog_id)
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 BITRIX_WEBHOOK_URL + "im.dialog.get", json={"DIALOG_ID": dialog_id}
