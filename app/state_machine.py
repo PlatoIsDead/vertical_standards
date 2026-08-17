@@ -393,10 +393,13 @@ def _start_reading(session: dict, course: dict) -> str:
     return "\n".join(lines)
 
 
-def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
+def my_courses(user_id: str, role_id: str | None,
+               switchable: bool = True) -> tuple[str, list[dict]]:
     """«Мои курсы»: текст списка + курсы, ДОСТУПНЫЕ к выбору (не текущий,
     не пройденные). Нумерация в тексте = индексы списка — единый источник
-    для «Выбрать N» (протокол 05.08: выбор курса сотрудником)."""
+    для «Выбрать N» (протокол 05.08: выбор курса сотрудником).
+    switchable=False (WAITING_HR): переключение запрещено FSM — подсказка
+    «напиши Выбрать» не должна обещать то, в чём бот откажет."""
     courses = get_active_courses()
     done = _done_course_ids(user_id)
     session = get_session(user_id)
@@ -417,12 +420,17 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
         else:
             lines.append(f"{selectable.index(c) + 1}. ⏳ {name}")
     if selectable:
-        lines += ["", "Переключиться на другой курс: напиши *Выбрать {номер}*."]
+        if switchable:
+            lines += ["", "Переключиться на другой курс: напиши *Выбрать {номер}*."]
+        else:
+            lines += ["", "⏳ Переключиться на другой курс можно будет "
+                          "после решения HR по текущему."]
     return "\n".join(lines), selectable
 
 
-def _my_courses_text(user_id: str, role_id: str | None) -> str:
-    return my_courses(user_id, role_id)[0]
+def _my_courses_text(user_id: str, role_id: str | None,
+                     switchable: bool = True) -> str:
+    return my_courses(user_id, role_id, switchable)[0]
 
 
 _MENU_COMMANDS = ("мои курсы", "курсы", "меню")
@@ -606,7 +614,8 @@ def _finish_phase(session: dict, phase: str, questions: dict,
 def _handle_waiting_hr(session: dict, message: str) -> str:
     cmd = message.strip().lower()
     if cmd in _MENU_COMMANDS:
-        return _my_courses_text(session["user_id"], session.get("role"))
+        return _my_courses_text(session["user_id"], session.get("role"),
+                                switchable=False)
     if cmd.startswith("выбрать"):
         return ("⏳ Дождись решения HR по текущему курсу — "
                 "потом можно будет переключиться.")

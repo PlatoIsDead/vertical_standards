@@ -307,6 +307,20 @@ def test_finish_basic_admit_button_env_gated(monkeypatch):
     assert captured["kb"] is None
 
 
+def test_my_courses_hint_matches_fsm(monkeypatch):
+    """WAITING_HR: переключение запрещено FSM — текст не должен обещать
+    «напиши Выбрать» (скрин 17.08)."""
+    courses = [{"id": 1, "doc_name": "A.docx"}, {"id": 2, "doc_name": "B.docx"}]
+    monkeypatch.setattr(sm, "get_active_courses", lambda: courses)
+    monkeypatch.setattr(sm, "_done_course_ids", lambda uid: set())
+    monkeypatch.setattr(sm, "get_session", lambda uid: {"course_id": 1})
+    text_on, sel = sm.my_courses("u1", None)
+    assert "напиши *Выбрать" in text_on and len(sel) == 1
+    text_off, _ = sm.my_courses("u1", None, switchable=False)
+    assert "напиши *Выбрать" not in text_off
+    assert "после решения HR" in text_off
+
+
 def test_bare_dialog():
     """«uNNN» → 400 DIALOG_ID_EMPTY на портале (живой прогон 17.08)."""
     assert sm.bare_dialog("u28528") == "28528"
