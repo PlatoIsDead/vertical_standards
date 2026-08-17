@@ -24,20 +24,31 @@ def _wait_for(predicate, timeout=2.0):
 
 # ── Чистые билдеры ───────────────────────────────────────────────────────────
 
+def _btns(keyboard):
+    return [b for b in keyboard if "TEXT" in b]
+
+
 def test_hr_main_menu():
-    menu = kb.hr_main_menu()
-    assert [b["TEXT"] for b in menu] == ["Курсы", "Отчёт", "Руководители"]
-    assert all(b["COMMAND"] == "hrsay" and b["COMMAND_PARAMS"] == b["TEXT"]
+    menu = _btns(kb.hr_main_menu(True))
+    assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in menu] == [
+        ("📚 Курсы на проверке", "Курсы"),
+        ("📊 Отчёт по обучению", "Отчёт"),
+        ("👥 Руководители", "Руководители")]
+    assert all(b["COMMAND"] == "hrsay" and b["DISPLAY"] == "BLOCK"
                for b in menu)
+    assert menu[0]["BG_COLOR"] == "#BEDC3C"               # очередь непуста
+    assert _btns(kb.hr_main_menu(False))[0]["BG_COLOR"] == "#DDEFF8"
 
 
-def test_hr_course_list_rows_and_cap():
+def test_hr_course_list_pagination():
     rows = kb.hr_course_list([1, 2])
     assert [b.get("TEXT", "NL") for b in rows] == \
         ["Вопросы 1", "Подтвердить 1", "NL", "Вопросы 2", "Подтвердить 2"]
-    many = kb.hr_course_list(list(range(1, 26)))          # 25 курсов → кап 20
-    assert sum(1 for b in many if "TEXT" in b) == 40
-    assert sum(1 for b in many if b.get("TYPE") == "NEWLINE") == 19
+    page = kb.hr_course_list(list(range(1, 9)), page=1, remaining=12)
+    assert sum(1 for b in page if "TEXT" in b) == 17      # 8 пар + «ещё»
+    more = _btns(page)[-1]
+    assert (more["TEXT"], more["COMMAND_PARAMS"]) == \
+        ("Показать ещё 12", "Курсы 2")
 
 
 def test_hr_param_buttons():
@@ -56,15 +67,16 @@ def test_start_button():
     assert btn[0]["DISPLAY"] == "BLOCK"
 
 
-def test_with_switch():
-    only = kb.with_switch(None, 2)
-    assert [b["TEXT"] for b in only] == ["Выбрать 1", "Выбрать 2"]
-    reading = kb.for_session({"state": "READING"})
-    merged = kb.with_switch(reading, 1)
-    assert merged[0]["TEXT"] == "Выбрать 1"
-    assert merged[1] == {"TYPE": "NEWLINE"}
-    assert [b["TEXT"] for b in merged if "TEXT" in b] == \
-        ["Выбрать 1", "Готов", "Мои курсы", "Роль"]
+def test_courses_menu():
+    """Дизайн 17.08: курсы BLOCK-кнопками (with_switch заменён)."""
+    menu = _btns(kb.courses_menu([(1, "Курс А", "todo"),
+                                  (2, "Курс Б", "admitted")], reading=True))
+    assert [b["COMMAND_PARAMS"] for b in menu] == \
+        ["Готов", "Выбрать 1", "Выбрать 2", "Роль"]
+    assert menu[2]["TEXT"] == "🎓 2 · Курс Б"
+    grid = _btns(kb.courses_menu([(i, f"К{i}", "todo") for i in range(1, 8)]))
+    assert [b["COMMAND_PARAMS"] for b in grid] == \
+        [f"Выбрать {i}" for i in range(1, 8)]
 
 
 # ── HR-ветки за флагом ───────────────────────────────────────────────────────
@@ -95,11 +107,14 @@ def _post_hr(client, message, user="hr1", dialog="dhr"):
 
 def test_hr_help_menu_keyboard(hr_env, monkeypatch):
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_pending_courses", lambda: [])
     client, captured = hr_env
     _post_hr(client, "непонятная команда")
     assert _wait_for(lambda: captured)
-    assert [b["TEXT"] for b in captured[0]["keyboard"]] == \
+    menu = _btns(captured[0]["keyboard"])
+    assert [b["COMMAND_PARAMS"] for b in menu] == \
         ["Курсы", "Отчёт", "Руководители"]
+    assert menu[0]["BG_COLOR"] == "#DDEFF8"               # очередь пуста
 
 
 def test_hr_no_keyboard_flag_off(hr_env):
@@ -137,9 +152,11 @@ def test_hr_questions_card_keyboard(hr_env, monkeypatch):
     assert "B. 2 ✅" in captured[0]["text"]
     texts = [b["TEXT"] for b in captured[0]["keyboard"] if "TEXT" in b]
     assert texts == ["▶️ Далее", "✏️ Изменить", "🔄 Заново", "📄 Все вопросы"]
-    # последняя карточка: вместо «Далее» — «Подтвердить»
-    assert [b["TEXT"] for b in kb.hr_question_card(5, 15) if "TEXT" in b][:2] \
-        == ["⬅️ Назад", "✅ Подтвердить"]
+    # последняя карточка: «Далее» нет, необратимое — последним рядом
+    last = [b for b in kb.hr_question_card(5, 15) if "TEXT" in b]
+    assert "▶️ Далее" not in [b["TEXT"] for b in last]
+    assert (last[-1]["TEXT"], last[-1]["COMMAND_PARAMS"]) == \
+        ("Подтвердить и запустить", "Подтвердить 5")
 
 
 def test_hr_edit_wizard_keyboards(hr_env, monkeypatch):
@@ -155,14 +172,16 @@ def test_hr_edit_wizard_keyboards(hr_env, monkeypatch):
     client, captured = hr_env
     _post_hr(client, "Изменить 5.1")
     assert _wait_for(lambda: captured)
-    assert [b["TEXT"] for b in captured[0]["keyboard"]] == \
+    assert [b["TEXT"] for b in _btns(captured[0]["keyboard"])] == \
         ["• Оставить", "Отмена"]
     # цельный блок по шаблону → сразу превью с confirm-клавиатурой
     _post_hr(client, "Новый вопрос?\nA. а\nB. б\nC. в\nD. г\nОтвет: A")
     assert _wait_for(lambda: len(captured) >= 2)
     assert "Проверь вопрос" in captured[1]["text"]
-    assert [b["TEXT"] for b in captured[1]["keyboard"]] == \
-        ["💾 Сохранить", "🔄 Заново", "Отмена"]
+    assert [(b["TEXT"], b["COMMAND_PARAMS"])
+            for b in _btns(captured[1]["keyboard"])] == \
+        [("💾 Сохранить", "Сохранить"), ("🔄 Заново", "Заново"),
+         ("Отмена", "Отмена")]
 
 
 def test_hr_admit_waiting_in_place(hr_env, monkeypatch):
@@ -180,7 +199,7 @@ def test_hr_admit_waiting_in_place(hr_env, monkeypatch):
     assert _wait_for(lambda: len(captured) >= 2)
     assert admitted == [5]
     emp = next(c for c in captured if c["dialog"] == "d_emp")
-    assert emp["keyboard"][0]["TEXT"] == "Начать экзамен"
+    assert emp["keyboard"][0]["TEXT"] == "🎓 Начать экзамен"
     assert emp["keyboard"][0]["COMMAND_PARAMS"] == "Начать"
 
 
@@ -198,7 +217,7 @@ def test_hr_admit_parked_not_pulled(hr_env, monkeypatch):
     assert _wait_for(lambda: len(captured) >= 2)
     emp = next(c for c in captured if c["dialog"] == "d_emp")
     assert "Мои курсы" in emp["text"]
-    assert emp["keyboard"][0]["TEXT"] == "Мои курсы"
+    assert emp["keyboard"][0]["TEXT"] == "📚 Мои курсы"
 
 
 # ── /command: роутинг по имени команды ───────────────────────────────────────
@@ -407,8 +426,8 @@ def test_reminders_carry_state_keyboard(send_trap, monkeypatch):
     monkeypatch.setattr(bot, "get_meta", lambda k: None)
     monkeypatch.setattr(bot, "set_meta", lambda k, v: None)
     asyncio.run(bot._maybe_send_reminders(datetime(2026, 8, 17, 12, 0)))
-    assert send_trap and [b["TEXT"] for b in send_trap[0]["keyboard"]] == \
-        ["Готов", "Мои курсы", "Роль"]
+    texts = [b["TEXT"] for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "Роль"]
 
 
 def test_notify_hr_about_user_invite_button(send_trap, monkeypatch):
@@ -445,7 +464,8 @@ def test_invite_autostart_keyboard(hr_env, monkeypatch):
     _post_hr(client, "Пригласить ivan@x.ru")
     assert _wait_for(lambda: any(c["dialog"] == "u500" for c in captured))
     emp = next(c for c in captured if c["dialog"] == "u500")
-    assert [b["TEXT"] for b in emp["keyboard"]] == ["1", "2"]
+    assert [(b["TEXT"], b["COMMAND_PARAMS"])
+            for b in _btns(emp["keyboard"])] == [("1 · A", "1"), ("2 · B", "2")]
 
 
 # ── «Выбрать N» после «Мои курсы» ────────────────────────────────────────────
@@ -463,17 +483,21 @@ def test_my_courses_switch_buttons(send_trap, monkeypatch):
                         lambda uid: {"course_id": 1, "state": "READING",
                                      "role": "fo"})
     monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "список")
-    monkeypatch.setattr(bot, "my_courses",
-                        lambda uid, role: ("t", [{"id": 2}, {"id": 3}]))
+    monkeypatch.setattr(
+        bot, "my_courses",
+        lambda uid, role: ("t", [
+            {"id": 2, "n": 1, "status": "todo", "doc_name": "А.docx"},
+            {"id": 3, "n": 2, "status": "admitted", "doc_name": "Б.docx"},
+        ]))
     bot._recent_msgs.clear()
     _run_employee("Мои курсы")
-    keyboard = send_trap[0]["keyboard"]
-    assert [b["TEXT"] for b in keyboard[:2]] == ["Выбрать 1", "Выбрать 2"]
-    assert [b["TEXT"] for b in keyboard if "TEXT" in b][-3:] == \
-        ["Готов", "Мои курсы", "Роль"]
+    btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert [b["COMMAND_PARAMS"] for b in btns] == \
+        ["Готов", "Выбрать 1", "Выбрать 2", "Роль"]
+    assert btns[2]["TEXT"] == "🎓 2 · Б"                   # допущенный курс
 
     # обычный вопрос в READING → чистый ряд без «Выбрать»
     send_trap.clear()
     _run_employee("что такое чек-ин?")
-    assert [b["TEXT"] for b in send_trap[0]["keyboard"]] == \
-        ["Готов", "Мои курсы", "Роль"]
+    texts = [b["TEXT"] for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "Роль"]

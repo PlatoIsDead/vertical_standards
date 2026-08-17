@@ -429,6 +429,11 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
         else:
             n = selectable.index(c) + 1
             state = open_states.get(c["id"])
+            # Обогащение для BLOCK-кнопок (дизайн 17.08): номер «Выбрать N»
+            # и статус едут вместе с курсом, контракт (text, selectable) прежний
+            c["n"] = n
+            c["status"] = ("admitted" if state == "EXAM"
+                           else "waiting" if state == "WAITING_HR" else "todo")
             if state == "WAITING_HR":
                 lines.append(f"{n}. ⏳ {name} — базовый сдан, ждёт допуска HR")
             elif state == "EXAM":
@@ -611,8 +616,11 @@ def _finish_phase(session: dict, phase: str, questions: dict,
                        score_basic=correct_count)
         # Флаг кнопок читаем env-ом в момент вызова: state_machine не может
         # импортировать bitrix_bot.BUTTONS_ENABLED (циклический импорт).
-        admit_kb = (keyboards.hr_admit(session["user_id"])
-                    if os.getenv("BUTTONS_ENABLED", "0") == "1" else None)
+        admit_kb = None
+        if os.getenv("BUTTONS_ENABLED", "0") == "1":
+            emp = get_employee(session["user_id"])
+            admit_kb = keyboards.hr_admit(
+                session["user_id"], (emp or {}).get("full_name"))
         notify_hr(
             f"📋 Сотрудник {_employee_label(session['user_id'])} "
             f"завершил базовый тест.\n"

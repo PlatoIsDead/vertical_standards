@@ -725,6 +725,30 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
     print(f"BITRIX SEND ERROR after 5 attempts (dialog={dialog_id}): {last_exc!r}")
 
 
+_OPT_BODY_RE = re.compile(r"^[A-D][.)]\s*(.*)$", re.DOTALL)
+
+
+async def _test_options(session: dict | None) -> list | None:
+    """Тела вариантов текущего вопроса (BASIC_TEST/EXAM) — для BLOCK-кнопок
+    «A · текст» (дизайн 17.08: все тела ≤24 симв. → нажатие без сверки)."""
+    if not session or session["state"] not in ("BASIC_TEST", "EXAM"):
+        return None
+    questions = await asyncio.to_thread(get_course_questions,
+                                        session["course_id"])
+    phase = "basic" if session["state"] == "BASIC_TEST" else "exam"
+    q_list = questions.get(f"{phase}_questions", [])
+    idx = session.get("current_q_idx", 0)
+    if not (0 <= idx < len(q_list)):
+        return None
+    bodies = []
+    for o in q_list[idx].get("options", []):
+        m = _OPT_BODY_RE.match(str(o).strip())
+        if not m:
+            return None
+        bodies.append(m.group(1).strip())
+    return bodies if len(bodies) == 4 else None
+
+
 async def _session_keyboard(user_id: str) -> list | None:
     """Клавиатура по ТЕКУЩЕМУ состоянию сессии — для проактивных отправок
     (напоминания №9): кнопки всегда совпадают с тем, что FSM сейчас поймёт."""
@@ -734,7 +758,8 @@ async def _session_keyboard(user_id: str) -> list | None:
     fork = False
     if session is None:
         fork = (await asyncio.to_thread(_retake_fork_text, user_id)) is not None
-    return keyboards.for_session(session, fork, selectable_roles())
+    return keyboards.for_session(session, fork, selectable_roles(),
+                                 test_options=await _test_options(session))
 
 
 async def _handle_employee_message(user_id: str, question: str,
@@ -781,15 +806,19 @@ async def _handle_employee_message(user_id: str, question: str,
         if after is None:
             fork = (await asyncio.to_thread(_retake_fork_text, user_id)
                     is not None)
-        keyboard = keyboards.for_session(after, fork, selectable_roles())
-        # Ответ на «Мои курсы» → кнопки «Выбрать N» поверх ряда (17.08:
+        keyboard = keyboards.for_session(after, fork, selectable_roles(),
+                                         test_options=await _test_options(after))
+        # Ответ на «Мои курсы» → курсы BLOCK-кнопками (дизайн 17.08;
         # в WAITING_HR переключение тоже разрешено)
         if (after and after["state"] in ("READING", "WAITING_HR")
                 and question.strip().lower() in _MENU_COMMANDS):
             _, selectable = await asyncio.to_thread(
                 my_courses, user_id, after.get("role"))
             if selectable:
-                keyboard = keyboards.with_switch(keyboard, len(selectable))
+                keyboard = keyboards.courses_menu(
+                    [(c["n"], display_name(c["doc_name"]), c["status"])
+                     for c in selectable],
+                    reading=(after["state"] == "READING"))
 
     asyncio.create_task(_send(dialog_id, text, bot_id or BOT_ID, client_id,
                               keyboard=keyboard))
@@ -893,7 +922,7 @@ async def _broadcast_course(course: dict, uids: list[str]) -> None:
     BOT_CLIENT_ID из .env. Последовательно: _send ретраит до 5 раз на флапе."""
     text = (f"📚 Тебе доступен новый курс: *{display_name(course['doc_name'])}*\n"
             "Напиши мне любое сообщение, чтобы начать обучение.")
-    kb = keyboards.start_button("Начать обучение") if BUTTONS_ENABLED else None
+    kb = keyboards.start_button("▶ Начать обучение") if BUTTONS_ENABLED else None
     for uid in uids:
         await _send(f"u{uid}", text, BOT_ID, **_kb_kwargs(kb))
 
@@ -963,19 +992,31 @@ async def _handle_hr_message(user_id: str, question: str,
             return
         _pending_edits.pop(user_id, None)  # команда важнее забытой правки
 
-    if msg_lower in ("курсы", "курс", "список"):
+    m_courses = re.match(r"^(?:курсы|курс|список)(?:\s+(\d+))?$", msg_lower)
+    if m_courses:
+        # Дизайн 17.08: постранично по 8 — 40 кнопок в 30 КБ влезут,
+        # но список перестаёт читаться; «Показать ещё» шлёт «Курсы {page+1}»
+        page = int(m_courses.group(1) or 1)
         pending = await asyncio.to_thread(get_pending_courses)
         if not pending:
             text = "✅ Нет курсов, ожидающих активации."
         else:
-            lines = ["📋 *Курсы на проверке:*\n"]
-            for c in pending:
-                name = c['doc_name']
-                n = c['id']
-                lines.append(f"*{name}*")
-                lines.append(f"  👁 Вопросы {n}   ✅ Подтвердить {n}\n")
+            start = (page - 1) * keyboards.HR_COURSES_PAGE
+            page_items = pending[start:start + keyboards.HR_COURSES_PAGE]
+            if not page_items:                       # кривая страница → первая
+                page, start = 1, 0
+                page_items = pending[:keyboards.HR_COURSES_PAGE]
+            header = "📋 *Курсы на проверке"
+            if len(pending) > keyboards.HR_COURSES_PAGE:
+                header += f" ({start + 1}–{start + len(page_items)} из {len(pending)})"
+            lines = [header + ":*\n"]
+            for c in page_items:
+                lines.append(f"*{c['doc_name']}*")
+                lines.append(f"  👁 Вопросы {c['id']}   ✅ Подтвердить {c['id']}\n")
             text = "\n".join(lines)
-            kb = keyboards.hr_course_list([c["id"] for c in pending])
+            kb = keyboards.hr_course_list(
+                [c["id"] for c in page_items], page,
+                remaining=len(pending) - start - len(page_items))
 
     elif msg_lower.startswith("подтвердить"):
         parts = question.split()
@@ -1081,13 +1122,13 @@ async def _handle_hr_message(user_id: str, question: str,
                 if in_place:
                     msg = ("🎓 HR допустил тебя к экзамену! "
                            "Напиши что-нибудь, чтобы начать.")
-                    kbd = (keyboards.start_button("Начать экзамен")
+                    kbd = (keyboards.start_button("🎓 Начать экзамен")
                            if BUTTONS_ENABLED else None)
                 else:
                     # Не выдёргиваем из текущего курса — экзамен ждёт в меню
                     msg = (f"🎓 HR допустил тебя к экзамену по курсу *{cname}*. "
                            "Сдай его, когда будешь готов: Мои курсы → Выбрать.")
-                    kbd = (keyboards.start_button("Мои курсы", "Мои курсы")
+                    kbd = (keyboards.start_button("📚 Мои курсы", "Мои курсы", role="secondary")
                            if BUTTONS_ENABLED else None)
                 if waiting.get("dialog_id"):
                     await _send(waiting["dialog_id"], msg, BOT_ID, client_id,
@@ -1101,7 +1142,7 @@ async def _handle_hr_message(user_id: str, question: str,
                     emp_dialog = await asyncio.to_thread(get_session_dialog_id,
                                                          target_uid)
                     if emp_dialog:
-                        start_kb = (keyboards.start_button("Начать экзамен")
+                        start_kb = (keyboards.start_button("🎓 Начать экзамен")
                                     if BUTTONS_ENABLED else None)
                         await _send(
                             emp_dialog,
@@ -1302,7 +1343,8 @@ async def _handle_hr_message(user_id: str, question: str,
             "• *Руководители* — реестр получателей эскалаций\n"
             "• *Руководитель добавить/удалить {email} [старший]* — правка реестра"
         )
-        kb = keyboards.hr_main_menu()
+        has_pending = bool(await asyncio.to_thread(get_pending_courses))
+        kb = keyboards.hr_main_menu(has_pending)
 
     if not BUTTONS_ENABLED:
         kb = None
@@ -1624,11 +1666,17 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
         with open(draft_path, "w", encoding="utf-8") as f:
             json.dump(questions, f, ensure_ascii=False, indent=2)
 
-        # 10. Notify HR
+        # 10. Notify HR (дизайн 17.08: сводка-страховка перед необратимым —
+        # сколько вопросов и сколько получателей уйдёт рассылка)
         hr_ids = _hr_ids()
+        course_row = await asyncio.to_thread(get_course_by_id, course_id)
+        n_recipients = len(await asyncio.to_thread(
+            _course_recipients, course_row)) if course_row else 0
         notify_text = (
             f"📄 Новый документ: *{file_name}*\n"
-            f"Сгенерировано 15 вопросов (5 базовых + 10 экзаменационных).\n\n"
+            f"15 вопросов (5 базовых + 10 экзаменационных) · "
+            f"{n_recipients} подходящих получателей рассылки.\n"
+            "После подтверждения курс активируется и рассылка уйдёт сразу.\n\n"
             f"Посмотреть вопросы: Вопросы {course_id}\n"
             f"Активировать курс: Подтвердить {course_id}"
         )
@@ -1638,7 +1686,7 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
                 "такого департамента нет в реестре ролей (data/roles.json). "
                 "Проверь имя файла."
             )
-        notify_kb = (keyboards.hr_course_actions(course_id)
+        notify_kb = (keyboards.hr_new_course_actions(course_id)
                      if BUTTONS_ENABLED else None)
         for hr_id in hr_ids:
             await _send(str(hr_id), notify_text, HR_BOT_ID,

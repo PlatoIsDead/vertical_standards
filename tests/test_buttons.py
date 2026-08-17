@@ -21,25 +21,35 @@ def _wait_for(predicate, timeout=2.0):
 
 # ── Чистые клавиатуры ────────────────────────────────────────────────────────
 
+def _btns(keyboard):
+    return [b for b in keyboard if "TEXT" in b]
+
+
 def test_for_session_states():
+    """Дизайн 17.08: TEXT — витрина, COMMAND_PARAMS — прежние команды FSM."""
     assert kb.for_session(None) is None
-    assert [b["TEXT"] for b in kb.for_session(None, fork=True)] == \
-        ["Пересдать", "Далее"]
-    assert [b["TEXT"] for b in
-            kb.for_session({"state": "ROLE_SELECT"}, role_options=[1, 2, 3])] \
-        == ["1", "2", "3"]
-    reading = kb.for_session({"state": "READING"})
-    assert [b["TEXT"] for b in reading] == ["Готов", "Мои курсы", "Роль"]
+    fork = _btns(kb.for_session(None, fork=True))
+    assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in fork] == \
+        [("🔁 Пересдать экзамен", "Пересдать"), ("Далее, к следующему", "Далее")]
+    roles = _btns(kb.for_session({"state": "ROLE_SELECT"},
+                                 role_options=[("a", "А"), ("b", "Б"),
+                                               ("c", "В")]))
+    assert [b["COMMAND_PARAMS"] for b in roles] == ["1", "2", "3"]
+    reading = _btns(kb.for_session({"state": "READING"}))
+    assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in reading] == \
+        [("✅ Готов к тесту", "Готов"), ("📚 Мои курсы", "Мои курсы"),
+         ("Роль", "Роль")]
     assert reading[0]["DISPLAY"] == "BLOCK"
-    assert [b["TEXT"] for b in kb.for_session({"state": "BASIC_TEST"})] == \
+    assert [b["COMMAND_PARAMS"] for b in
+            _btns(kb.for_session({"state": "BASIC_TEST"}))] == \
         ["A", "B", "C", "D"]
     assert kb.for_session({"state": "EXAM"}) == kb.for_session(
         {"state": "BASIC_TEST"})
-    assert [b["TEXT"] for b in kb.for_session({"state": "WAITING_HR"})] == \
-        ["Мои курсы"]
-    # Нажатие = набор того же текста: generic-команда say
-    assert all(b["COMMAND"] == "say" and b["COMMAND_PARAMS"] == b["TEXT"]
-               for b in reading)
+    waiting = _btns(kb.for_session({"state": "WAITING_HR"}))
+    assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in waiting] == \
+        [("📚 Мои курсы", "Мои курсы")]
+    # Нажатие шлёт generic-команду say с ПРЕЖНИМ payload
+    assert all(b["COMMAND"] == "say" for b in reading)
 
 
 # ── KEYBOARD в payload _send ─────────────────────────────────────────────────
@@ -86,6 +96,7 @@ def test_keyboard_attached_when_flag_on(monkeypatch):
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
     monkeypatch.setattr(bot, "get_session",
                         lambda uid: {"course_id": 5, "state": "BASIC_TEST"})
+    monkeypatch.setattr(bot, "get_course_questions", lambda cid: {})
     monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "ok")
     captured = []
 
