@@ -168,6 +168,7 @@ def _is_duplicate(user_id: str, dialog_id: str, question: str) -> bool:
 async def start_disk_poller():
     global _poller_task, _user_poller_task, _rating_task
     global _reminder_task, _escalation_task
+    print(f"[build] git commit: {os.getenv('GIT_COMMIT', 'dev')}")
     _poller_task = asyncio.create_task(_disk_poll_loop())
     _user_poller_task = asyncio.create_task(_user_poll_loop())
     _rating_task = asyncio.create_task(_weekly_rating_loop())

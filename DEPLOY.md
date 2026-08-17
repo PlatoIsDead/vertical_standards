@@ -16,11 +16,31 @@ sudo systemctl enable --now docker
 ## Деплой / редеплой
 
 ```bash
-./deploy.sh
+./deploy.sh                # деплой текущего HEAD
+./deploy.sh --tag v1.1     # то же + создать и запушить annotated-тег релиза
 ```
 
-Скрипт: код → `~/vertical-standards/src/`, сборка образа `vertical-standards:latest`,
-перезапуск контейнера `vertical-standards-bot` (порт 8000 наружу).
+Деплой СТРОГО ИЗ GIT: уезжает `git archive HEAD` (не рабочая папка);
+незакоммиченное в app/scripts/requirements.txt/Dockerfile блокирует запуск.
+Образ тегируется `vertical-standards:latest` + `vertical-standards:<rev>`,
+хеш коммита виден в логе старта (`[build] git commit: ...`) и в `GIT_COMMIT`
+env контейнера. Перезапуск контейнера `vertical-standards-bot` (порт 8000).
+
+## Откат
+
+Быстрый (на сервере, без пересборки — старые образы хранят каждый деплой):
+
+```bash
+docker images vertical-standards        # выбрать <rev>
+docker rm -f vertical-standards-bot
+# повторить docker run из deploy.sh (шаг 5/5), подставив vertical-standards:<rev>
+```
+
+Каноничный (через git-тег):
+
+```bash
+git checkout v1.0 && ./deploy.sh && git checkout master
+```
 `.env`, `state/onboarding.db`, `state/data/` сидируются **только при первом деплое** —
 повторные запуски серверное состояние не перезаписывают. Канал до сервера может
 флапать — внутри ретраи (ControlMaster, сокет `/tmp/mux-vert`).
