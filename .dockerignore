@@ -1,0 +1,12 @@
+.env
+.git
+data/
+tests/
+PRPs/
+onboarding.db
+*.deb
+*.md
+__pycache__/
+*.pyc
+.pytest_cache/
+scripts/__pycache__/
