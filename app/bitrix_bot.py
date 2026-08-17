@@ -665,10 +665,12 @@ async def _session_keyboard(user_id: str) -> list | None:
 
 async def _handle_employee_message(user_id: str, question: str,
                                    dialog_id: str, client_id: str,
-                                   bot_id: str = None) -> None:
+                                   bot_id: str = None,
+                                   dedup_key: str | None = None) -> None:
     """Общий путь employee-бота: текст из чата ("/") и нажатие кнопки
-    ("/command", №7) обрабатываются одинаково."""
-    if _is_duplicate(user_id, dialog_id, question):
+    ("/command", №7) обрабатываются одинаково. dedup_key — ключ дедупа для
+    кнопок (текст+MESSAGE_ID): та же надпись на ДРУГОМ сообщении легитимна."""
+    if _is_duplicate(user_id, dialog_id, dedup_key or question):
         print(f"DEDUP skip (dialog={dialog_id}): {question!r}")
         return
 
@@ -770,12 +772,19 @@ async def command_handler(request: Request):
     if not params or not dialog_id or not user_id:
         return {"status": "no_data"}
 
+    # Дедуп по (текст + сообщение-источник): двойной клик той же кнопки
+    # гасится, та же надпись на другом сообщении — проходит.
+    message_id = field("MESSAGE_ID")
+    dedup_key = f"{params}#msg{message_id}" if message_id else None
+
     # Роутинг по ИМЕНИ команды: hrsay → HR-бот, say/нет поля → employee
     command_name = field("COMMAND").lower()
     if command_name == "hrsay":
-        await _handle_hr_message(user_id, params, dialog_id, client_id)
+        await _handle_hr_message(user_id, params, dialog_id, client_id,
+                                 dedup_key=dedup_key)
     else:
-        await _handle_employee_message(user_id, params, dialog_id, client_id)
+        await _handle_employee_message(user_id, params, dialog_id, client_id,
+                                       dedup_key=dedup_key)
     return {"status": "ok"}
 
 
@@ -835,10 +844,11 @@ async def hr_handler(request: Request):
 
 
 async def _handle_hr_message(user_id: str, question: str,
-                             dialog_id: str, client_id: str) -> None:
+                             dialog_id: str, client_id: str,
+                             dedup_key: str | None = None) -> None:
     """Общий путь HR-бота: текст из чата ("/hr") и нажатие HR-кнопки
     ("/command", команда hrsay) обрабатываются одинаково."""
-    if _is_duplicate(user_id, dialog_id, question):
+    if _is_duplicate(user_id, dialog_id, dedup_key or question):
         print(f"DEDUP skip HR (dialog={dialog_id}): {question!r}")
         return
 

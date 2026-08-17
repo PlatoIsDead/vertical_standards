@@ -172,10 +172,12 @@ def test_hr_admit_sends_start_exam_button(hr_env, monkeypatch):
 def cmd_router(monkeypatch):
     calls = []
 
-    async def fake_hr(user_id, question, dialog_id, client_id):
+    async def fake_hr(user_id, question, dialog_id, client_id,
+                      dedup_key=None):
         calls.append(("hr", user_id, question, dialog_id))
 
-    async def fake_emp(user_id, question, dialog_id, client_id, bot_id=None):
+    async def fake_emp(user_id, question, dialog_id, client_id, bot_id=None,
+                       dedup_key=None):
         calls.append(("emp", user_id, question, dialog_id))
 
     monkeypatch.setattr(bot, "_handle_hr_message", fake_hr)
@@ -229,6 +231,40 @@ def test_command_say_and_missing_name_route_to_employee(cmd_router):
         "data[USER][ID]": "u2",
     })
     assert calls == [("emp", "u1", "A", "d1"), ("emp", "u2", "B", "d2")]
+
+
+def test_command_dedup_by_source_message(monkeypatch):
+    """Та же надпись кнопки на РАЗНЫХ сообщениях → оба нажатия проходят;
+    двойной клик той же кнопки (тот же MESSAGE_ID) → гасится (лог 17.08)."""
+    replies = []
+
+    async def fake_send(dialog_id, text, bot_id=None, client_id="",
+                        keyboard=None):
+        replies.append(text)
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "ОТВЕТ")
+    monkeypatch.setattr(bot, "get_session", lambda uid: None)
+    monkeypatch.setattr(bot, "_retake_fork_text", lambda uid: None)
+    bot._recent_msgs.clear()
+    client = TestClient(bot.app)
+
+    def press(msg_id):
+        client.post("/command", data={
+            "event": "ONIMCOMMANDADD",
+            "data[COMMAND][70][COMMAND]": "say",
+            "data[COMMAND][70][COMMAND_PARAMS]": "Мои курсы",
+            "data[COMMAND][70][MESSAGE_ID]": msg_id,
+            "data[PARAMS][DIALOG_ID]": "d1",
+            "data[USER][ID]": "u9",
+        })
+
+    press("100")
+    press("101")            # та же надпись, другое сообщение → проходит
+    press("101")            # двойной клик той же кнопки → dedup
+    assert _wait_for(lambda: len(replies) >= 2)
+    time.sleep(0.05)
+    assert len(replies) == 2
 
 
 # ── notify_hr + кнопка «Допустить» из _finish_phase ──────────────────────────
