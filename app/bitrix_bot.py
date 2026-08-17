@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from app.db import (
     get_meta,
     get_pending_courses,
     get_processed_by_folders,
+    get_processed_by_hash,
     get_processed_file,
     get_report_rows,
     get_session,
@@ -57,11 +59,12 @@ from app.db import (
 from app.doc_parsers import SUPPORTED_EXTS, parse_file
 from app.hr_tools import (
     REPLACEMENT_TEMPLATE,
+    _norm_letter,
     apply_replacement,
     build_history_text,
     build_report_text,
     correct_option,
-    format_question_full,
+    format_question_card,
     parse_replacement,
     question_by_ref,
 )
@@ -136,7 +139,8 @@ _pending_edits: dict[str, dict] = {}
 # Начало любого из этих слов = команда; при живом pending команда важнее правки
 _HR_COMMAND_PREFIXES = ("курсы", "курс", "список", "подтвердить", "допустить",
                         "пригласить", "вопросы", "изменить", "история",
-                        "отчёт", "отчет", "руководители", "руководитель")
+                        "отчёт", "отчет", "руководители", "руководитель",
+                        "перегенерировать")
 
 
 def _get_pending(user_id: str) -> dict | None:
@@ -491,27 +495,94 @@ def _extract_email(text: str) -> str | None:
     return m.group(0).lower() if m else None
 
 
-async def _apply_pending_edit(user_id: str, pending: dict, raw: str) -> str:
-    """Шаг 2 правки: разобрать замену, применить к questions_json курса."""
-    repl = parse_replacement(raw)
-    if repl is None:
-        return ("❌ Не понял формат. Пришли вопрос одним сообщением:\n\n"
-                + REPLACEMENT_TEMPLATE + "\n\nИли напиши: Отмена")
-    questions = await asyncio.to_thread(get_course_questions, pending["course_id"])
-    try:
-        questions = apply_replacement(questions, pending["q_num"], repl)
-    except ValueError as exc:
-        return f"❌ {exc}"
-    await asyncio.to_thread(
-        update_course_questions, pending["course_id"],
-        json.dumps(questions, ensure_ascii=False),
-    )
-    _pending_edits.pop(user_id, None)
-    course = await asyncio.to_thread(get_course_by_id, pending["course_id"])
-    new_q = question_by_ref(questions, pending["q_num"])
-    doc_name = course["doc_name"] if course else f"№{pending['course_id']}"
-    return (f"✅ Вопрос {pending['q_num']} курса «{doc_name}» обновлён.\n\n"
-            + format_question_full(new_q, pending["q_num"]))
+# ── Визард правки вопроса (17.08: вместо one-shot всей карточки) ─────────────
+
+_WIZARD_STEPS = ("text", "opt_a", "opt_b", "opt_c", "opt_d", "correct", "confirm")
+
+
+def _wizard_step_text(pending: dict) -> str:
+    d = pending["draft"]
+    step = pending["step"]
+    n = _WIZARD_STEPS.index(step) + 1
+    if step == "text":
+        return (f"✏️ Правка вопроса {pending['q_num']} курса "
+                f"«{pending['doc_name']}» — шаг 1/6: текст вопроса.\n"
+                f"Сейчас: {d['text']}\n\n"
+                "Пришли новый текст, точку (.) — оставить как есть, либо весь "
+                "вопрос целиком по шаблону:\n\n" + REPLACEMENT_TEMPLATE
+                + "\n\nОтмена — выйти без изменений.")
+    if step.startswith("opt_"):
+        i = "abcd".index(step[-1])
+        return (f"Шаг {n}/6: вариант {'ABCD'[i]}.\n"
+                f"Сейчас: {d['options'][i]}\n\n"
+                "Пришли новый текст варианта или точку (.) — оставить.")
+    if step == "correct":
+        return (f"Шаг 6/6: правильный ответ.\nСейчас: {d['correct']}\n\n"
+                "Пришли букву A–D или точку (.) — оставить.")
+    # confirm
+    preview = format_question_card(pending["doc_name"], d, pending["q_num"])
+    return ("Проверь вопрос:\n\n" + preview
+            + "\n\n💾 Сохранить — записать · 🔄 Заново — с первого шага · "
+              "Отмена — выйти без изменений.")
+
+
+async def _wizard_input(user_id: str, pending: dict,
+                        raw: str) -> tuple[str, list | None]:
+    """Обработка ответа HR на текущем шаге визарда → (текст, клавиатура)."""
+    d = pending["draft"]
+    step = pending["step"]
+    val = raw.strip()
+    skip = val == "."
+
+    if step == "confirm":
+        low = val.lower().strip("💾🔄 ")
+        if low == "сохранить":
+            questions = await asyncio.to_thread(get_course_questions,
+                                                pending["course_id"])
+            try:
+                questions = apply_replacement(questions, pending["q_num"], d)
+            except ValueError as exc:
+                return (f"❌ {exc}\n\n" + _wizard_step_text(pending),
+                        keyboards.hr_wizard_confirm())
+            await asyncio.to_thread(
+                update_course_questions, pending["course_id"],
+                json.dumps(questions, ensure_ascii=False),
+            )
+            course_id, q_num = pending["course_id"], pending["q_num"]
+            saved = question_by_ref(questions, q_num)
+            _pending_edits.pop(user_id, None)
+            return (f"✅ Вопрос {q_num} сохранён.\n\n"
+                    + format_question_card(pending["doc_name"], saved, q_num),
+                    keyboards.hr_question_card(course_id, q_num))
+        if low == "заново":
+            pending["step"] = "text"
+            return _wizard_step_text(pending), keyboards.hr_wizard_step()
+        return _wizard_step_text(pending), keyboards.hr_wizard_confirm()
+
+    if step == "text":
+        repl = parse_replacement(raw)
+        if repl is not None:              # power-user: цельный блок по шаблону
+            d.update(repl)
+            pending["step"] = "confirm"
+            return _wizard_step_text(pending), keyboards.hr_wizard_confirm()
+        if not skip:
+            d["text"] = val
+    elif step.startswith("opt_"):
+        i = "abcd".index(step[-1])
+        if not skip:
+            d["options"][i] = f"{'ABCD'[i]}. {val}"
+    elif step == "correct" and not skip:
+        letter = _norm_letter(val)
+        if letter not in ("A", "B", "C", "D"):
+            return ("❌ Нужна буква A–D (или точка — оставить).\n\n"
+                    + _wizard_step_text(pending), keyboards.hr_wizard_step())
+        d["correct"] = letter
+
+    pending["step"] = _WIZARD_STEPS[_WIZARD_STEPS.index(step) + 1]
+    pending["expires"] = time.monotonic() + PENDING_EDIT_TTL
+    kb = (keyboards.hr_wizard_confirm() if pending["step"] == "confirm"
+          else keyboards.hr_wizard_step())
+    return _wizard_step_text(pending), kb
 
 
 async def _bitrix_user_by_email(email: str) -> dict | None:
@@ -852,7 +923,13 @@ async def _handle_hr_message(user_id: str, question: str,
                              dedup_key: str | None = None) -> None:
     """Общий путь HR-бота: текст из чата ("/hr") и нажатие HR-кнопки
     ("/command", команда hrsay) обрабатываются одинаково."""
-    if _is_duplicate(user_id, dialog_id, dedup_key or question):
+    # Внутри визарда ключ дедупа включает шаг: «.» на соседних шагах легальна,
+    # дубль-доставка ответа на ОДИН шаг гасится.
+    wiz = _get_pending(user_id)
+    key = dedup_key or question
+    if wiz:
+        key = f"{key}#step{wiz.get('step', '')}"
+    if _is_duplicate(user_id, dialog_id, key):
         print(f"DEDUP skip HR (dialog={dialog_id}): {question!r}")
         return
 
@@ -879,11 +956,10 @@ async def _handle_hr_message(user_id: str, question: str,
                                       HR_BOT_ID, client_id))
             return
         if not msg_lower.startswith(_HR_COMMAND_PREFIXES):
-            text = await _apply_pending_edit(user_id, pending, question)
-            if BUTTONS_ENABLED and text.startswith("❌ Не понял"):
-                kb = keyboards.hr_cancel_edit()
-            asyncio.create_task(_send(dialog_id, text, HR_BOT_ID, client_id,
-                                      **_kb_kwargs(kb)))
+            text, kb = await _wizard_input(user_id, pending, question)
+            asyncio.create_task(_send(
+                dialog_id, text, HR_BOT_ID, client_id,
+                **_kb_kwargs(kb if BUTTONS_ENABLED else None)))
             return
         _pending_edits.pop(user_id, None)  # команда важнее забытой правки
 
@@ -1038,46 +1114,52 @@ async def _handle_hr_message(user_id: str, question: str,
                     text = f"❌ Активная сессия для сотрудника {target_uid} не найдена."
 
     elif msg_lower.startswith("вопросы"):
-        parts = question.split()
-        if len(parts) < 2:
-            text = "❌ Укажи номер курса: Вопросы {N}"
+        # 17.08: «Вопросы N» — карточки по одному; «N.q» — конкретный;
+        # «N все» — прежняя простыня со всеми ответами
+        m = re.match(r"^вопросы\s+(\d+)(?:\.(\d+))?(\s+все)?$", msg_lower)
+        if not m:
+            text = ("❌ Формат: Вопросы {N} — по карточке, "
+                    "Вопросы {N}.{вопрос 1–15} — конкретный, "
+                    "Вопросы {N} все — списком")
         else:
-            try:
-                course_id = int(parts[-1])
-                course = await asyncio.to_thread(get_course_by_id, course_id)
-                if not course:
-                    text = f"❌ Курс №{course_id} не найден."
+            course_id = int(m.group(1))
+            q_num = int(m.group(2)) if m.group(2) else 1
+            course = await asyncio.to_thread(get_course_by_id, course_id)
+            if not course:
+                text = f"❌ Курс №{course_id} не найден."
+            elif m.group(3):                     # «все» — простыня
+                questions = await asyncio.to_thread(get_course_questions, course_id)
+                basic = questions.get("basic_questions", [])
+                exam = questions.get("exam_questions", [])
+                # Сквозная нумерация 1–15: 1–5 базовые, 6–15 экзамен
+                # (та же, что в команде «Изменить»)
+                lines = [f"📋 *{course['doc_name']}*\n"]
+                lines.append("*Базовые вопросы (1–5):*")
+                for i, q in enumerate(basic, 1):
+                    lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
+                lines.append("\n*Экзаменационные вопросы (6–15):*")
+                for i, q in enumerate(exam, 6):
+                    lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
+                lines.append(f"\nДля активации: Подтвердить {course_id}")
+                lines.append(f"Изменить вопрос: Изменить {course_id}.{{номер 1–15}}")
+                text = "\n".join(lines)
+                kb = keyboards.hr_course_actions(course_id)
+            else:
+                questions = await asyncio.to_thread(get_course_questions, course_id)
+                q = question_by_ref(questions, q_num)
+                if q is None:
+                    text = "❌ Номер вопроса — от 1 до 15."
                 else:
-                    questions = await asyncio.to_thread(get_course_questions, course_id)
-                    basic = questions.get("basic_questions", [])
-                    exam = questions.get("exam_questions", [])
-                    # Сквозная нумерация 1–15: 1–5 базовые, 6–15 экзамен
-                    # (та же, что в команде «Изменить»)
-                    lines = [f"📋 *{course['doc_name']}*\n"]
-                    lines.append("*Базовые вопросы (1–5):*")
-                    for i, q in enumerate(basic, 1):
-                        lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
-                    lines.append("\n*Экзаменационные вопросы (6–15):*")
-                    for i, q in enumerate(exam, 6):
-                        lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
-                    lines.append(f"\nДля активации: Подтвердить {course_id}")
-                    lines.append(f"Изменить вопрос: Изменить {course_id} {{номер 1–15}}")
-                    text = "\n".join(lines)
-                    kb = keyboards.hr_course_actions(course_id)
-            except ValueError:
-                text = "❌ Укажи числовой номер курса: Вопросы {N}"
+                    text = format_question_card(course["doc_name"], q, q_num)
+                    kb = keyboards.hr_question_card(course_id, q_num)
 
     elif msg_lower.startswith("изменить"):
-        parts = question.split()
-        course_id = q_num = None
-        if len(parts) >= 3:
-            try:
-                course_id, q_num = int(parts[1]), int(parts[2])
-            except ValueError:
-                pass
-        if course_id is None:
-            text = "❌ Формат: Изменить {номер курса} {номер вопроса 1–15}"
+        # 17.08: пошаговый визард вместо one-shot; форматы «N q» и «N.q»
+        m = re.match(r"^изменить\s+(\d+)[.\s]+(\d+)$", msg_lower)
+        if not m:
+            text = "❌ Формат: Изменить {курс}.{вопрос 1–15} (или через пробел)"
         else:
+            course_id, q_num = int(m.group(1)), int(m.group(2))
             course = await asyncio.to_thread(get_course_by_id, course_id)
             if not course:
                 text = f"❌ Курс №{course_id} не найден."
@@ -1090,17 +1172,42 @@ async def _handle_hr_message(user_id: str, question: str,
                 else:
                     _pending_edits[user_id] = {
                         "course_id": course_id, "q_num": q_num,
+                        "doc_name": course["doc_name"], "step": "text",
+                        "draft": {"text": q["text"],
+                                  "options": list(q["options"]),
+                                  "correct": q["correct"],
+                                  "explanation": q.get("explanation", "")},
                         "expires": time.monotonic() + PENDING_EDIT_TTL,
                     }
-                    text = (
-                        f"✏️ Курс «{course['doc_name']}», сейчас:\n\n"
-                        + format_question_full(q, q_num)
-                        + "\n\nПришли новый вопрос одним сообщением:\n\n"
-                        + REPLACEMENT_TEMPLATE
-                        + "\n\n(Пояснение необязательно; без него старое "
-                          "пояснение удаляется.)\nОтмена — выйти без изменений."
-                    )
-                    kb = keyboards.hr_cancel_edit()
+                    text = _wizard_step_text(_pending_edits[user_id])
+                    kb = keyboards.hr_wizard_step()
+
+    elif msg_lower.startswith("перегенерировать"):
+        m = re.match(r"^перегенерировать\s+(\d+)(?:\.(\d+))?$", msg_lower)
+        if not m:
+            text = ("❌ Формат: Перегенерировать {N} — весь курс, "
+                    "Перегенерировать {N}.{вопрос 1–15} — один вопрос")
+        else:
+            course_id = int(m.group(1))
+            q_num = int(m.group(2)) if m.group(2) else None
+            course = await asyncio.to_thread(get_course_by_id, course_id)
+            if not course:
+                text = f"❌ Курс №{course_id} не найден."
+            elif q_num is not None and not (1 <= q_num <= 15):
+                text = "❌ Номер вопроса — от 1 до 15."
+            else:
+                doc_chunks = [c for c in chunks
+                              if c.get("doc_name") == course["doc_name"]]
+                if not doc_chunks:
+                    text = ("❌ Фрагменты документа не найдены в индексе — "
+                            "перегенерация недоступна.")
+                else:
+                    # LLM долго — вебхук не ждёт (паттерн _build_and_send_report)
+                    asyncio.create_task(_regenerate_and_notify(
+                        dialog_id, client_id, course, q_num, doc_chunks))
+                    what = (f"вопрос {q_num}" if q_num else "все 15 вопросов")
+                    text = (f"⏳ Генерирую заново {what} курса "
+                            f"«{course['doc_name']}» — пришлю результат…")
 
     elif msg_lower.startswith("история"):
         parts = question.split()
@@ -1203,6 +1310,58 @@ async def _handle_hr_message(user_id: str, question: str,
                               **_kb_kwargs(kb)))
 
 
+async def _regenerate_and_notify(dialog_id: str, client_id: str, course: dict,
+                                 q_num: int | None,
+                                 doc_chunks: list[dict]) -> None:
+    """Фоновая перегенерация вопросов (17.08). Best-effort: сбой — лог + «❌»."""
+    from app import course_generator  # noqa: PLC0415
+    try:
+        if q_num is None:
+            new_questions = await asyncio.to_thread(
+                course_generator.generate_questions, course["doc_name"],
+                doc_chunks)
+            await asyncio.to_thread(
+                update_course_questions, course["id"],
+                json.dumps(new_questions, ensure_ascii=False))
+            first = question_by_ref(new_questions, 1)
+            text = (f"✅ Курс «{course['doc_name']}»: 15 вопросов пересозданы "
+                    "(прежние, включая ручные правки, затёрты).\n\n"
+                    + format_question_card(course["doc_name"], first, 1))
+            kb = keyboards.hr_question_card(course["id"], 1)
+        else:
+            questions = await asyncio.to_thread(get_course_questions,
+                                                course["id"])
+            facts = (questions.get("facts_basic", [])
+                     + questions.get("facts_exam", []))
+            fact = facts[q_num - 1] if len(facts) >= q_num else None
+            existing = [x["text"] for x in
+                        questions.get("basic_questions", [])
+                        + questions.get("exam_questions", [])]
+            new_q = await asyncio.to_thread(
+                course_generator.regenerate_one, course["doc_name"],
+                doc_chunks, fact, existing)
+            questions = apply_replacement(questions, q_num, {
+                "text": new_q["text"], "options": new_q["options"],
+                "correct": new_q["correct"],
+                "explanation": new_q.get("explanation", ""),
+            })
+            await asyncio.to_thread(
+                update_course_questions, course["id"],
+                json.dumps(questions, ensure_ascii=False))
+            text = (f"✅ Вопрос {q_num} курса «{course['doc_name']}» "
+                    "пересоздан.\n\n"
+                    + format_question_card(course["doc_name"], new_q, q_num))
+            kb = keyboards.hr_question_card(course["id"], q_num)
+        await _send(dialog_id, text, HR_BOT_ID, client_id,
+                    **_kb_kwargs(kb if BUTTONS_ENABLED else None))
+    except Exception as exc:
+        import traceback
+        print(f"[regen] ERROR: {exc}\n{traceback.format_exc()}")
+        await _send(dialog_id,
+                    "❌ Перегенерация не удалась — попробуй ещё раз позже.",
+                    HR_BOT_ID, client_id)
+
+
 @app.post("/disk-webhook")
 async def disk_webhook(request: Request):
     form = await request.form()
@@ -1269,14 +1428,19 @@ async def user_webhook(request: Request):
     return {"status": "ok"}
 
 
+_ingest_locks: dict[str, asyncio.Lock] = {}
+
+
+def _doc_lock(file_name: str) -> asyncio.Lock:
+    return _ingest_locks.setdefault(file_name, asyncio.Lock())
+
+
 async def process_new_document(file_id: str, file_name: str,
                                roles: list[str] = None,
                                folder_id: str = None) -> None:
     """Download from Bitrix Disk, update RAG index, generate questions, notify HR.
 
     roles — роли-адресаты чанков (из папки); префиксы в имени файла главнее (№11)."""
-    global chunks, embeddings
-
     print(f"[process_new_document] START file_id={file_id!r} name={file_name!r} roles={roles}")
 
     if file_name.startswith("."):
@@ -1290,14 +1454,27 @@ async def process_new_document(file_id: str, file_name: str,
         roles = parsed["roles"]
     roles = roles or ["all_staff"]
 
-    # Защита от двойного срабатывания (поллер + вебхук)
-    if await asyncio.to_thread(is_file_processed, file_id):
-        print(f"[process_new_document] {file_id} already processed — skip")
-        return
-
     ext = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else ""
     if ext not in SUPPORTED_EXTS:
         print(f"[process_new_document] Unsupported type: .{ext}")
+        return
+
+    # Гонка копий одного документа (живые данные 29.07: 4 курса
+    # «КОНФЕДЕНЦИАЛЬНОСТЬ» за 4с из 4 копий в разных ролевых папках —
+    # каждая проверила «курс уже есть?» до сохранения первой): копии
+    # сериализуются per-doc локом, разные документы идут параллельно.
+    async with _doc_lock(file_name):
+        await _ingest_document(file_id, file_name, roles, folder_id, parsed, ext)
+
+
+async def _ingest_document(file_id: str, file_name: str, roles: list[str],
+                           folder_id: str, parsed: dict, ext: str) -> None:
+    """Тело ингеста — строго под _doc_lock(file_name)."""
+    global chunks, embeddings
+
+    # Защита от двойного срабатывания (поллер + вебхук)
+    if await asyncio.to_thread(is_file_processed, file_id):
+        print(f"[process_new_document] {file_id} already processed — skip")
         return
 
     tmp_path = None
@@ -1320,6 +1497,8 @@ async def process_new_document(file_id: str, file_name: str,
             r2 = await client.get(download_url)
             r2.raise_for_status()
             file_bytes = r2.content
+        # 17.08: дедуп переименованных копий — хеш сырого содержимого
+        content_hash = hashlib.sha256(file_bytes).hexdigest()
 
         # 3. Save to temp path
         data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -1387,7 +1566,8 @@ async def process_new_document(file_id: str, file_name: str,
                 await asyncio.to_thread(set_course_archived, duplicate["id"], False)
                 print(f"[process_new_document] course {duplicate['id']} unarchived")
             await asyncio.to_thread(
-                mark_file_processed, file_id, file_name, folder_id, update_time
+                mark_file_processed, file_id, file_name, folder_id, update_time,
+                content_hash,
             )
             if is_replacement:
                 notify = (f"🔄 Документ «{file_name}» обновлён: "
@@ -1402,10 +1582,30 @@ async def process_new_document(file_id: str, file_name: str,
             )
             return
 
+        # 6.6. То же СОДЕРЖИМОЕ под другим именем (17.08): курс не плодим —
+        # авто-привязка к существующему (решение юзера), HR в курсе.
+        same = await asyncio.to_thread(get_processed_by_hash, content_hash)
+        if same and same["doc_name"] != file_name:
+            twin = await asyncio.to_thread(get_course_by_doc_name,
+                                           same["doc_name"])
+            if twin:
+                await asyncio.to_thread(
+                    mark_file_processed, file_id, file_name, folder_id,
+                    update_time, content_hash,
+                )
+                notify = (f"📄 «{file_name}» — то же содержимое, что у курса "
+                          f"«{twin['doc_name']}» (№{twin['id']}): вопросы "
+                          "общие, новый курс не создан.")
+                for hr_id in _hr_ids():
+                    await _send(str(hr_id), notify, HR_BOT_ID)
+                print(f"[process_new_document] content twin of "
+                      f"{same['doc_name']!r} — course skipped")
+                return
+
         # 7. Generate questions
         from app.course_generator import generate_questions  # noqa: PLC0415
 
-        questions = await asyncio.to_thread(generate_questions, file_name, new_chunks[:20])
+        questions = await asyncio.to_thread(generate_questions, file_name, new_chunks)
         questions_json = json.dumps(questions, ensure_ascii=False)
 
         # 8. Persist to DB
@@ -1413,7 +1613,8 @@ async def process_new_document(file_id: str, file_name: str,
             save_draft_course, file_name, file_id, questions_json, detail_url
         )
         await asyncio.to_thread(
-            mark_file_processed, file_id, file_name, folder_id, update_time
+            mark_file_processed, file_id, file_name, folder_id, update_time,
+            content_hash,
         )
 
         # 9. Save draft JSON

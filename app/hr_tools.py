@@ -84,6 +84,23 @@ def format_question_full(q: dict, q_num: int) -> str:
     return "\n".join(lines)
 
 
+def format_question_card(doc_name: str, q: dict, q_num: int) -> str:
+    """Карточка вопроса «как видит сотрудник» + ✅ на правильном (17.08:
+    «Вопросы N» листает карточки вместо простыни-ответника)."""
+    phase, idx = resolve_question_ref(q_num)
+    sub = (f"Базовый блок — вопрос {idx + 1}/5" if phase == "basic"
+           else f"Экзамен — вопрос {idx + 1}/10")
+    lines = [f"📋 *{doc_name}*", sub, "", f"{q_num}. {q['text']}", ""]
+    correct_prefix = (q.get("correct") or "") + "."
+    for o in q.get("options", []):
+        o = str(o).strip()
+        mark = " ✅" if o.upper().startswith(correct_prefix) else ""
+        lines.append(o + mark)
+    if q.get("explanation"):
+        lines += ["", f"Пояснение: {q['explanation']}"]
+    return "\n".join(lines)
+
+
 def parse_replacement(raw: str) -> dict | None:
     """Разбор замены вопроса из одного сообщения HR. None = формат не распознан.
 

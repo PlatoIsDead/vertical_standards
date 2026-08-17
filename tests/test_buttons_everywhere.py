@@ -121,37 +121,48 @@ def test_hr_courses_keyboard(hr_env, monkeypatch):
         ["Вопросы 3", "Подтвердить 3", "NL", "Вопросы 7", "Подтвердить 7"]
 
 
-def test_hr_questions_keyboard(hr_env, monkeypatch):
+def test_hr_questions_card_keyboard(hr_env, monkeypatch):
+    """17.08: «Вопросы N» — карточка с ✅ и навигацией."""
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
-    monkeypatch.setattr(bot, "get_course_by_id",
-                        lambda cid: {"id": cid, "doc_name": "Д"})
-    monkeypatch.setattr(bot, "get_course_questions",
-                        lambda cid: {"basic_questions": [],
-                                     "exam_questions": []})
-    client, captured = hr_env
-    _post_hr(client, "Вопросы 5")
-    assert _wait_for(lambda: captured)
-    assert [b["TEXT"] for b in captured[0]["keyboard"]] == \
-        ["Вопросы 5", "Подтвердить 5"]
-
-
-def test_hr_edit_step1_cancel_keyboard(hr_env, monkeypatch):
-    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
-    q = {"text": "?", "options": ["A. 1", "B. 2"], "correct": "A"}
+    q = {"text": "Что?", "options": ["A. 1", "B. 2", "C. 3", "D. 4"],
+         "correct": "B"}
     monkeypatch.setattr(bot, "get_course_by_id",
                         lambda cid: {"id": cid, "doc_name": "Д"})
     monkeypatch.setattr(bot, "get_course_questions",
                         lambda cid: {"basic_questions": [q],
                                      "exam_questions": []})
     client, captured = hr_env
-    _post_hr(client, "Изменить 5 1")
+    _post_hr(client, "Вопросы 5")
     assert _wait_for(lambda: captured)
-    assert [b["TEXT"] for b in captured[0]["keyboard"]] == ["Отмена"]
-    # шаг 2, кривой формат → снова [Отмена]
-    _post_hr(client, "какой-то мусор")
+    assert "B. 2 ✅" in captured[0]["text"]
+    texts = [b["TEXT"] for b in captured[0]["keyboard"] if "TEXT" in b]
+    assert texts == ["▶️ Далее", "✏️ Изменить", "🔄 Заново", "📄 Все вопросы"]
+    # последняя карточка: вместо «Далее» — «Подтвердить»
+    assert [b["TEXT"] for b in kb.hr_question_card(5, 15) if "TEXT" in b][:2] \
+        == ["⬅️ Назад", "✅ Подтвердить"]
+
+
+def test_hr_edit_wizard_keyboards(hr_env, monkeypatch):
+    """17.08: визард — [• Оставить][Отмена] на шагах, confirm-набор в конце."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    q = {"text": "?", "options": ["A. 1", "B. 2", "C. 3", "D. 4"],
+         "correct": "A"}
+    monkeypatch.setattr(bot, "get_course_by_id",
+                        lambda cid: {"id": cid, "doc_name": "Д"})
+    monkeypatch.setattr(bot, "get_course_questions",
+                        lambda cid: {"basic_questions": [q],
+                                     "exam_questions": []})
+    client, captured = hr_env
+    _post_hr(client, "Изменить 5.1")
+    assert _wait_for(lambda: captured)
+    assert [b["TEXT"] for b in captured[0]["keyboard"]] == \
+        ["• Оставить", "Отмена"]
+    # цельный блок по шаблону → сразу превью с confirm-клавиатурой
+    _post_hr(client, "Новый вопрос?\nA. а\nB. б\nC. в\nD. г\nОтвет: A")
     assert _wait_for(lambda: len(captured) >= 2)
-    assert captured[1]["text"].startswith("❌ Не понял")
-    assert [b["TEXT"] for b in captured[1]["keyboard"]] == ["Отмена"]
+    assert "Проверь вопрос" in captured[1]["text"]
+    assert [b["TEXT"] for b in captured[1]["keyboard"]] == \
+        ["💾 Сохранить", "🔄 Заново", "Отмена"]
 
 
 def test_hr_admit_waiting_in_place(hr_env, monkeypatch):

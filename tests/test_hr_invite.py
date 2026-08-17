@@ -171,7 +171,7 @@ def test_questions_show_correct_option_text(env):
          "correct": "B", "explanation": ""}], "exam_questions": []},
         ensure_ascii=False)
     db.update_course_questions(course_id, qjson)
-    _post_hr(client, f"Вопросы {course_id}")
+    _post_hr(client, f"Вопросы {course_id} все")   # 17.08: простыня = «все»
     assert _wait_for(lambda: any(m[0] == "d9" for m in sent))
     text = next(m for m in sent if m[0] == "d9")[1]
     assert "→ B. Звонить 112" in text

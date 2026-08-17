@@ -86,6 +86,34 @@ def hr_course_list(course_ids: list) -> list:
     return rows
 
 
+def hr_question_card(course_id: int, q_num: int) -> list:
+    """Клавиатура карточки «Вопросы N.q» (сквозная нумерация 1–15)."""
+    nav = []
+    if q_num > 1:
+        nav.append(_hr_btn("⬅️ Назад", f"Вопросы {course_id}.{q_num - 1}"))
+    if q_num < 15:
+        nav.append(_hr_btn("▶️ Далее", f"Вопросы {course_id}.{q_num + 1}"))
+    else:
+        nav.append(_hr_btn("✅ Подтвердить", f"Подтвердить {course_id}"))
+    return nav + [
+        dict(_NEWLINE),
+        _hr_btn("✏️ Изменить", f"Изменить {course_id}.{q_num}"),
+        _hr_btn("🔄 Заново", f"Перегенерировать {course_id}.{q_num}"),
+        dict(_NEWLINE),
+        _hr_btn("📄 Все вопросы", f"Вопросы {course_id} все"),
+    ]
+
+
+def hr_wizard_step() -> list:
+    """Шаг визарда правки: «.» = оставить текущее значение."""
+    return [_hr_btn("• Оставить", "."), _hr_btn("Отмена")]
+
+
+def hr_wizard_confirm() -> list:
+    return [_hr_btn("💾 Сохранить", "Сохранить"),
+            _hr_btn("🔄 Заново", "Заново"), _hr_btn("Отмена")]
+
+
 def hr_invite(email: str) -> list:
     return [_hr_btn(f"Пригласить {email}", display="BLOCK")]
 

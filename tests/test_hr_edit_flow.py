@@ -70,33 +70,63 @@ def _post_and_reply(client, sent, message, from_user="9", dialog="d9"):
     raise AssertionError(f"no reply to {message!r}")
 
 
-def test_edit_two_step(env):
+def test_wizard_full_pass(env):
+    """17.08: пошаговый визард — текст → A–D → буква → превью → сохранить."""
     client, sent, course_id = env
-    reply = _post_and_reply(client, sent, f"Изменить {course_id} 7")
-    assert "Экзамен 2?" in reply and "Отмена" in reply
+    reply = _post_and_reply(client, sent, f"Изменить {course_id}.7")
+    assert "шаг 1/6" in reply and "Экзамен 2?" in reply
 
-    reply = _post_and_reply(client, sent, REPLACEMENT)
-    assert "обновлён" in reply
+    reply = _post_and_reply(client, sent, "Новый текст?")
+    assert "вариант A" in reply
+    reply = _post_and_reply(client, sent, "первый")
+    assert "вариант B" in reply
+    reply = _post_and_reply(client, sent, ".")               # B оставить
+    assert "вариант C" in reply
+    reply = _post_and_reply(client, sent, ".")               # C оставить
+    assert "вариант D" in reply
+    reply = _post_and_reply(client, sent, "четвёртый")
+    assert "равильный ответ" in reply
+    reply = _post_and_reply(client, sent, "В")               # кириллица → B
+    assert "Проверь вопрос" in reply and "Новый текст?" in reply
+    reply = _post_and_reply(client, sent, "Сохранить")
+    assert "сохранён" in reply
 
-    questions = db.get_course_questions(course_id)
-    assert questions["exam_questions"][1]["text"] == "Новый вопрос?"
-    assert questions["exam_questions"][1]["correct"] == "B"  # кириллица нормализована
-    assert questions["exam_questions"][0]["text"] == "Экзамен 1?"
-    assert questions["basic_questions"][0]["text"] == "Базовый 1?"
+    q = db.get_course_questions(course_id)["exam_questions"][1]
+    assert q["text"] == "Новый текст?"
+    assert q["options"][0] == "A. первый"
+    assert q["options"][1] == "B. 2"                          # «.» оставила
+    assert q["options"][3] == "D. четвёртый"
+    assert q["correct"] == "B"
     assert db.get_course_by_id(course_id)["approved_at"]     # курс не деактивирован
     assert not bot._pending_edits
 
 
-def test_edit_bad_format_keeps_pending(env):
+def test_wizard_oneshot_block(env):
+    """Цельный блок по шаблону на шаге 1 → сразу превью (power-user путь)."""
     client, sent, course_id = env
     _post_and_reply(client, sent, f"Изменить {course_id} 3")
-    reply = _post_and_reply(client, sent, "просто какой-то текст")
-    assert "Не понял формат" in reply
-    assert bot._pending_edits  # pending жив
-
     reply = _post_and_reply(client, sent, REPLACEMENT)
-    assert "обновлён" in reply
-    assert db.get_course_questions(course_id)["basic_questions"][2]["text"] == "Новый вопрос?"
+    assert "Проверь вопрос" in reply and "Новый вопрос?" in reply
+    reply = _post_and_reply(client, sent, "Сохранить")
+    assert "сохранён" in reply
+    q = db.get_course_questions(course_id)["basic_questions"][2]
+    assert q["text"] == "Новый вопрос?"
+    assert q["correct"] == "B"                                # кириллица «В» → B
+
+
+def test_wizard_rejects_duplicate_options(env):
+    client, sent, course_id = env
+    _post_and_reply(client, sent, f"Изменить {course_id}.1")
+    _post_and_reply(client, sent, ".")                        # текст оставить
+    _post_and_reply(client, sent, "2")                        # A = «2» (дубль B)
+    for _ in range(3):
+        _post_and_reply(client, sent, ".")                    # B, C, D оставить
+    _post_and_reply(client, sent, ".")                        # correct оставить
+    reply = _post_and_reply(client, sent, "Сохранить")
+    assert "❌" in reply and "повторяются" in reply
+    assert bot._pending_edits                                 # визард жив
+    q = db.get_course_questions(course_id)["basic_questions"][0]
+    assert q["options"][0] == "A. 1"                          # не сохранилось
 
 
 def test_edit_cancel(env):
@@ -177,8 +207,9 @@ def test_report(env):
 
 
 def test_voprosy_through_numbering(env):
+    """17.08: простыня со сквозной нумерацией — теперь «Вопросы N все»."""
     client, sent, course_id = env
-    reply = _post_and_reply(client, sent, f"Вопросы {course_id}")
+    reply = _post_and_reply(client, sent, f"Вопросы {course_id} все")
     assert "6. Экзамен 1?" in reply
     assert "15. Экзамен 10?" in reply
     assert f"Изменить {course_id}" in reply

@@ -113,6 +113,8 @@ def init_db() -> None:
         # №4: архив курса при удалении файла; детект новой версии при том же file_id
         _ensure_column(conn, "courses", "archived_at", "TEXT")
         _ensure_column(conn, "processed_files", "update_time", "TEXT")
+        # 17.08: дедуп переименованных копий — sha256 содержимого файла
+        _ensure_column(conn, "processed_files", "content_hash", "TEXT")
         # Демо-фидбек C: должность в отчётах (из user.get при «Пригласить»)
         _ensure_column(conn, "employees", "work_position", "TEXT")
         # Гейт поллера: файлы, обработанные ДО появления processed_files,
@@ -425,15 +427,29 @@ def get_processed_file(file_id: str) -> dict | None:
 
 
 def mark_file_processed(file_id: str, doc_name: str, folder_id: str = None,
-                        update_time: str = None) -> None:
+                        update_time: str = None,
+                        content_hash: str = None) -> None:
     with _conn() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO processed_files
-               (file_id, doc_name, folder_id, processed_at, update_time)
-               VALUES (?, ?, ?, ?, ?)""",
+               (file_id, doc_name, folder_id, processed_at, update_time,
+                content_hash)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (str(file_id), doc_name, folder_id,
-             datetime.utcnow().isoformat(), update_time),
+             datetime.utcnow().isoformat(), update_time, content_hash),
         )
+
+
+def get_processed_by_hash(content_hash: str) -> dict | None:
+    """Файл с тем же содержимым (дедуп переименованных копий, 17.08)."""
+    if not content_hash:
+        return None
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM processed_files WHERE content_hash = ? LIMIT 1",
+            (content_hash,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def remove_processed_file(file_id: str) -> None:

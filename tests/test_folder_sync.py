@@ -76,6 +76,7 @@ def env(tmp_path, monkeypatch):
     bot._missing_strikes.clear()
     bot._processing.clear()
     bot._recent_msgs.clear()
+    bot._ingest_locks.clear()   # asyncio.Lock привязан к лупу — не переживает asyncio.run
     monkeypatch.setattr(bot, "_embed_texts",
                         lambda texts: np.zeros((len(texts), 4), dtype=np.float32))
     monkeypatch.setattr(bot, "_hr_ids", lambda: [])
@@ -379,3 +380,56 @@ def test_new_session_triggers_course_file(env, monkeypatch):
     while time.monotonic() < deadline and not sent_files:
         time.sleep(0.01)
     assert sent_files == [("d1", 7)]
+
+
+# ── 17.08: дедуп курсов — гонка копий и content-hash ─────────────────────────
+
+def test_parallel_copies_create_one_course(env, monkeypatch):
+    """Гонка 29.07 (4 курса «КОНФЕДЕНЦИАЛЬНОСТЬ» за 4с): параллельные копии
+    одного документа сериализуются per-doc локом → курс ровно один."""
+    def slow_generate(name, chunks):
+        time.sleep(0.05)                      # sync, в to_thread — луп живёт
+        return dict(QUESTIONS, doc_name=name)
+
+    monkeypatch.setattr(cg, "generate_questions", slow_generate)
+    FakeAsyncClient.routes["disk.file.get"] = lambda j: {
+        "result": {"DOWNLOAD_URL": f"https://dl/{j['id']}",
+                   "DETAIL_URL": "u", "UPDATE_TIME": "T1"}}
+    FakeAsyncClient.files["https://dl/g1"] = V1_TEXT.encode("utf-8")
+    FakeAsyncClient.files["https://dl/g2"] = V1_TEXT.encode("utf-8")
+
+    async def both():
+        await asyncio.gather(
+            bot.process_new_document("g1", "Гонка.txt", ["a"], "10"),
+            bot.process_new_document("g2", "Гонка.txt", ["b"], "20"))
+
+    asyncio.run(both())
+    same_name = [c for c in db.get_pending_courses()
+                 if c["doc_name"] == "Гонка.txt"]
+    assert len(same_name) == 1
+
+
+def test_same_content_other_name_attaches(env, monkeypatch):
+    """Тот же файл под другим именем: чанки ингестируются (роли), курс НЕ
+    создаётся, HR уведомлён (авто-привязка — решение юзера 17.08)."""
+    import hashlib
+
+    calls = env
+    notified = []
+
+    async def fake_send(dialog_id, text, bot_id=None, client_id="",
+                        keyboard=None):
+        notified.append(text)
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    monkeypatch.setattr(bot, "_hr_ids", lambda: ["9"])
+
+    _ingest("h1", "Оригинал.txt", "10", V1_TEXT)
+    _ingest("h2", "Копия.txt", "20", V1_TEXT)
+
+    assert calls["generate"] == 1                       # второй генерации нет
+    assert db.get_course_by_doc_name("Оригинал.txt")
+    assert db.get_course_by_doc_name("Копия.txt") is None
+    assert any("то же содержимое" in t for t in notified)
+    h = hashlib.sha256(V1_TEXT.encode("utf-8")).hexdigest()
+    assert db.get_processed_by_hash(h)["content_hash"] == h
