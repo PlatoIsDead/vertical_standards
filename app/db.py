@@ -263,14 +263,52 @@ def update_course_questions(course_id: int, questions_json: str) -> bool:
 # ── Sessions ─────────────────────────────────────────────────────────────────
 
 def get_session(user_id: str) -> dict | None:
-    """Latest non-DONE session for a user, or None."""
+    """АКТИВНАЯ сессия = самая свежая по updated_at незакрытая строка.
+
+    Незакрытых строк может быть несколько (17.08: «ждёт допуска HR» —
+    свойство курса, а не клетка): WAITING_HR-строки других курсов висят
+    непотроганными, активна та, которую трогали последней."""
     with _conn() as conn:
         row = conn.execute(
             "SELECT * FROM sessions WHERE user_id = ? AND state != 'DONE'"
-            " ORDER BY id DESC LIMIT 1",
+            " ORDER BY updated_at DESC, id DESC LIMIT 1",
             (user_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_waiting_session(user_id: str) -> dict | None:
+    """Свежайшая строка «сдал базовый, ждёт допуска HR» (для «Допустить»)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE user_id = ? AND state = 'WAITING_HR'"
+            " ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_open_session_for_course(user_id: str, course_id: int) -> dict | None:
+    """Незакрытая строка сотрудника по КОНКРЕТНОМУ курсу («Выбрать» должен
+    вернуться к висящей строке, а не плодить вторую)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE user_id = ? AND course_id = ?"
+            " AND state != 'DONE' ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (user_id, course_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def admit_session(session_id: int) -> None:
+    """«Допустить»: WAITING_HR → EXAM БЕЗ touch updated_at — допуск снимает
+    блокировку, но не выдёргивает сотрудника из курса, который он проходит
+    сейчас (активная сессия определяется свежестью updated_at)."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET state = 'EXAM', current_q_idx = 0 WHERE id = ?",
+            (session_id,),
+        )
 
 
 def get_session_by_id(session_id: int) -> dict | None:
@@ -324,7 +362,7 @@ def update_session_by_user(user_id: str, state: str, q_idx: int = 0) -> bool:
     with _conn() as conn:
         row = conn.execute(
             "SELECT id FROM sessions WHERE user_id = ? AND state != 'DONE'"
-            " ORDER BY id DESC LIMIT 1",
+            " ORDER BY updated_at DESC, id DESC LIMIT 1",
             (user_id,),
         ).fetchone()
         if not row:
@@ -362,7 +400,7 @@ def get_session_dialog_id(user_id: str) -> str | None:
     with _conn() as conn:
         row = conn.execute(
             "SELECT dialog_id FROM sessions WHERE user_id = ? AND state != 'DONE'"
-            " ORDER BY id DESC LIMIT 1",
+            " ORDER BY updated_at DESC, id DESC LIMIT 1",
             (user_id,),
         ).fetchone()
         return row["dialog_id"] if row else None

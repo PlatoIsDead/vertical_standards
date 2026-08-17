@@ -256,8 +256,61 @@ def test_waiting_hr_menu(env, monkeypatch):
     sm.process_message("u1", "A", "d1", [], None)          # → WAITING_HR
     reply = sm.process_message("u1", "Мои курсы", "d1", [], None)
     assert "📚 Твои курсы" in reply
+    # 17.08: ожидание допуска не блокирует — вопросы уходят в RAG
     reply2 = sm.process_message("u1", "что дальше?", "d1", [], None)
-    assert "Ожидаем решения HR" in reply2
+    assert reply2 == "MOCK_ANSWER"
+
+
+def test_waiting_park_switch_admit_exam(env, monkeypatch):
+    """17.08: «ждёт допуска» — свойство курса, не клетка: сотрудник уходит во
+    второй курс, допуск не выдёргивает, экзамен доступен через «Выбрать»."""
+    monkeypatch.setattr(sm, "notify_hr", lambda *a, **kw: None)
+    exam_q = {
+        "course_summary": "s",
+        "basic_questions": [{"text": "Б?", "options": ["A. 1", "B. 2"],
+                             "correct": "A"}],
+        "exam_questions": [{"text": "Э?", "options": ["A. 1", "B. 2"],
+                            "correct": "A"}],
+    }
+    course_a = db.get_course_by_doc_name("Стандарты.docx")
+    db.update_course_questions(course_a["id"],
+                               json.dumps(exam_q, ensure_ascii=False))
+    cid_b = db.save_draft_course("Правила.docx", "2",
+                                 json.dumps(exam_q, ensure_ascii=False))
+    db.activate_course_by_id(cid_b, "hr1")
+
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)          # роль → первый курс
+    first_course = db.get_session("u1")["course_id"]       # порядок не важен
+    sm.process_message("u1", "Готов", "d1", [], None)
+    sm.process_message("u1", "A", "d1", [], None)          # базовый → WAITING_HR
+    a_row = db.get_waiting_session("u1")
+    assert a_row and a_row["course_id"] == first_course
+
+    # Переключение из ожидания: строка первого курса паркуется, второму — новая
+    reply = sm.process_message("u1", "Выбрать 1", "d1", [], None)
+    assert "Переключил курс" in reply
+    active = db.get_session("u1")
+    assert active["course_id"] != first_course and active["state"] == "READING"
+    assert active["id"] != a_row["id"]
+    assert db.get_waiting_session("u1")["id"] == a_row["id"]   # ожидание живо
+
+    menu, _ = sm.my_courses("u1", active.get("role"))
+    assert "ждёт допуска HR" in menu
+
+    # Допуск НЕ выдёргивает из текущего курса
+    db.admit_session(a_row["id"])
+    assert db.get_session("u1")["id"] == active["id"]
+    menu2, sel = sm.my_courses("u1", active.get("role"))
+    assert "допущен к экзамену" in menu2
+
+    # Вход в допущенный экзамен через «Выбрать»
+    n = next(i + 1 for i, c in enumerate(sel) if c["id"] == first_course)
+    reply = sm.process_message("u1", f"Выбрать {n}", "d1", [], None)
+    assert "Экзамен" in reply and "Э?" in reply
+    sm.process_message("u1", "A", "d1", [], None)          # сдать (1 вопрос)
+    assert db.get_session_by_id(a_row["id"])["state"] == "DONE"
+    assert db.get_session("u1")["id"] == active["id"]      # активен снова второй
 
 
 # ── Протокол 05.08: BB-код, выбор курса ──────────────────────────────────────

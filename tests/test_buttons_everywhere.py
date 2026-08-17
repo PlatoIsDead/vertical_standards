@@ -154,16 +154,40 @@ def test_hr_edit_step1_cancel_keyboard(hr_env, monkeypatch):
     assert [b["TEXT"] for b in captured[1]["keyboard"]] == ["Отмена"]
 
 
-def test_hr_admit_sends_start_exam_button(hr_env, monkeypatch):
+def test_hr_admit_waiting_in_place(hr_env, monkeypatch):
+    """Сотрудник ждёт в курсе: «Начать экзамен» как раньше."""
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
-    monkeypatch.setattr(bot, "update_session_by_user", lambda uid, s, q: True)
-    monkeypatch.setattr(bot, "get_session_dialog_id", lambda uid: "d_emp")
+    waiting = {"id": 5, "course_id": 3, "dialog_id": "d_emp", "user_id": "500"}
+    monkeypatch.setattr(bot, "get_waiting_session", lambda uid: waiting)
+    admitted = []
+    monkeypatch.setattr(bot, "admit_session", lambda sid: admitted.append(sid))
+    monkeypatch.setattr(bot, "get_session", lambda uid: {"id": 5})
+    monkeypatch.setattr(bot, "get_course_by_id",
+                        lambda cid: {"doc_name": "Д.docx"})
+    client, captured = hr_env
+    _post_hr(client, "Допустить 500")
+    assert _wait_for(lambda: len(captured) >= 2)
+    assert admitted == [5]
+    emp = next(c for c in captured if c["dialog"] == "d_emp")
+    assert emp["keyboard"][0]["TEXT"] == "Начать экзамен"
+    assert emp["keyboard"][0]["COMMAND_PARAMS"] == "Начать"
+
+
+def test_hr_admit_parked_not_pulled(hr_env, monkeypatch):
+    """17.08: сотрудник в другом курсе — допуск НЕ выдёргивает, зовёт в меню."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    waiting = {"id": 5, "course_id": 3, "dialog_id": "d_emp", "user_id": "500"}
+    monkeypatch.setattr(bot, "get_waiting_session", lambda uid: waiting)
+    monkeypatch.setattr(bot, "admit_session", lambda sid: None)
+    monkeypatch.setattr(bot, "get_session", lambda uid: {"id": 9})
+    monkeypatch.setattr(bot, "get_course_by_id",
+                        lambda cid: {"doc_name": "Д.docx"})
     client, captured = hr_env
     _post_hr(client, "Допустить 500")
     assert _wait_for(lambda: len(captured) >= 2)
     emp = next(c for c in captured if c["dialog"] == "d_emp")
-    assert emp["keyboard"][0]["COMMAND_PARAMS"] == "Начать"
-    assert emp["keyboard"][0]["TEXT"] == "Начать экзамен"
+    assert "Мои курсы" in emp["text"]
+    assert emp["keyboard"][0]["TEXT"] == "Мои курсы"
 
 
 # ── /command: роутинг по имени команды ───────────────────────────────────────
@@ -307,18 +331,22 @@ def test_finish_basic_admit_button_env_gated(monkeypatch):
     assert captured["kb"] is None
 
 
-def test_my_courses_hint_matches_fsm(monkeypatch):
-    """WAITING_HR: переключение запрещено FSM — текст не должен обещать
-    «напиши Выбрать» (скрин 17.08)."""
-    courses = [{"id": 1, "doc_name": "A.docx"}, {"id": 2, "doc_name": "B.docx"}]
+def test_my_courses_open_state_labels(monkeypatch):
+    """17.08: висящие строки курсов подписаны — ждёт допуска / допущен."""
+    courses = [{"id": 1, "doc_name": "A.docx"}, {"id": 2, "doc_name": "B.docx"},
+               {"id": 3, "doc_name": "C.docx"}]
     monkeypatch.setattr(sm, "get_active_courses", lambda: courses)
     monkeypatch.setattr(sm, "_done_course_ids", lambda uid: set())
-    monkeypatch.setattr(sm, "get_session", lambda uid: {"course_id": 1})
-    text_on, sel = sm.my_courses("u1", None)
-    assert "напиши *Выбрать" in text_on and len(sel) == 1
-    text_off, _ = sm.my_courses("u1", None, switchable=False)
-    assert "напиши *Выбрать" not in text_off
-    assert "после решения HR" in text_off
+    monkeypatch.setattr(sm, "get_session",
+                        lambda uid: {"course_id": 1, "state": "READING"})
+    monkeypatch.setattr(sm, "get_sessions_by_user", lambda uid: [
+        {"course_id": 2, "state": "WAITING_HR"},
+        {"course_id": 3, "state": "EXAM"},
+    ])
+    text, sel = sm.my_courses("u1", None)
+    assert "ждёт допуска HR" in text
+    assert "допущен к экзамену" in text
+    assert len(sel) == 2 and "напиши *Выбрать" in text
 
 
 def test_bare_dialog():

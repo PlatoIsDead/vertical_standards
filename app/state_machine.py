@@ -28,6 +28,7 @@ from app.db import (
     get_course_questions,
     get_employee,
     get_last_done_session,
+    get_open_session_for_course,
     get_session,
     get_session_answers,
     get_session_by_id,
@@ -125,7 +126,7 @@ def process_message(user_id: str, message: str, dialog_id: str,
     elif state == "BASIC_TEST":
         return _handle_test(session, message, "basic")
     elif state == "WAITING_HR":
-        return _handle_waiting_hr(session, message)
+        return _handle_waiting_hr(session, message, chunks, embeddings)
     elif state == "EXAM":
         return _handle_test(session, message, "exam")
     elif state == "DONE":
@@ -393,17 +394,22 @@ def _start_reading(session: dict, course: dict) -> str:
     return "\n".join(lines)
 
 
-def my_courses(user_id: str, role_id: str | None,
-               switchable: bool = True) -> tuple[str, list[dict]]:
+def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
     """«Мои курсы»: текст списка + курсы, ДОСТУПНЫЕ к выбору (не текущий,
     не пройденные). Нумерация в тексте = индексы списка — единый источник
     для «Выбрать N» (протокол 05.08: выбор курса сотрудником).
-    switchable=False (WAITING_HR): переключение запрещено FSM — подсказка
-    «напиши Выбрать» не должна обещать то, в чём бот откажет."""
+    Висящие строки других курсов (17.08) получают статус: «ждёт допуска HR» /
+    «допущен к экзамену» — такие курсы тоже выбираемы."""
     courses = get_active_courses()
     done = _done_course_ids(user_id)
     session = get_session(user_id)
     current_id = session["course_id"] if session else 0
+    # Свежайшее состояние незакрытой строки по каждому курсу (список отсортирован
+    # новые сверху — берём первое вхождение)
+    open_states: dict[int, str] = {}
+    for s in get_sessions_by_user(user_id):
+        if s["state"] != "DONE" and s["course_id"] not in open_states:
+            open_states[s["course_id"]] = s["state"]
     mine = [c for c in courses
             if role_id is None or {role_id, ALL_STAFF} & set(course_roles(c))]
     if not mine:
@@ -414,23 +420,28 @@ def my_courses(user_id: str, role_id: str | None,
     for c in mine:
         name = display_name(c["doc_name"])
         if c["id"] == current_id:
-            lines.append(f"▶️ {name} — проходишь сейчас")
+            if session and session["state"] == "WAITING_HR":
+                lines.append(f"▶️ {name} — базовый сдан, ждёт допуска HR")
+            else:
+                lines.append(f"▶️ {name} — проходишь сейчас")
         elif c["id"] in done:
             lines.append(f"✅ {name} — пройден")
         else:
-            lines.append(f"{selectable.index(c) + 1}. ⏳ {name}")
+            n = selectable.index(c) + 1
+            state = open_states.get(c["id"])
+            if state == "WAITING_HR":
+                lines.append(f"{n}. ⏳ {name} — базовый сдан, ждёт допуска HR")
+            elif state == "EXAM":
+                lines.append(f"{n}. 🎓 {name} — допущен к экзамену")
+            else:
+                lines.append(f"{n}. ⏳ {name}")
     if selectable:
-        if switchable:
-            lines += ["", "Переключиться на другой курс: напиши *Выбрать {номер}*."]
-        else:
-            lines += ["", "⏳ Переключиться на другой курс можно будет "
-                          "после решения HR по текущему."]
+        lines += ["", "Переключиться на другой курс: напиши *Выбрать {номер}*."]
     return "\n".join(lines), selectable
 
 
-def _my_courses_text(user_id: str, role_id: str | None,
-                     switchable: bool = True) -> str:
-    return my_courses(user_id, role_id, switchable)[0]
+def _my_courses_text(user_id: str, role_id: str | None) -> str:
+    return my_courses(user_id, role_id)[0]
 
 
 _MENU_COMMANDS = ("мои курсы", "курсы", "меню")
@@ -438,14 +449,46 @@ _SWITCH_RE = re.compile(r"^выбрать\s+(\d+)$")
 
 
 def _handle_course_switch(session: dict, n: int) -> str:
-    """«Выбрать N»: переключение текущей READING-сессии на другой курс.
-    Старый курс НЕ помечается пройденным (done — только через экзамен)."""
-    text, selectable = my_courses(session["user_id"], session.get("role"))
+    """«Выбрать N»: переключение на другой курс. Старый курс НЕ помечается
+    пройденным (done — только через экзамен).
+
+    17.08: у целевого курса может висеть своя незакрытая строка (ждёт допуска /
+    допущен к экзамену) — возвращаемся К НЕЙ (touch → она активна), вторую не
+    плодим. Из WAITING_HR текущую строку НЕ репоинтим (при ней ответы базового
+    её курса) — паркуем и создаём новую; READING-строка ответов не несёт,
+    её репоинт безопасен (как раньше)."""
+    user_id = session["user_id"]
+    text, selectable = my_courses(user_id, session.get("role"))
     if not selectable:
         return text
     if not (1 <= n <= len(selectable)):
         return f"Такого номера нет.\n\n{text}"
     course = selectable[n - 1]
+    name = display_name(course["doc_name"])
+
+    existing = get_open_session_for_course(user_id, course["id"])
+    if existing:
+        update_session(existing["id"])          # touch → активная
+        if existing["state"] == "EXAM":
+            questions = get_course_questions(course["id"])
+            q_list = questions.get("exam_questions", [])
+            idx = existing["current_q_idx"]
+            if q_list and idx < len(q_list):
+                return (f"🎓 Экзамен по курсу *{name}* — поехали!\n\n"
+                        + format_question(q_list[idx], idx, len(q_list), "exam"))
+            return f"🎓 Курс *{name}*: вопросы экзамена не найдены. Обратись к HR."
+        if existing["state"] == "WAITING_HR":
+            return (f"⏳ Курс *{name}*: базовый тест сдан, ждём допуска HR "
+                    "к экзамену. Пока можешь задавать вопросы по документам "
+                    "или выбрать другой курс: *Мои курсы*.")
+        return "🔄 Вернулся к курсу.\n\n" + _start_reading(existing, course)
+
+    if session["state"] == "WAITING_HR":
+        new = create_session(user_id, session["dialog_id"], course["id"])
+        if session.get("role"):
+            update_session(new["id"], role=session["role"])
+        return "🔄 Переключил курс.\n\n" + _start_reading(new, course)
+
     update_session(session["id"], course_id=course["id"],
                    state="READING", q_idx=0)
     return "🔄 Переключил курс.\n\n" + _start_reading(session, course)
@@ -478,6 +521,10 @@ def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> st
         return "✅ Отлично! Начинаем базовый тест — 5 вопросов.\n\n" + \
                format_question(first_q, 0, 5, "basic")
 
+    return _rag_reply(session, message, chunks, embeddings)
+
+
+def _rag_reply(session: dict, message: str, chunks: list, embeddings) -> str:
     text, _ = rag_answer(
         query=message,
         chunks=chunks,
@@ -578,7 +625,9 @@ def _finish_phase(session: dict, phase: str, questions: dict,
         )
         return prefix + (
             f"🏁 Базовый тест завершён! Результат: *{correct_count}/{total}*\n\n"
-            "Ожидаем решения HR о допуске к экзамену. Скоро получишь уведомление."
+            "Ожидаем решения HR о допуске к экзамену — придёт уведомление.\n"
+            "А пока можешь задавать вопросы по документам или пройти "
+            "другой курс: *Мои курсы*."
         )
 
     # Exam phase finished
@@ -611,16 +660,25 @@ def _finish_phase(session: dict, phase: str, questions: dict,
     )
 
 
-def _handle_waiting_hr(session: dict, message: str) -> str:
+def _handle_waiting_hr(session: dict, message: str,
+                       chunks: list, embeddings) -> str:
+    """Ожидание допуска НЕ блокирует сотрудника (17.08): RAG-вопросы,
+    «Мои курсы» и переключение на другие курсы доступны — заперт только
+    экзамен этого курса до «Допустить»."""
     cmd = message.strip().lower()
     if cmd in _MENU_COMMANDS:
-        return _my_courses_text(session["user_id"], session.get("role"),
-                                switchable=False)
-    if cmd.startswith("выбрать"):
-        return ("⏳ Дождись решения HR по текущему курсу — "
-                "потом можно будет переключиться.")
-    return ("⏳ Ожидаем решения HR о допуске к экзамену. Скоро получишь уведомление.\n"
-            "Посмотреть свои курсы: *Мои курсы*")
+        return _my_courses_text(session["user_id"], session.get("role"))
+    m_switch = _SWITCH_RE.match(cmd)
+    if m_switch:
+        return _handle_course_switch(session, int(m_switch.group(1)))
+    if cmd in ("пересдать", "пересдача"):
+        return ("Пересдать прошлый экзамен можно будет после завершения "
+                "текущего курса.")
+    if cmd in ("готов", "экзамен", "начать"):
+        return ("⏳ Экзамен по этому курсу откроется после допуска HR — "
+                "придёт уведомление.\nПока можешь задавать вопросы по "
+                "документам или пройти другой курс: *Мои курсы*.")
+    return _rag_reply(session, message, chunks, embeddings)
 
 
 def _handle_done(session: dict) -> str:

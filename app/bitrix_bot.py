@@ -16,6 +16,7 @@ from app.db import (
     activate_course_by_id,
     add_employee,
     add_manager,
+    admit_session,
     get_active_courses,
     count_processed_by_doc_name,
     get_all_employees,
@@ -35,6 +36,7 @@ from app.db import (
     get_session_dialog_id,
     get_sessions_by_user,
     get_user_departments,
+    get_waiting_session,
     init_db,
     is_employee_allowed,
     is_file_processed,
@@ -708,8 +710,9 @@ async def _handle_employee_message(user_id: str, question: str,
             fork = (await asyncio.to_thread(_retake_fork_text, user_id)
                     is not None)
         keyboard = keyboards.for_session(after, fork, selectable_roles())
-        # Ответ на «Мои курсы» в READING → кнопки «Выбрать N» поверх ряда
-        if (after and after["state"] == "READING"
+        # Ответ на «Мои курсы» → кнопки «Выбрать N» поверх ряда (17.08:
+        # в WAITING_HR переключение тоже разрешено)
+        if (after and after["state"] in ("READING", "WAITING_HR")
                 and question.strip().lower() in _MENU_COMMANDS):
             _, selectable = await asyncio.to_thread(
                 my_courses, user_id, after.get("role"))
@@ -987,21 +990,51 @@ async def _handle_hr_message(user_id: str, question: str,
         if len(parts) < 2:
             text = "❌ Укажи ID или email сотрудника: Допустить {user_id или email}"
         elif target_uid:
-            found = await asyncio.to_thread(update_session_by_user, target_uid, "EXAM", 0)
-            if found:
-                emp_dialog = await asyncio.to_thread(get_session_dialog_id, target_uid)
-                if emp_dialog:
-                    start_kb = (keyboards.start_button("Начать экзамен")
-                                if BUTTONS_ENABLED else None)
-                    await _send(
-                        emp_dialog,
-                        "🎓 HR допустил тебя к экзамену! Напиши что-нибудь, чтобы начать.",
-                        BOT_ID, client_id,
-                        **_kb_kwargs(start_kb),
-                    )
-                text = f"✅ Сотрудник {target_uid} допущен к экзамену."
+            # 17.08: допуск целится в WAITING_HR-строку (свойство курса), а не
+            # в активную сессию — сотрудник мог уйти проходить другой курс.
+            waiting = await asyncio.to_thread(get_waiting_session, target_uid)
+            if waiting:
+                await asyncio.to_thread(admit_session, waiting["id"])
+                active = await asyncio.to_thread(get_session, target_uid)
+                in_place = bool(active and active["id"] == waiting["id"])
+                course = await asyncio.to_thread(get_course_by_id,
+                                                 waiting["course_id"])
+                cname = (display_name(course["doc_name"]) if course
+                         else f"курс №{waiting['course_id']}")
+                if in_place:
+                    msg = ("🎓 HR допустил тебя к экзамену! "
+                           "Напиши что-нибудь, чтобы начать.")
+                    kbd = (keyboards.start_button("Начать экзамен")
+                           if BUTTONS_ENABLED else None)
+                else:
+                    # Не выдёргиваем из текущего курса — экзамен ждёт в меню
+                    msg = (f"🎓 HR допустил тебя к экзамену по курсу *{cname}*. "
+                           "Сдай его, когда будешь готов: Мои курсы → Выбрать.")
+                    kbd = (keyboards.start_button("Мои курсы", "Мои курсы")
+                           if BUTTONS_ENABLED else None)
+                if waiting.get("dialog_id"):
+                    await _send(waiting["dialog_id"], msg, BOT_ID, client_id,
+                                **_kb_kwargs(kbd))
+                text = f"✅ Сотрудник {target_uid} допущен к экзамену ({cname})."
             else:
-                text = f"❌ Активная сессия для сотрудника {target_uid} не найдена."
+                # Легаси-форс: строки WAITING_HR нет — активную сессию в EXAM
+                found = await asyncio.to_thread(update_session_by_user,
+                                                target_uid, "EXAM", 0)
+                if found:
+                    emp_dialog = await asyncio.to_thread(get_session_dialog_id,
+                                                         target_uid)
+                    if emp_dialog:
+                        start_kb = (keyboards.start_button("Начать экзамен")
+                                    if BUTTONS_ENABLED else None)
+                        await _send(
+                            emp_dialog,
+                            "🎓 HR допустил тебя к экзамену! Напиши что-нибудь, чтобы начать.",
+                            BOT_ID, client_id,
+                            **_kb_kwargs(start_kb),
+                        )
+                    text = f"✅ Сотрудник {target_uid} допущен к экзамену."
+                else:
+                    text = f"❌ Активная сессия для сотрудника {target_uid} не найдена."
 
     elif msg_lower.startswith("вопросы"):
         parts = question.split()
