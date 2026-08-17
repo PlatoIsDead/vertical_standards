@@ -753,21 +753,25 @@ async def command_handler(request: Request):
     if event != "ONIMCOMMANDADD":
         return {"status": "ignored"}
 
-    params = (form.get("data[COMMAND][0][COMMAND_PARAMS]")
-              or form.get("data[PARAMS][COMMAND_PARAMS]") or "").strip()
-    dialog_id = (form.get("data[COMMAND][0][DIALOG_ID]")
-                 or form.get("data[PARAMS][DIALOG_ID]") or "")
-    user_id = (form.get("data[COMMAND][0][USER_ID]")
-               or form.get("data[USER][ID]") or "").strip()
+    def field(name: str) -> str:
+        # Живой формат (лог 17.08): индекс в ключе = COMMAND_ID, не 0
+        # (data[COMMAND][71][COMMAND_PARAMS]) — ищем по суффиксу ключа;
+        # фолбэк — плоский data[PARAMS][...].
+        for k in form:
+            if k.startswith("data[COMMAND][") and k.endswith(f"][{name}]"):
+                return (form.get(k) or "").strip()
+        return (form.get(f"data[PARAMS][{name}]") or "").strip()
+
+    params = field("COMMAND_PARAMS")
+    dialog_id = field("DIALOG_ID")
+    user_id = field("USER_ID") or (form.get("data[USER][ID]") or "").strip()
     client_id = form.get("auth[application_token]", "")
 
     if not params or not dialog_id or not user_id:
         return {"status": "no_data"}
 
     # Роутинг по ИМЕНИ команды: hrsay → HR-бот, say/нет поля → employee
-    # (BOT_ID в событии не гарантирован; поле имени — те же два кандидата).
-    command_name = (form.get("data[COMMAND][0][COMMAND]")
-                    or form.get("data[PARAMS][COMMAND]") or "").strip().lower()
+    command_name = field("COMMAND").lower()
     if command_name == "hrsay":
         await _handle_hr_message(user_id, params, dialog_id, client_id)
     else:

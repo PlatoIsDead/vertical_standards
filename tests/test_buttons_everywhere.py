@@ -195,6 +195,24 @@ def test_command_hrsay_routes_to_hr(cmd_router):
     assert calls == [("hr", "u5", "Курсы", "d9")]
 
 
+def test_command_live_format_command_id_index(cmd_router):
+    """Живой формат портала (лог 17.08): индекс ключа = COMMAND_ID, не 0;
+    DIALOG_ID/USER только в data[PARAMS]/data[USER]."""
+    client, calls = cmd_router
+    client.post("/command", data={
+        "event": "ONIMCOMMANDADD",
+        "data[COMMAND][71][BOT_ID]": "54858",
+        "data[COMMAND][71][COMMAND]": "hrsay",
+        "data[COMMAND][71][COMMAND_ID]": "71",
+        "data[COMMAND][71][COMMAND_PARAMS]": "Курсы",
+        "data[COMMAND][71][COMMAND_CONTEXT]": "KEYBOARD",
+        "data[PARAMS][MESSAGE]": "/hrsay Курсы",
+        "data[PARAMS][DIALOG_ID]": "28528",
+        "data[USER][ID]": "28528",
+    })
+    assert calls == [("hr", "28528", "Курсы", "28528")]
+
+
 def test_command_say_and_missing_name_route_to_employee(cmd_router):
     client, calls = cmd_router
     client.post("/command", data={
