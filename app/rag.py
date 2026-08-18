@@ -69,13 +69,15 @@ def answer(query, chunks, embeddings, section_filter, answer_length, role_filter
         "Подробно":   "Развёрнутый ответ со всеми деталями.",
     }
 
+    # gpt-5.5 (OPENAI_MODEL с 17.08) отвергает max_tokens и temperature —
+    # max_completion_tokens понимают и новые, и старые модели (18.08: живой
+    # 400 «Unsupported parameter: max_tokens» ронял ВСЕ RAG-ответы)
     response = client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{length_map.get(answer_length, '')}\n\nФрагменты:\n{context}\n\nВопрос: {query}"},
         ],
-        temperature=0.2,
-        max_tokens=800,
+        max_completion_tokens=2000,
     )
     return response.choices[0].message.content, relevant
