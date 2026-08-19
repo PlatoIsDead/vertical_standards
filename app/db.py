@@ -119,9 +119,12 @@ def init_db() -> None:
         _ensure_column(conn, "employees", "work_position", "TEXT")
         # Гейт поллера: файлы, обработанные ДО появления processed_files,
         # известны по courses.doc_id — сидируем, чтобы их не переобработать.
+        # 19.08: архивные курсы НЕ сидируем — иначе чистка индекса
+        # «воскресает» на каждом рестарте
         conn.execute(
             """INSERT OR IGNORE INTO processed_files (file_id, doc_name, processed_at)
-               SELECT doc_id, doc_name, created_at FROM courses WHERE doc_id IS NOT NULL"""
+               SELECT doc_id, doc_name, created_at FROM courses
+               WHERE doc_id IS NOT NULL AND archived_at IS NULL"""
         )
         # Whitelist: юзеры с сессиями (до появления employees) остаются допущенными.
         conn.execute(
