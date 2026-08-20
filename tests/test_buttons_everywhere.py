@@ -427,7 +427,8 @@ def test_reminders_carry_state_keyboard(send_trap, monkeypatch):
     monkeypatch.setattr(bot, "set_meta", lambda k, v: None)
     asyncio.run(bot._maybe_send_reminders(datetime(2026, 8, 17, 12, 0)))
     texts = [b["TEXT"] for b in send_trap[0]["keyboard"] if "TEXT" in b]
-    assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "Роль"]
+    assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "📄 Документы",
+                     "Роль"]
 
 
 def test_notify_hr_about_user_invite_button(send_trap, monkeypatch):
@@ -500,4 +501,5 @@ def test_my_courses_switch_buttons(send_trap, monkeypatch):
     send_trap.clear()
     _run_employee("что такое чек-ин?")
     texts = [b["TEXT"] for b in send_trap[0]["keyboard"] if "TEXT" in b]
-    assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "Роль"]
+    assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "📄 Документы",
+                     "Роль"]

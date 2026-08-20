@@ -38,16 +38,16 @@ def test_for_session_states():
     reading = _btns(kb.for_session({"state": "READING"}))
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in reading] == \
         [("✅ Готов к тесту", "Готов"), ("📚 Мои курсы", "Мои курсы"),
-         ("Роль", "Роль")]
+         ("📄 Документы", "Документы"), ("Роль", "Роль")]
     assert reading[0]["DISPLAY"] == "BLOCK"
-    assert [b["COMMAND_PARAMS"] for b in
-            _btns(kb.for_session({"state": "BASIC_TEST"}))] == \
-        ["A", "B", "C", "D"]
+    test_kb = _btns(kb.for_session({"state": "BASIC_TEST"}))
+    assert [b["COMMAND_PARAMS"] for b in test_kb] == \
+        ["A", "B", "C", "D", "Выйти"]        # 19.08: пауза теста
     assert kb.for_session({"state": "EXAM"}) == kb.for_session(
         {"state": "BASIC_TEST"})
     waiting = _btns(kb.for_session({"state": "WAITING_HR"}))
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in waiting] == \
-        [("📚 Мои курсы", "Мои курсы")]
+        [("📚 Мои курсы", "Мои курсы"), ("📄 Документы", "Документы")]
     # Нажатие шлёт generic-команду say с ПРЕЖНИМ payload
     assert all(b["COMMAND"] == "say" for b in reading)
 
@@ -112,7 +112,9 @@ def test_keyboard_attached_when_flag_on(monkeypatch):
         await asyncio.sleep(0)
 
     asyncio.run(run())
-    assert captured and [b["TEXT"] for b in captured[0]] == ["A", "B", "C", "D"]
+    assert captured and \
+        [b["COMMAND_PARAMS"] for b in captured[0] if "TEXT" in b] == \
+        ["A", "B", "C", "D", "Выйти"]
 
 
 # ── /command ─────────────────────────────────────────────────────────────────

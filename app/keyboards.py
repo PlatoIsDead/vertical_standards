@@ -78,22 +78,29 @@ def for_session(session: dict | None, fork: bool = False,
                      role="primary"),
                 dict(_NEWLINE),
                 _btn("📚 Мои курсы", "Мои курсы", width=150),
+                _btn("📄 Документы", "Документы", width=130),
+                dict(_NEWLINE),
                 _btn("Роль", width=110, role="service")]
     if state in ("BASIC_TEST", "EXAM"):
         # Короткие варианты (все ≤24) — BLOCK с текстом: нажатие не требует
         # сверки с сообщением; payload — буква (parse_answer)
+        pause = [dict(_NEWLINE),
+                 _btn("⏸ Отложить тест", "Выйти", width=170, role="service")]
         if (test_options and len(test_options) == 4
                 and all(len(b) <= 24 for b in test_options)):
             return [_btn(f"{letter} · {body}", letter, display="BLOCK")
-                    for letter, body in zip("ABCD", test_options)]
-        return [_btn(x, width=70) for x in ("A", "B", "C", "D")]
+                    for letter, body in zip("ABCD", test_options)] + pause
+        return [_btn(x, width=70) for x in ("A", "B", "C", "D")] + pause
     if state == "WAITING_HR":
         # Действовать нечему — primary здесь быть не должно (спека)
-        return [_btn("📚 Мои курсы", "Мои курсы", display="BLOCK")]
+        return [_btn("📚 Мои курсы", "Мои курсы", display="BLOCK"),
+                dict(_NEWLINE),
+                _btn("📄 Документы", "Документы", width=130)]
     return None
 
 
-_STATUS_EMOJI = {"admitted": "🎓", "waiting": "⏳", "todo": "⏳"}
+_STATUS_EMOJI = {"admitted": "🎓", "waiting": "⏳", "todo": "⏳",
+                 "paused": "⏸"}
 
 
 def courses_menu(items: list, reading: bool = False) -> list | None:

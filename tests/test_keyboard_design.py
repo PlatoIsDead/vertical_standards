@@ -49,6 +49,7 @@ SAMPLES = {
 # ЖЕЛЕЗНЫЙ ИНВАРИАНТ: payload'ы — только команды, которые понимает FSM/HR
 ALLOWED_PAYLOADS = [
     r"^(Готов|Мои курсы|Роль|Пересдать|Далее|Начать|Отмена|Сохранить|Заново|\.)$",
+    r"^(Документы|Выйти)$",                 # 19.08: «Мои документы», пауза теста
     r"^[A-D]$",
     r"^\d{1,2}$",                       # выбор роли
     r"^Выбрать \d+$",
@@ -134,12 +135,15 @@ def test_test_options_block_vs_letters():
     block = _buttons(SAMPLES["test_block"])
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in block][0] == \
         ("A · До заезда гостя", "A")
-    assert all(b["DISPLAY"] == "BLOCK" for b in block)
+    answers = [b for b in block if b["COMMAND_PARAMS"] != "Выйти"]
+    assert all(b["DISPLAY"] == "BLOCK" for b in answers)
+    assert block[-1]["COMMAND_PARAMS"] == "Выйти"          # 19.08: пауза теста
     # длинный вариант → буквы
     long = kb.for_session({"state": "EXAM"},
                           test_options=["х" * 30, "а", "б", "в"])
-    assert [b["COMMAND_PARAMS"] for b in long] == ["A", "B", "C", "D"]
-    assert all(b["DISPLAY"] == "LINE" and b["WIDTH"] == 70 for b in long)
+    letters = [b for b in _buttons(long) if b["COMMAND_PARAMS"] != "Выйти"]
+    assert [b["COMMAND_PARAMS"] for b in letters] == ["A", "B", "C", "D"]
+    assert all(b["DISPLAY"] == "LINE" and b["WIDTH"] == 70 for b in letters)
 
 
 def test_courses_menu_layouts():

@@ -117,6 +117,8 @@ def init_db() -> None:
         _ensure_column(conn, "processed_files", "content_hash", "TEXT")
         # Демо-фидбек C: должность в отчётах (из user.get при «Пригласить»)
         _ensure_column(conn, "employees", "work_position", "TEXT")
+        # 19.08: право смены роли выдаёт HR (дефолт 1 — поведение прежнее)
+        _ensure_column(conn, "employees", "can_switch_role", "INTEGER DEFAULT 1")
         # Гейт поллера: файлы, обработанные ДО появления processed_files,
         # известны по courses.doc_id — сидируем, чтобы их не переобработать.
         # 19.08: архивные курсы НЕ сидируем — иначе чистка индекса
@@ -526,6 +528,16 @@ def get_all_employees() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute("SELECT * FROM employees").fetchall()
         return [dict(r) for r in rows]
+
+
+def set_can_switch_role(bitrix_uid: str, allowed: bool) -> bool:
+    """19.08: HR выдаёт/забирает право смены роли. True = сотрудник найден."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE employees SET can_switch_role = ? WHERE bitrix_uid = ?",
+            (1 if allowed else 0, str(bitrix_uid)),
+        )
+        return cur.rowcount > 0
 
 
 def get_employee(bitrix_uid: str) -> dict | None:

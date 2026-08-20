@@ -50,6 +50,7 @@ from app.db import (
     remove_processed_file,
     save_draft_course,
     seen_users_empty,
+    set_can_switch_role,
     set_course_archived,
     set_meta,
     update_course_questions,
@@ -76,6 +77,7 @@ from app.roles import (
     display_name,
     load_roles_config,
     parse_filename,
+    save_roles_config,
     selectable_roles,
 )
 from app.state_machine import (
@@ -140,7 +142,8 @@ _pending_edits: dict[str, dict] = {}
 _HR_COMMAND_PREFIXES = ("курсы", "курс", "список", "подтвердить", "допустить",
                         "пригласить", "вопросы", "изменить", "история",
                         "отчёт", "отчет", "руководители", "руководитель",
-                        "перегенерировать")
+                        "перегенерировать", "аббревиатура", "аббревиатуры",
+                        "роль")
 
 
 def _get_pending(user_id: str) -> dict | None:
@@ -484,6 +487,17 @@ async def _delete_document(row: dict) -> None:
         text += "\nКурс архивирован — новым сотрудникам он не назначается."
     for hr_id in _hr_ids():
         await _send(str(hr_id), text, HR_BOT_ID)
+
+
+def _abbr_list_text(cfg: dict) -> str:
+    prefixes = cfg.get("prefixes", {})
+    if not prefixes:
+        return "Реестр аббревиатур пуст."
+    roles_map = cfg.get("roles", {})
+    lines = ["🔤 Аббревиатуры департаментов:"]
+    for abbr in sorted(prefixes):
+        lines.append(f"• {abbr} → {roles_map.get(prefixes[abbr], prefixes[abbr])}")
+    return "\n".join(lines)
 
 
 def _hr_ids() -> list[str]:
@@ -921,10 +935,40 @@ async def _broadcast_course(course: dict, uids: list[str]) -> None:
     """Анонс от EMPLOYEE-бота (BOT_ID): client_id не передаём — _send возьмёт
     BOT_CLIENT_ID из .env. Последовательно: _send ретраит до 5 раз на флапе."""
     text = (f"📚 Тебе доступен новый курс: *{display_name(course['doc_name'])}*\n"
-            "Напиши мне любое сообщение, чтобы начать обучение.")
+            "Напиши мне любое сообщение, чтобы начать обучение.\n"
+            f"⏰ На прохождение — {ESCALATION_DAYS} дней.")
     kb = keyboards.start_button("▶ Начать обучение") if BUTTONS_ENABLED else None
     for uid in uids:
         await _send(f"u{uid}", text, BOT_ID, **_kb_kwargs(kb))
+
+
+def _standard_recipients(doc_roles: list[str]) -> list[str]:
+    """Кому анонсировать НОВЫЙ СТАНДАРТ (19.08: доступен для вопросов сразу).
+    Без гейтов busy/done — это знание, а не назначение курса. Роль неизвестна
+    → только ALL-документы (не спамить ролевыми не тем людям)."""
+    doc = set(doc_roles)
+    uids = []
+    for e in get_all_employees():
+        uid = e["bitrix_uid"]
+        role = _last_known_role(uid)
+        if role and ({role, ALL_STAFF} & doc):
+            uids.append(uid)
+        elif role is None and ALL_STAFF in doc:
+            uids.append(uid)
+    return uids
+
+
+async def _broadcast_new_standard(file_name: str, detail_url: str | None,
+                                  doc_roles: list[str]) -> None:
+    """«Стандарт доступен сразу после загрузки» — тест назначается позже,
+    после «Подтвердить» (флоу 19.08). Fire-and-forget, _send сам ретраит."""
+    uids = await asyncio.to_thread(_standard_recipients, doc_roles)
+    text = (f"📄 Новый стандарт доступен: *{display_name(file_name)}*\n"
+            + (f"{detail_url}\n" if detail_url else "")
+            + "Уже можешь читать его и задавать мне вопросы по нему. "
+              "Тест будет назначен позже.")
+    for uid in uids:
+        await _send(f"u{uid}", text, BOT_ID)
 
 
 @app.post("/hr")
@@ -1329,6 +1373,72 @@ async def _handle_hr_message(user_id: str, question: str,
             text = ("❌ Формат: Руководители | Руководитель добавить {email} "
                     "[старший] | Руководитель удалить {email}")
 
+    elif msg_lower.startswith(("аббревиатура", "аббревиатуры")):
+        # 19.08: реестр аббревиатур департаментов правится из HR-бота
+        cfg = await asyncio.to_thread(load_roles_config)
+        prefixes = cfg.setdefault("prefixes", {})
+        m = re.match(r"^аббревиатура\s+(добавить|удалить)\s+(\S{1,10})"
+                     r"(?:\s+(.+))?$", question.strip(), re.IGNORECASE)
+        if m:
+            action = m.group(1).lower()
+            abbr = m.group(2).upper()
+            title = (m.group(3) or "").strip()
+            if not re.fullmatch(r"[A-Z0-9]{1,6}", abbr):
+                text = ("❌ Аббревиатура — латиница/цифры, до 6 символов "
+                        "(FO, HSKP, FIN).")
+            elif action == "удалить":
+                if abbr in prefixes:
+                    prefixes.pop(abbr)
+                    await asyncio.to_thread(save_roles_config, cfg)
+                    text = (f"✅ Аббревиатура {abbr} удалена (роль осталась "
+                            "в реестре).\n\n" + _abbr_list_text(cfg))
+                else:
+                    text = f"⚠️ Аббревиатуры {abbr} нет в реестре."
+            elif abbr in prefixes:
+                known = cfg.get("roles", {}).get(prefixes[abbr], prefixes[abbr])
+                text = f"ℹ️ {abbr} уже занята: {known}."
+            else:
+                slug = abbr.lower()
+                roles_map = cfg.setdefault("roles", {})
+                if slug not in roles_map and not title:
+                    text = ("❌ Для новой роли укажи название: "
+                            "Аббревиатура добавить FIN Финансовая служба")
+                else:
+                    if title:
+                        roles_map.setdefault(slug, title)
+                    prefixes[abbr] = slug
+                    await asyncio.to_thread(save_roles_config, cfg)
+                    text = (f"✅ {abbr} → {roles_map[slug]}.\n\n"
+                            + _abbr_list_text(cfg))
+        else:
+            text = (_abbr_list_text(cfg) + "\n\n"
+                    "Правка: Аббревиатура добавить {ABBR} {Название роли} · "
+                    "Аббревиатура удалить {ABBR}")
+
+    elif re.match(r"^роль\s+(разрешить|запретить)\b", msg_lower):
+        # 19.08: право смены роли — например, менеджеру смотреть ответы
+        # разных отделов; снятие возвращает роль по отделу
+        m = re.match(r"^роль\s+(разрешить|запретить)\s+(\S+)$", msg_lower)
+        if not m:
+            text = "❌ Формат: Роль разрешить {email или ID} · Роль запретить {email или ID}"
+        else:
+            allow = m.group(1) == "разрешить"
+            target = m.group(2)
+            if "@" in target:
+                emp = await asyncio.to_thread(get_employee_by_email, target)
+                target = emp["bitrix_uid"] if emp else None
+            if target is None:
+                text = (f"⚠️ {m.group(2)} не найден среди приглашённых. "
+                        f"Сначала: Пригласить {m.group(2)}")
+            elif await asyncio.to_thread(set_can_switch_role, target, allow):
+                text = (f"✅ Сотрудник {target} "
+                        + ("может выбирать роль сам (команда «Роль»)."
+                           if allow else
+                           "больше не выбирает роль — она определяется отделом."))
+            else:
+                text = (f"⚠️ Сотрудник {target} не найден среди приглашённых. "
+                        "Сначала: Пригласить {email}")
+
     else:
         text = (
             "Доступные команды:\n"
@@ -1407,12 +1517,13 @@ async def _regenerate_and_notify(dialog_id: str, client_id: str, course: dict,
 @app.post("/disk-webhook")
 async def disk_webhook(request: Request):
     form = await request.form()
-    event = form.get("event", "")
+    # Имена событий приходят UPPERCASE (как в /user-webhook) — 19.08
+    event = (form.get("event") or "").upper()
 
     # Log all fields to help debug payload structure in production
     print(f"[disk-webhook] event={event!r} fields={dict(form)}")
 
-    if event != "OnDiskFileAdd":
+    if event != "ONDISKFILEADD":
         return {"status": "ignored"}
 
     file_id = form.get("data[FIELDS_AFTER][ID]")
@@ -1658,6 +1769,12 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
             mark_file_processed, file_id, file_name, folder_id, update_time,
             content_hash,
         )
+
+        # 8.5. 19.08: стандарт доступен для вопросов СРАЗУ (чанки уже в
+        # индексе) — сотрудники ролей документа узнают, не дожидаясь
+        # «Подтвердить» (тест придёт позже отдельным анонсом)
+        asyncio.create_task(_broadcast_new_standard(
+            file_name, detail_url, list(roles)))
 
         # 9. Save draft JSON
         courses_dir = os.path.join(data_dir, "courses")

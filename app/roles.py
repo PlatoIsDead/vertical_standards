@@ -31,6 +31,15 @@ def load_roles_config() -> dict:
     return cfg
 
 
+def save_roles_config(cfg: dict) -> None:
+    """Атомарная запись roles.json (19.08: HR-команда «Аббревиатура …»).
+    Файл читают на каждый запрос и правят руками — tmp+replace, читаемый JSON."""
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
 def selectable_roles() -> list[tuple[str, str]]:
     """Роли для меню выбора сотрудником, в порядке из конфига (без all_staff)."""
     roles = load_roles_config().get("roles", {})
