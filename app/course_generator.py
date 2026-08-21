@@ -104,7 +104,7 @@ def _llm_json(client: OpenAI, system: str, user: str, max_tokens: int,
     непрошедшая валидация → ретрай, после второй неудачи — ValueError."""
     for attempt in range(2):
         response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

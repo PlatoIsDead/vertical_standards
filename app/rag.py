@@ -73,7 +73,7 @@ def answer(query, chunks, embeddings, section_filter, answer_length, role_filter
     # max_completion_tokens понимают и новые, и старые модели (18.08: живой
     # 400 «Unsupported parameter: max_tokens» ронял ВСЕ RAG-ответы)
     response = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{length_map.get(answer_length, '')}\n\nФрагменты:\n{context}\n\nВопрос: {query}"},

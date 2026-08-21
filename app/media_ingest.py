@@ -136,7 +136,7 @@ def _llm_text(system: str, user: str, max_tokens: int = 2000,
     if content_extra:
         content += content_extra
     resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": content}],
         max_completion_tokens=max_tokens,

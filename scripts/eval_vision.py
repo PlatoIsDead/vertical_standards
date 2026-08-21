@@ -65,7 +65,7 @@ def _vision_json(client: OpenAI, system: str, user_text: str,
         content.append(_image_part(image_bytes))
     for attempt in range(2):
         resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": content}],
             response_format={"type": "json_object"},

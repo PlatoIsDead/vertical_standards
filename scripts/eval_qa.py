@@ -61,7 +61,7 @@ def main() -> None:
     lines = [f"# Валидация Q&A — {args.date}", "",
              f"Документов: {len(docs)} · вопросов на документ: "
              f"{args.questions} · модель: "
-             f"{os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}", ""]
+             f"{os.getenv('OPENAI_MODEL', 'gpt-5.5')}", ""]
 
     for doc_name in sorted(docs):
         doc_chunks = docs[doc_name]
