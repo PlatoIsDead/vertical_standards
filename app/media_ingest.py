@@ -141,7 +141,14 @@ def _llm_text(system: str, user: str, max_tokens: int = 2000,
                   {"role": "user", "content": content}],
         max_completion_tokens=max_tokens,
     )
-    return (resp.choices[0].message.content or "").strip()
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        # Sprint 3: reasoning-модель может сжечь ВЕСЬ бюджет на невидимый
+        # reasoning и вернуть пустой content — молчать нельзя
+        raise RuntimeError(
+            f"пустой content (finish_reason="
+            f"{resp.choices[0].finish_reason}, budget={max_tokens})")
+    return text
 
 
 def smartart_to_text(xml_bytes: bytes, doc_context: str) -> str:
@@ -173,14 +180,20 @@ def describe_image(image_bytes: bytes, doc_context: str) -> str:
     if key in cache:
         return cache[key]
     b64 = base64.b64encode(image_bytes).decode()
-    text = _llm_text(
-        DESCRIBE_PROMPT.format(ctx=doc_context),
-        "Расшифруй изображение по инструкции из системного сообщения.",
-        max_tokens=3000,   # Sprint 2: полная транскрипция структуры длиннее
-        content_extra=[{"type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}",
-                                      "detail": "high"}}],   # мелкий текст таблиц
-    )
+    extra = [{"type": "image_url",
+              "image_url": {"url": f"data:image/png;base64,{b64}",
+                            "detail": "high"}}]   # мелкий текст таблиц
+    text = ""
+    # Sprint 3: reasoning может сжечь бюджет → пустой content; повтор с ×2
+    for budget in (8000, 16000):
+        try:
+            text = _llm_text(
+                DESCRIBE_PROMPT.format(ctx=doc_context),
+                "Расшифруй изображение по инструкции из системного сообщения.",
+                max_tokens=budget, content_extra=extra)
+            break
+        except RuntimeError as exc:
+            print(f"[media] describe (budget={budget}): {exc}")
     if text:
         cache[key] = text
         _save_cache(cache)
