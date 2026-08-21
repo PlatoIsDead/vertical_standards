@@ -22,7 +22,10 @@ def parse_file(path: str, ext: str, file_name: str) -> list[dict]:
         if _SCRIPTS_DIR not in sys.path:
             sys.path.insert(0, _SCRIPTS_DIR)
         from parse_standards import parse_docx  # noqa: PLC0415
-        return parse_docx(path)
+        chunks = parse_docx(path)
+        # Vision-ингест (21.08): SmartArt-схемы и скриншоты → текстовые чанки
+        from app.media_ingest import docx_media_chunks  # noqa: PLC0415
+        return chunks + docx_media_chunks(path, file_name)
     if ext == "md":
         return parse_md(path)
     if ext == "txt":
