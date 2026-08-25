@@ -65,12 +65,64 @@ def md_to_bb(text: str) -> str:
     return _BOLD_RE.sub(r"[b]\1[/b]", text)
 
 
+_HELP_TEXT = (
+    "🤖 Я — бот стандартов «Вертикали». Что я умею:\n"
+    "• Отвечаю на вопросы по стандартам твоего отдела — просто напиши вопрос\n"
+    "• *Мои курсы* — твоё обучение и переключение между курсами\n"
+    "• *Документы* — стандарты твоего отдела со ссылками\n"
+    "• *Готов* — начать тест по текущему курсу · *Выйти* — пауза теста\n"
+    "• *Роль* — сменить роль\n"
+    "• *Помощь* — показать эту подсказку ещё раз"
+)
+
+_HELP_COMMANDS = ("помощь", "help", "старт", "инструкция")
+
+# 21.08 (Евгения: «инструкция уровня „нажми эту кнопку“», обещание «после
+# каждой команды — пояснение»): хвост-навигатор по ТЕКУЩЕМУ состоянию
+_STATE_HINTS = {
+    "READING": ("Что дальше: *Готов* — начать тест · *Мои курсы* · "
+                "*Документы* · или просто задай вопрос по стандарту"),
+    "BASIC_TEST": "Что дальше: ответь буквой A–D · *Выйти* — пауза теста",
+    "EXAM": "Что дальше: ответь буквой A–D · *Выйти* — пауза теста",
+    "WAITING_HR": ("Что дальше: жди допуска HR · *Мои курсы* · *Документы* · "
+                   "задавай вопросы по стандартам"),
+    None: "Что дальше: *Мои курсы* · *Документы* · *Помощь*",
+}
+
+# Тексты, которые уже сами всё объясняют — хвост не дублируем
+_HINT_SKIP_MARKERS = ("Что дальше", "Команды:", "Что я умею",
+                      "ответь одной буквой")
+
+
+def _with_hint(text: str, user_id: str) -> str:
+    if any(m in text for m in _HINT_SKIP_MARKERS):
+        return text
+    session = get_session(user_id)          # СВЕЖЕЕ состояние (после команды)
+    state = session["state"] if session else None
+    hint = _STATE_HINTS.get(state)
+    return f"{text}\n\n{hint}" if hint else text
+
+
 def process_message(user_id: str, message: str, dialog_id: str,
-                     chunks: list, embeddings) -> str:
+                    chunks: list, embeddings) -> str:
     """
     Main entry point. Returns the text to send back to the user.
     All DB calls are sync; run this in asyncio.to_thread() from FastAPI.
     """
+    cmd = message.strip().lower()
+    if cmd in _HELP_COMMANDS and is_employee_allowed(user_id):
+        return _HELP_TEXT
+    # 21.08: первый контакт — приветствие-инструкция перед обычным ответом
+    first_contact = (is_employee_allowed(user_id)
+                     and not get_sessions_by_user(user_id))
+    text = _dispatch(user_id, message, dialog_id, chunks, embeddings)
+    if first_contact:
+        return _HELP_TEXT + "\n\n" + text
+    return _with_hint(text, user_id)
+
+
+def _dispatch(user_id: str, message: str, dialog_id: str,
+              chunks: list, embeddings) -> str:
     session = get_session(user_id)
 
     if session is None:
@@ -681,9 +733,12 @@ def _handle_test(session: dict, message: str, phase: str,
         return _my_courses_text(session["user_id"], session.get("role"))
     if cmd in ("выйти", "выход"):
         return (f"⏸ Тест на паузе (вопрос {q_idx + 1}/{total}, прогресс "
-                "сохранён).\n"
-                "Что дальше: ▶ *Продолжить* — вернуться к вопросу · "
-                "*Выбрать {номер}* — другой курс · *Документы*.\n\n"
+                "сохранён).\n\n"
+                "Что дальше — пока тест на паузе, можно:\n"
+                "• ▶ *Продолжить* — вернуться к тому же вопросу\n"
+                "• *Выбрать {номер}* — перейти к другому курсу\n"
+                "• *Документы* — открыть список стандартов\n"
+                "• *Помощь* — напомнить, как пользоваться ботом\n\n"
                 + _my_courses_text(session["user_id"], session.get("role")))
     if cmd == "продолжить":
         return "▶ Продолжаем!\n\n" + format_question(current_q, q_idx,

@@ -82,7 +82,7 @@ def test_rag_called_with_role_filter(env):
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
     reply = sm.process_message("u1", "Как убирать номер?", "d1", [], None)
-    assert reply == "MOCK_ANSWER"
+    assert reply.startswith("MOCK_ANSWER")   # + хвост «Что дальше»
     assert env["role_filter"] == "housekeeper"
 
 
@@ -227,7 +227,7 @@ def test_free_question_still_goes_to_rag(env):
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
     reply = sm.process_message("u1", "какие курсы по уборке?", "d1", [], None)
-    assert reply == "MOCK_ANSWER"                          # substring ≠ команда
+    assert reply.startswith("MOCK_ANSWER")   # + хвост «Что дальше»                          # substring ≠ команда
 
 
 def test_start_reading_shows_command_hints(env):
@@ -258,7 +258,7 @@ def test_waiting_hr_menu(env, monkeypatch):
     assert "📚 Твои курсы" in reply
     # 17.08: ожидание допуска не блокирует — вопросы уходят в RAG
     reply2 = sm.process_message("u1", "что дальше?", "d1", [], None)
-    assert reply2 == "MOCK_ANSWER"
+    assert reply2.startswith("MOCK_ANSWER")
 
 
 def test_waiting_park_switch_admit_exam(env, monkeypatch):
@@ -516,3 +516,24 @@ def test_documents_sections(env):
     out = sm._my_documents_text("admin_reception", chunks)
     assert out.index("📌") < out.index("Пожар") < out.index("📖") \
         < out.index("Общее")
+
+
+# ── 25.08: «после каждой команды — пояснение» (обещание со встречи 21.08) ────
+
+def test_help_command_and_first_contact_greeting(env):
+    reply = sm.process_message("u1", "привет", "d1", [], None)
+    assert "Что я умею" in reply          # первый контакт = приветствие
+    reply2 = sm.process_message("u1", "Помощь", "d1", [], None)
+    assert reply2 == sm._HELP_TEXT        # команда работает из любого состояния
+
+
+def test_hint_follows_state(env):
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    rag = sm.process_message("u1", "как дела?", "d1", [], None)
+    assert "Что дальше: *Готов*" in rag            # READING-хвост на RAG-ответе
+    q = sm.process_message("u1", "Готов", "d1", [], None)
+    assert "ответь буквой A–D" in q                # хвост по НОВОМУ состоянию
+    pause = sm.process_message("u1", "выйти", "d1", [], None)
+    assert pause.count("Что дальше") == 1          # свой текст, без дубля хвоста
+    assert "*Помощь*" in pause
