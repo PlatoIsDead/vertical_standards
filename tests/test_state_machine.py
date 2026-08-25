@@ -428,3 +428,91 @@ def test_test_pause_and_resume(env, monkeypatch):
     row = db.get_waiting_session("u1")
     assert row["course_id"] == first_course
     assert row["score_basic"] == 2                         # без задвоений
+
+
+# ── 21.08: фиксы встречи — меню отовсюду, честные статусы, «Продолжить» ─────
+
+_EXAM2 = {"course_summary": "s",
+          "basic_questions": [{"text": "Б?", "options": ["A. 1", "B. 2"],
+                               "correct": "A"}],
+          "exam_questions": [
+              {"text": "Э1?", "options": ["A. 1", "B. 2"], "correct": "A"},
+              {"text": "Э2?", "options": ["A. 1", "B. 2"], "correct": "A"}]}
+
+
+def test_menu_everywhere_no_side_effects(env, monkeypatch):
+    """«Мои курсы»/«Документы» при session None: список, БЕЗ retake-форка и
+    БЕЗ молчаливого назначения курса (живой тупик Дмитрия 21.08)."""
+    monkeypatch.setattr(sm, "notify_hr", lambda *a, **kw: None)
+    course = db.get_course_by_doc_name("Стандарты.docx")
+    db.update_course_questions(course["id"],
+                               json.dumps(_EXAM2, ensure_ascii=False))
+    s = db.create_session("u1", "d1", course["id"], state="DONE")  # провал 0/2
+    db.update_session(s["id"], role="housekeeper")
+
+    reply = sm.process_message("u1", "Мои курсы", "d1", [], None)
+    assert "📚 Твои курсы" in reply
+    assert db.get_session("u1") is None            # курс НЕ назначился
+    assert "Ты не сдал экзамен" not in reply       # форк НЕ перехватил
+
+    doc_chunks = [{"doc_name": "ALL Правила.docx", "text": "т",
+                   "roles": ["all_staff"], "audience": "staff"}]
+    reply = sm.process_message("u1", "Документы", "d1", doc_chunks, None)
+    assert "📖" in reply and "Правила" in reply
+    assert db.get_session("u1") is None
+
+    # обычное сообщение — форк работает как раньше
+    reply = sm.process_message("u1", "привет", "d1", [], None)
+    assert "Пересдать" in reply
+
+
+def test_my_courses_honest_statuses(env, monkeypatch):
+    """21.08: провал ≠ «пройден»; у последнего провала — подсказка Пересдать."""
+    monkeypatch.setattr(sm, "notify_hr", lambda *a, **kw: None)
+    course_a = db.get_course_by_doc_name("Стандарты.docx")
+    db.update_course_questions(course_a["id"],
+                               json.dumps(_EXAM2, ensure_ascii=False))
+    cid_b = db.save_draft_course("Правила.docx", "2",
+                                 json.dumps(_EXAM2, ensure_ascii=False))
+    db.activate_course_by_id(cid_b, "hr1")
+
+    sb = db.create_session("u1", "d1", cid_b, state="DONE")       # B сдан 2/2
+    db.update_session(sb["id"], score_exam=2)
+    sa = db.create_session("u1", "d1", course_a["id"], state="DONE")  # A провал
+    db.update_session(sa["id"], score_exam=0)
+
+    menu, sel = sm.my_courses("u1", None)
+    assert "✅ Правила — пройден" in menu
+    assert "❌ Стандарты — экзамен не сдан (0/2)" in menu
+    assert "напиши *Пересдать*" in menu            # A = последний провал
+    assert sel == []                               # завершённые не выбираемы
+
+
+def test_continue_returns_to_question(env, monkeypatch):
+    monkeypatch.setattr(sm, "notify_hr", lambda *a, **kw: None)
+    course = db.get_course_by_doc_name("Стандарты.docx")
+    db.update_course_questions(course["id"],
+                               json.dumps(_EXAM2, ensure_ascii=False))
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    sm.process_message("u1", "Готов", "d1", [], None)        # вопрос Б?
+    reply = sm.process_message("u1", "выйти", "d1", [], None)
+    assert "Что дальше" in reply and "Продолжить" in reply
+    reply = sm.process_message("u1", "Продолжить", "d1", [], None)
+    assert "Б?" in reply                                     # тот же вопрос
+    assert db.get_session("u1")["current_q_idx"] == 0        # прогресс цел
+    reply = sm.process_message("u1", "A", "d1", [], None)    # отвечает дальше
+    assert "Базовый тест завершён" in reply
+    assert "Что дальше" in reply                             # хвост-подсказка
+
+
+def test_documents_sections(env):
+    chunks = [
+        {"doc_name": "FO Пожар.docx", "text": "т",
+         "roles": ["admin_reception"], "audience": "staff"},
+        {"doc_name": "ALL Общее.docx", "text": "т",
+         "roles": ["all_staff"], "audience": "staff"},
+    ]
+    out = sm._my_documents_text("admin_reception", chunks)
+    assert out.index("📌") < out.index("Пожар") < out.index("📖") \
+        < out.index("Общее")

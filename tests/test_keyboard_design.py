@@ -27,6 +27,8 @@ SAMPLES = {
                                   reading=True),
     "menu_grid": kb.courses_menu([(i, f"Курс {i}", "todo")
                                   for i in range(1, 8)]),
+    "menu_resume": kb.courses_menu([(1, "Курс", "todo")], resume_test=True),
+    "menu_retake": kb.courses_menu([(1, "Курс", "todo")], retake=True),
     "start": kb.start_button("▶ Начать обучение"),
     "start_menu": kb.start_button("📚 Мои курсы", "Мои курсы",
                                   role="secondary"),
@@ -49,7 +51,7 @@ SAMPLES = {
 # ЖЕЛЕЗНЫЙ ИНВАРИАНТ: payload'ы — только команды, которые понимает FSM/HR
 ALLOWED_PAYLOADS = [
     r"^(Готов|Мои курсы|Роль|Пересдать|Далее|Начать|Отмена|Сохранить|Заново|\.)$",
-    r"^(Документы|Выйти)$",                 # 19.08: «Мои документы», пауза теста
+    r"^(Документы|Выйти|Продолжить)$",      # 19.08/21.08: документы, пауза
     r"^[A-D]$",
     r"^\d{1,2}$",                       # выбор роли
     r"^Выбрать \d+$",
@@ -200,3 +202,13 @@ def test_admit_and_invite_trim():
     assert len(invite["TEXT"]) == 34
     assert invite["COMMAND_PARAMS"] == \
         "Пригласить very.long.address@subdomain.becar.ru"
+
+
+def test_resume_and_retake_menu():
+    resume = _buttons(SAMPLES["menu_resume"])
+    assert (resume[0]["TEXT"], resume[0]["COMMAND_PARAMS"]) == \
+        ("▶ Продолжить тест", "Продолжить")
+    assert resume[0]["BG_COLOR"] == "#BEDC3C"      # primary у «Продолжить»
+    assert all(b["COMMAND_PARAMS"] != "Готов" for b in resume)
+    retake = _buttons(SAMPLES["menu_retake"])
+    assert any(b["COMMAND_PARAMS"] == "Пересдать" for b in retake)

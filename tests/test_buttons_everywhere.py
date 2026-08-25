@@ -503,3 +503,53 @@ def test_my_courses_switch_buttons(send_trap, monkeypatch):
     texts = [b["TEXT"] for b in send_trap[0]["keyboard"] if "TEXT" in b]
     assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "📄 Документы",
                      "Роль"]
+
+
+# ── 21.08: фиксы встречи ─────────────────────────────────────────────────────
+
+def test_canonical_url(monkeypatch):
+    monkeypatch.setattr(bot, "BITRIX_WEBHOOK_URL",
+                        "https://portal.becar.ru/rest/1/xyz/")
+    assert bot._canonical_url(
+        "https://propertyhunters.pro/company/doc.docx?a=1") == \
+        "https://portal.becar.ru/company/doc.docx?a=1"
+    assert bot._canonical_url(None) is None
+    assert bot._canonical_url("кривое") == "кривое"
+
+
+def test_exit_from_test_gets_menu_keyboard(send_trap, monkeypatch):
+    """21.08: тупик паузы — после «выйти» клавиатура курсов с
+    [▶ Продолжить тест], НЕ тестовая A–D."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 1, "state": "BASIC_TEST",
+                                     "role": "fo", "current_q_idx": 0})
+    monkeypatch.setattr(bot, "get_course_questions", lambda cid: {})
+    monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "пауза")
+    monkeypatch.setattr(
+        bot, "my_courses",
+        lambda uid, role: ("t", [{"id": 2, "n": 1, "status": "todo",
+                                  "doc_name": "Б.docx"}]))
+    bot._recent_msgs.clear()
+    _run_employee("выйти")
+    btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert btns[0]["COMMAND_PARAMS"] == "Продолжить"
+    assert [b["COMMAND_PARAMS"] for b in btns] == \
+        ["Продолжить", "Выбрать 1"]
+
+
+def test_menu_at_session_none_gets_retake_keyboard(send_trap, monkeypatch):
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session", lambda uid: None)
+    monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "список")
+    monkeypatch.setattr(bot, "_retake_fork_text", lambda uid: "форк")
+    monkeypatch.setattr(bot, "_last_known_role", lambda uid: None)
+    monkeypatch.setattr(
+        bot, "my_courses",
+        lambda uid, role: ("t", [{"id": 2, "n": 1, "status": "todo",
+                                  "doc_name": "Б.docx"}]))
+    bot._recent_msgs.clear()
+    _run_employee("Мои курсы")
+    btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert [b["COMMAND_PARAMS"] for b in btns] == \
+        ["Выбрать 1", "Пересдать"]

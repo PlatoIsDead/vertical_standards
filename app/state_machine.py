@@ -85,6 +85,13 @@ def process_message(user_id: str, message: str, dialog_id: str,
         # (иначе любое сообщение молча назначит следующий курс, и «Пересдать»
         # уйдёт в RAG).
         cmd = message.strip().lower()
+        # 21.08: меню/документы работают ВЕЗДЕ и БЕЗ побочных эффектов —
+        # раньше их съедал retake-форк или они молча назначали новый курс
+        # (живой тупик Дмитрия на встрече 21.08)
+        if cmd in _MENU_COMMANDS:
+            return my_courses(user_id, _last_known_role(user_id))[0]
+        if cmd in _DOC_COMMANDS:
+            return _my_documents_text(_last_known_role(user_id), chunks)
         if cmd in ("пересдать", "пересдача"):
             return _handle_retake(user_id)
         if cmd != "далее":
@@ -125,11 +132,11 @@ def process_message(user_id: str, message: str, dialog_id: str,
     elif state == "READING":
         return _handle_reading(session, message, chunks, embeddings)
     elif state == "BASIC_TEST":
-        return _handle_test(session, message, "basic")
+        return _handle_test(session, message, "basic", chunks)
     elif state == "WAITING_HR":
         return _handle_waiting_hr(session, message, chunks, embeddings)
     elif state == "EXAM":
-        return _handle_test(session, message, "exam")
+        return _handle_test(session, message, "exam", chunks)
     elif state == "DONE":
         return _handle_done(session)
     else:
@@ -406,12 +413,20 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
     session = get_session(user_id)
     current_id = session["course_id"] if session else 0
     # Свежайшее состояние незакрытой строки по каждому курсу (список отсортирован
-    # новые сверху — берём первое вхождение); q_idx — для меток пауз тестов
+    # новые сверху — берём первое вхождение); q_idx — для меток пауз тестов.
+    # 21.08: тем же списком считаем ЛУЧШИЙ экзамен по DONE-строкам — статусы
+    # «пройден/не сдан» должны быть честными (маркеры course_id=0 не в счёт)
     open_states: dict[int, tuple] = {}
-    for s in get_sessions_by_user(user_id):
-        if s["state"] != "DONE" and s["course_id"] not in open_states:
+    best_exam: dict[int, int] = {}
+    all_sessions = get_sessions_by_user(user_id)
+    for s in all_sessions:
+        if s["state"] == "DONE":
+            if s["course_id"]:
+                best_exam[s["course_id"]] = max(
+                    best_exam.get(s["course_id"], 0), s["score_exam"] or 0)
+        elif s["course_id"] not in open_states:
             open_states[s["course_id"]] = (s["state"],
-                                            s.get("current_q_idx", 0))
+                                           s.get("current_q_idx", 0))
     mine = [c for c in courses
             if role_id is None or {role_id, ALL_STAFF} & set(course_roles(c))]
     if not mine:
@@ -433,7 +448,17 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
             else:
                 lines.append(f"▶️ {name} — проходишь сейчас")
         elif c["id"] in done:
-            lines.append(f"✅ {name} — пройден")
+            questions = get_course_questions(c["id"])
+            total_exam = len(questions.get("exam_questions", []))
+            best = best_exam.get(c["id"], 0)
+            if best >= _exam_pass_threshold(questions):
+                lines.append(f"✅ {name} — пройден")
+            else:
+                line = f"❌ {name} — экзамен не сдан ({best}/{total_exam})"
+                last = get_last_done_session(user_id)
+                if last and last["course_id"] == c["id"]:
+                    line += " · напиши *Пересдать*"
+                lines.append(line)
         else:
             n = selectable.index(c) + 1
             state, q_idx = open_states.get(c["id"], (None, 0))
@@ -594,9 +619,11 @@ _DOC_COMMANDS = ("мои документы", "документы")
 
 
 def _my_documents_text(role_id: str | None, chunks: list) -> str:
-    """«Мои документы»: уникальные документы индекса для роли сотрудника
-    (19.08). Роль неизвестна → только общие (ALL) + подсказка про «Роль»."""
-    docs: list[str] = []
+    """«Мои документы»: документы индекса для роли сотрудника (19.08).
+    21.08 (Евгения: «136 простынёй — люди уйдут к руководителю»): две секции —
+    «Для твоего отдела» и «Общие». Роль неизвестна → только общие."""
+    dept_docs: list[str] = []
+    common_docs: list[str] = []
     for c in chunks:
         if c.get("audience") == "guest":
             continue
@@ -604,28 +631,37 @@ def _my_documents_text(role_id: str | None, chunks: list) -> str:
         if not doc:
             continue
         c_roles = set(c.get("roles") or [])
-        if role_id is None:
-            if ALL_STAFF not in c_roles:
-                continue
-        elif not ({role_id, ALL_STAFF} & c_roles):
-            continue
-        if doc not in docs:
-            docs.append(doc)
-    if not docs:
+        if role_id is not None and role_id in c_roles:
+            if doc not in dept_docs:
+                dept_docs.append(doc)
+        elif ALL_STAFF in c_roles:
+            if doc not in common_docs and doc not in dept_docs:
+                common_docs.append(doc)
+    if not dept_docs and not common_docs:
         return "Для твоей роли пока нет документов."
-    lines = ["📄 Твои документы:", ""]
-    for doc in docs:
-        lines.append(f"• {display_name(doc)}")
-        url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
-        if url:
-            lines.append(f"  {url}")
+
+    def _section(docs: list[str]) -> list[str]:
+        out = []
+        for doc in docs:
+            out.append(f"• {display_name(doc)}")
+            url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
+            if url:
+                out.append(f"  {url}")
+        return out
+
+    lines = ["📄 Твои документы:"]
+    if dept_docs:
+        lines += ["", "📌 *Для твоего отдела:*"] + _section(dept_docs)
+    if common_docs:
+        lines += ["", "📖 *Общие:*"] + _section(common_docs)
     lines += ["", "Задавай вопросы по любому из них — отвечу по тексту стандарта."]
     if role_id is None:
         lines += ["", "Показаны только общие документы — выбери роль: *Роль*."]
     return "\n".join(lines)
 
 
-def _handle_test(session: dict, message: str, phase: str) -> str:
+def _handle_test(session: dict, message: str, phase: str,
+                 chunks: list | None = None) -> str:
     questions = get_course_questions(session["course_id"])
     q_list = questions.get(f"{phase}_questions", [])
     total = len(q_list)
@@ -645,9 +681,15 @@ def _handle_test(session: dict, message: str, phase: str) -> str:
         return _my_courses_text(session["user_id"], session.get("role"))
     if cmd in ("выйти", "выход"):
         return (f"⏸ Тест на паузе (вопрос {q_idx + 1}/{total}, прогресс "
-                "сохранён). Выбери другой курс — *Выбрать {номер}* — или "
-                "продолжай отвечать буквой A–D.\n\n"
+                "сохранён).\n"
+                "Что дальше: ▶ *Продолжить* — вернуться к вопросу · "
+                "*Выбрать {номер}* — другой курс · *Документы*.\n\n"
                 + _my_courses_text(session["user_id"], session.get("role")))
+    if cmd == "продолжить":
+        return "▶ Продолжаем!\n\n" + format_question(current_q, q_idx,
+                                                     total, phase)
+    if cmd in _DOC_COMMANDS:
+        return _my_documents_text(session.get("role"), chunks or [])
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
@@ -729,8 +771,8 @@ def _finish_phase(session: dict, phase: str, questions: dict,
         return prefix + (
             f"🏁 Базовый тест завершён! Результат: *{correct_count}/{total}*\n\n"
             "Ожидаем решения HR о допуске к экзамену — придёт уведомление.\n"
-            "А пока можешь задавать вопросы по документам или пройти "
-            "другой курс: *Мои курсы*."
+            "Что дальше: *Мои курсы* · *Документы* · задавай вопросы "
+            "по стандартам."
         )
 
     # Exam phase finished
@@ -791,11 +833,14 @@ def _handle_done(session: dict) -> str:
     exam_answers = get_session_answers(session["id"], "exam")
     basic_score = sum(1 for a in basic_answers if a["is_correct"] == 1)
     exam_score = sum(1 for a in exam_answers if a["is_correct"] == 1)
+    tail = "\nЧто дальше: *Мои курсы* · *Документы*"
+    if _retake_fork_text(session["user_id"]):
+        tail += " · *Пересдать*"
     return (
         f"📊 Твои результаты обучения:\n"
         f"• Базовый тест: {basic_score}/{len(basic_answers)}\n"
         f"• Экзамен: {exam_score}/{len(exam_answers)}\n\n"
-        "Обучение завершено. Для нового курса обратись к HR."
+        "Обучение завершено." + tail
     )
 
 

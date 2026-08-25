@@ -103,13 +103,19 @@ _STATUS_EMOJI = {"admitted": "🎓", "waiting": "⏳", "todo": "⏳",
                  "paused": "⏸"}
 
 
-def courses_menu(items: list, reading: bool = False) -> list | None:
+def courses_menu(items: list, reading: bool = False,
+                 resume_test: bool = False, retake: bool = False) -> list | None:
     """Ответ на «Мои курсы»: items = [(n, name, status)] ТОЛЬКО выбираемых
     курсов (n = номер «Выбрать N» из my_courses — FSM-совместимость).
     ≤6 — BLOCK с названием (≤38…), больше — сетка «Выбрать N» 3×96.
-    Текущий и пройденные курсы кнопками не делаются (нажимать незачем)."""
+    Текущий и пройденные курсы кнопками не делаются (нажимать незачем).
+    resume_test (21.08, тупик паузы) — primary [▶ Продолжить тест] вместо
+    «Готов»; retake — [🔁 Пересдать экзамен] после курсов."""
     rows: list = []
-    if reading:
+    if resume_test:
+        rows += [_btn("▶ Продолжить тест", "Продолжить", display="BLOCK",
+                      role="primary"), dict(_NEWLINE)]
+    elif reading:
         rows += [_btn("✅ Готов к тесту", "Готов", display="BLOCK",
                       role="primary"), dict(_NEWLINE)]
     if len(items) <= 6:
@@ -124,7 +130,10 @@ def courses_menu(items: list, reading: bool = False) -> list | None:
                 rows.append(dict(_NEWLINE))
             rows.append(_btn(f"Выбрать {n}", width=96))
         rows.append(dict(_NEWLINE))
-    if reading:
+    if retake:
+        rows += [_btn("🔁 Пересдать экзамен", "Пересдать", display="BLOCK"),
+                 dict(_NEWLINE)]
+    if reading and not resume_test:
         rows.append(_btn("Роль", width=110, role="service"))
     elif rows and rows[-1].get("TYPE") == "NEWLINE":
         rows.pop()

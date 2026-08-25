@@ -489,6 +489,21 @@ async def _delete_document(row: dict) -> None:
         await _send(str(hr_id), text, HR_BOT_ID)
 
 
+def _canonical_url(url: str | None) -> str | None:
+    """21.08: «ссылки не работают» — DETAIL_URL приходил со старого домена
+    (propertyhunters.pro), портал живёт на домене из BITRIX_WEBHOOK_URL.
+    Подменяем ТОЛЬКО хост, путь не трогаем; кривые входы — как есть."""
+    if not url:
+        return url
+    from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
+    canon = urlsplit(BITRIX_WEBHOOK_URL)
+    target = urlsplit(url)
+    if not canon.netloc or not target.netloc:
+        return url
+    return urlunsplit((canon.scheme or target.scheme, canon.netloc,
+                       target.path, target.query, target.fragment))
+
+
 def _abbr_list_text(cfg: dict) -> str:
     prefixes = cfg.get("prefixes", {})
     if not prefixes:
@@ -822,17 +837,29 @@ async def _handle_employee_message(user_id: str, question: str,
                     is not None)
         keyboard = keyboards.for_session(after, fork, selectable_roles(),
                                          test_options=await _test_options(after))
-        # Ответ на «Мои курсы» → курсы BLOCK-кнопками (дизайн 17.08;
-        # в WAITING_HR переключение тоже разрешено)
-        if (after and after["state"] in ("READING", "WAITING_HR")
-                and question.strip().lower() in _MENU_COMMANDS):
-            _, selectable = await asyncio.to_thread(
-                my_courses, user_id, after.get("role"))
-            if selectable:
-                keyboard = keyboards.courses_menu(
-                    [(c["n"], display_name(c["doc_name"]), c["status"])
-                     for c in selectable],
-                    reading=(after["state"] == "READING"))
+        # Ответ на «Мои курсы» → курсы BLOCK-кнопками (дизайн 17.08).
+        # 21.08: меню работает отовсюду — из тестов (⏸ пауза) и при
+        # session None; из паузы первая кнопка — [▶ Продолжить тест]
+        q_lower = question.strip().lower()
+        in_test = bool(after and after["state"] in ("BASIC_TEST", "EXAM"))
+        is_menu = (q_lower in _MENU_COMMANDS
+                   and (after is None or after["state"] in
+                        ("READING", "WAITING_HR", "BASIC_TEST", "EXAM")))
+        if is_menu or (q_lower in ("выйти", "выход") and in_test):
+            role = (after.get("role") if after
+                    else await asyncio.to_thread(_last_known_role, user_id))
+            _, selectable = await asyncio.to_thread(my_courses, user_id, role)
+            retake = False
+            if after is None:
+                retake = (await asyncio.to_thread(_retake_fork_text, user_id)
+                          is not None)
+            menu_kb = keyboards.courses_menu(
+                [(c["n"], display_name(c["doc_name"]), c["status"])
+                 for c in selectable],
+                reading=bool(after and after["state"] == "READING"),
+                resume_test=in_test, retake=retake)
+            if menu_kb:
+                keyboard = menu_kb
 
     asyncio.create_task(_send(dialog_id, text, bot_id or BOT_ID, client_id,
                               keyboard=keyboard))
@@ -1640,7 +1667,7 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
             r.raise_for_status()
             meta = r.json().get("result", {})
             download_url = meta.get("DOWNLOAD_URL")
-            detail_url = meta.get("DETAIL_URL")
+            detail_url = _canonical_url(meta.get("DETAIL_URL"))
             update_time = str(meta.get("UPDATE_TIME") or "")
             if not download_url:
                 print(f"[process_new_document] No DOWNLOAD_URL for {file_id}")
