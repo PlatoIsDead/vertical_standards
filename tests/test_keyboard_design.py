@@ -51,7 +51,7 @@ SAMPLES = {
 # ЖЕЛЕЗНЫЙ ИНВАРИАНТ: payload'ы — только команды, которые понимает FSM/HR
 ALLOWED_PAYLOADS = [
     r"^(Готов|Мои курсы|Роль|Пересдать|Далее|Начать|Отмена|Сохранить|Заново|\.)$",
-    r"^(Документы|Выйти|Продолжить)$",      # 19.08/21.08: документы, пауза
+    r"^(Документы|Выйти|Продолжить|Помощь)$",   # 19.08–26.08: навигация
     r"^[A-D]$",
     r"^\d{1,2}$",                       # выбор роли
     r"^Выбрать \d+$",
@@ -137,13 +137,16 @@ def test_test_options_block_vs_letters():
     block = _buttons(SAMPLES["test_block"])
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in block][0] == \
         ("A · До заезда гостя", "A")
-    answers = [b for b in block if b["COMMAND_PARAMS"] != "Выйти"]
+    answers = [b for b in block
+               if b["COMMAND_PARAMS"] not in ("Выйти", "Помощь")]
     assert all(b["DISPLAY"] == "BLOCK" for b in answers)
-    assert block[-1]["COMMAND_PARAMS"] == "Выйти"          # 19.08: пауза теста
+    assert [b["COMMAND_PARAMS"] for b in block[-2:]] == \
+        ["Выйти", "Помощь"]                    # 19.08/26.08: пауза + помощь
     # длинный вариант → буквы
     long = kb.for_session({"state": "EXAM"},
                           test_options=["х" * 30, "а", "б", "в"])
-    letters = [b for b in _buttons(long) if b["COMMAND_PARAMS"] != "Выйти"]
+    letters = [b for b in _buttons(long)
+               if b["COMMAND_PARAMS"] not in ("Выйти", "Помощь")]
     assert [b["COMMAND_PARAMS"] for b in letters] == ["A", "B", "C", "D"]
     assert all(b["DISPLAY"] == "LINE" and b["WIDTH"] == 70 for b in letters)
 
@@ -155,11 +158,12 @@ def test_courses_menu_layouts():
         ("⏳ 1 · Курс о конфиденциальности", "Выбрать 1")
     assert small[3]["TEXT"].startswith("🎓 3 · ")          # допущен
     assert small[-1]["COMMAND_PARAMS"] == "Роль"           # ряд состояния
-    grid = _buttons(SAMPLES["menu_grid"])
+    grid = [b for b in _buttons(SAMPLES["menu_grid"])
+            if b["COMMAND_PARAMS"].startswith("Выбрать")]
     assert [b["COMMAND_PARAMS"] for b in grid] == \
         [f"Выбрать {i}" for i in range(1, 8)]
     assert all(b["WIDTH"] == 96 for b in grid)
-    assert [len(r) for r in _rows(SAMPLES["menu_grid"])] == [3, 3, 1]
+    assert [len(r) for r in _rows(SAMPLES["menu_grid"])] == [3, 3, 1, 2]
     # обрезка 38
     long = _buttons(kb.courses_menu([(1, "х" * 60, "todo")]))[0]
     assert long["TEXT"].endswith("…") and len(long["TEXT"]) <= 38 + 8

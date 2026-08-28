@@ -72,11 +72,11 @@ def test_courses_menu():
     menu = _btns(kb.courses_menu([(1, "Курс А", "todo"),
                                   (2, "Курс Б", "admitted")], reading=True))
     assert [b["COMMAND_PARAMS"] for b in menu] == \
-        ["Готов", "Выбрать 1", "Выбрать 2", "Роль"]
+        ["Готов", "Выбрать 1", "Выбрать 2", "Документы", "Помощь", "Роль"]
     assert menu[2]["TEXT"] == "🎓 2 · Курс Б"
     grid = _btns(kb.courses_menu([(i, f"К{i}", "todo") for i in range(1, 8)]))
     assert [b["COMMAND_PARAMS"] for b in grid] == \
-        [f"Выбрать {i}" for i in range(1, 8)]
+        [f"Выбрать {i}" for i in range(1, 8)] + ["Документы", "Помощь"]
 
 
 # ── HR-ветки за флагом ───────────────────────────────────────────────────────
@@ -428,7 +428,7 @@ def test_reminders_carry_state_keyboard(send_trap, monkeypatch):
     asyncio.run(bot._maybe_send_reminders(datetime(2026, 8, 17, 12, 0)))
     texts = [b["TEXT"] for b in send_trap[0]["keyboard"] if "TEXT" in b]
     assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "📄 Документы",
-                     "Роль"]
+                     "Роль", "❓ Помощь"]
 
 
 def test_notify_hr_about_user_invite_button(send_trap, monkeypatch):
@@ -494,7 +494,7 @@ def test_my_courses_switch_buttons(send_trap, monkeypatch):
     _run_employee("Мои курсы")
     btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
     assert [b["COMMAND_PARAMS"] for b in btns] == \
-        ["Готов", "Выбрать 1", "Выбрать 2", "Роль"]
+        ["Готов", "Выбрать 1", "Выбрать 2", "Документы", "Помощь", "Роль"]
     assert btns[2]["TEXT"] == "🎓 2 · Б"                   # допущенный курс
 
     # обычный вопрос в READING → чистый ряд без «Выбрать»
@@ -502,7 +502,7 @@ def test_my_courses_switch_buttons(send_trap, monkeypatch):
     _run_employee("что такое чек-ин?")
     texts = [b["TEXT"] for b in send_trap[0]["keyboard"] if "TEXT" in b]
     assert texts == ["✅ Готов к тесту", "📚 Мои курсы", "📄 Документы",
-                     "Роль"]
+                     "Роль", "❓ Помощь"]
 
 
 # ── 21.08: фиксы встречи ─────────────────────────────────────────────────────
@@ -535,7 +535,7 @@ def test_exit_from_test_gets_menu_keyboard(send_trap, monkeypatch):
     btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
     assert btns[0]["COMMAND_PARAMS"] == "Продолжить"
     assert [b["COMMAND_PARAMS"] for b in btns] == \
-        ["Продолжить", "Выбрать 1"]
+        ["Продолжить", "Выбрать 1", "Документы", "Помощь"]
 
 
 def test_menu_at_session_none_gets_retake_keyboard(send_trap, monkeypatch):
@@ -552,4 +552,4 @@ def test_menu_at_session_none_gets_retake_keyboard(send_trap, monkeypatch):
     _run_employee("Мои курсы")
     btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
     assert [b["COMMAND_PARAMS"] for b in btns] == \
-        ["Выбрать 1", "Пересдать"]
+        ["Выбрать 1", "Пересдать", "Документы", "Помощь"]

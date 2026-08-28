@@ -492,16 +492,19 @@ async def _delete_document(row: dict) -> None:
 def _canonical_url(url: str | None) -> str | None:
     """21.08: «ссылки не работают» — DETAIL_URL приходил со старого домена
     (propertyhunters.pro), портал живёт на домене из BITRIX_WEBHOOK_URL.
-    Подменяем ТОЛЬКО хост, путь не трогаем; кривые входы — как есть."""
+    Подменяем ТОЛЬКО хост; кривые входы — как есть. 26.08: путь ещё и
+    percent-кодируем — пробел в имени файла («ALL КОНФ….docx») обрезал
+    автолинк Bitrix на первом пробеле, клик вёл на Ленту."""
     if not url:
         return url
-    from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
+    from urllib.parse import quote, unquote, urlsplit, urlunsplit  # noqa: PLC0415
     canon = urlsplit(BITRIX_WEBHOOK_URL)
     target = urlsplit(url)
     if not canon.netloc or not target.netloc:
         return url
+    path = quote(unquote(target.path), safe="/")   # идемпотентно
     return urlunsplit((canon.scheme or target.scheme, canon.netloc,
-                       target.path, target.query, target.fragment))
+                       path, target.query, target.fragment))
 
 
 def _abbr_list_text(cfg: dict) -> str:

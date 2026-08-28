@@ -436,14 +436,16 @@ def _handle_role_select(session: dict, message: str) -> str:
 def _start_reading(session: dict, course: dict) -> str:
     questions = get_course_questions(course["id"])
     summary = questions.get("course_summary", "")
-    detail_url = course.get("doc_detail_url") or "(ссылка не найдена — спросите HR)"
+    detail_url = course.get("doc_detail_url")
+    doc_link = (f"[URL={detail_url}]{display_name(course['doc_name'])}[/URL]"
+                if detail_url else "(ссылка не найдена — спросите HR)")
 
     lines = [f"👋 Добро пожаловать! Начинаем обучение: "
              f"*{display_name(course['doc_name'])}*", ""]
     if summary:
         lines += [summary, ""]
     lines += [
-        f"📄 Ссылка на документ: {detail_url}",
+        f"📄 Документ: {doc_link}",
         "",
         "Прочитай документ и напиши *Готов*, когда будешь готов к тесту.",
         "Если есть вопросы по материалу — задавай, отвечу на основе стандартов.",
@@ -660,10 +662,10 @@ def _rag_reply(session: dict, message: str, chunks: list, embeddings) -> str:
     if relevant:
         doc = relevant[0].get("doc_name")
         if doc:
-            text += f"\n\n📄 Источник: {display_name(doc)}"
             url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
-            if url:
-                text += f"\n{url}"
+            name = display_name(doc)
+            text += ("\n\n📄 Источник: " +
+                     (f"[URL={url}]{name}[/URL]" if url else name))
     return text
 
 
@@ -695,10 +697,9 @@ def _my_documents_text(role_id: str | None, chunks: list) -> str:
     def _section(docs: list[str]) -> list[str]:
         out = []
         for doc in docs:
-            out.append(f"• {display_name(doc)}")
             url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
-            if url:
-                out.append(f"  {url}")
+            name = display_name(doc)
+            out.append("• " + (f"[URL={url}]{name}[/URL]" if url else name))
         return out
 
     lines = ["📄 Твои документы:"]

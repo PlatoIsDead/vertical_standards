@@ -57,7 +57,12 @@ def for_session(session: dict | None, fork: bool = False,
             return [_btn("🔁 Пересдать экзамен", "Пересдать",
                          display="BLOCK", role="primary"),
                     dict(_NEWLINE),
-                    _btn("Далее, к следующему", "Далее", width=180)]
+                    _btn("Далее, к следующему", "Далее", width=180),
+                    dict(_NEWLINE),
+                    _btn("📚 Мои курсы", "Мои курсы", width=150),
+                    _btn("📄 Документы", "Документы", width=130),
+                    dict(_NEWLINE),
+                    _btn("❓ Помощь", "Помощь", width=130, role="service")]
         return None
     state = session["state"]
     if state == "ROLE_SELECT":
@@ -80,12 +85,14 @@ def for_session(session: dict | None, fork: bool = False,
                 _btn("📚 Мои курсы", "Мои курсы", width=150),
                 _btn("📄 Документы", "Документы", width=130),
                 dict(_NEWLINE),
-                _btn("Роль", width=110, role="service")]
+                _btn("Роль", width=110, role="service"),
+                _btn("❓ Помощь", "Помощь", width=130, role="service")]
     if state in ("BASIC_TEST", "EXAM"):
         # Короткие варианты (все ≤24) — BLOCK с текстом: нажатие не требует
         # сверки с сообщением; payload — буква (parse_answer)
         pause = [dict(_NEWLINE),
-                 _btn("⏸ Отложить тест", "Выйти", width=170, role="service")]
+                 _btn("⏸ Отложить тест", "Выйти", width=160, role="service"),
+                 _btn("❓ Помощь", "Помощь", width=130, role="service")]
         if (test_options and len(test_options) == 4
                 and all(len(b) <= 24 for b in test_options)):
             return [_btn(f"{letter} · {body}", letter, display="BLOCK")
@@ -95,7 +102,8 @@ def for_session(session: dict | None, fork: bool = False,
         # Действовать нечему — primary здесь быть не должно (спека)
         return [_btn("📚 Мои курсы", "Мои курсы", display="BLOCK"),
                 dict(_NEWLINE),
-                _btn("📄 Документы", "Документы", width=130)]
+                _btn("📄 Документы", "Документы", width=130),
+                _btn("❓ Помощь", "Помощь", width=130, role="service")]
     return None
 
 
@@ -133,10 +141,13 @@ def courses_menu(items: list, reading: bool = False,
     if retake:
         rows += [_btn("🔁 Пересдать экзамен", "Пересдать", display="BLOCK"),
                  dict(_NEWLINE)]
+    if rows and rows[-1].get("TYPE") != "NEWLINE":
+        rows.append(dict(_NEWLINE))
+    # 26.08 («все команды — кнопками»): сервисный ряд всегда виден
+    rows += [_btn("📄 Документы", "Документы", width=130, role="service"),
+             _btn("❓ Помощь", "Помощь", width=130, role="service")]
     if reading and not resume_test:
-        rows.append(_btn("Роль", width=110, role="service"))
-    elif rows and rows[-1].get("TYPE") == "NEWLINE":
-        rows.pop()
+        rows += [dict(_NEWLINE), _btn("Роль", width=110, role="service")]
     return rows or None
 
 

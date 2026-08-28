@@ -34,7 +34,7 @@ def test_rag_source_line(monkeypatch):
     monkeypatch.setattr(sm, "get_course_by_doc_name",
                         lambda d: {"doc_detail_url": "https://x/doc"})
     out = sm._rag_reply({"role": None}, "вопрос", [], None)
-    assert "📄 Источник: Пожар" in out
+    assert "📄 Источник: " in out and "]Пожар[/URL]" in out
     assert "https://x/doc" in out
 
 
