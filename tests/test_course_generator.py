@@ -97,7 +97,7 @@ def test_fails_after_two_bad_attempts(monkeypatch):
 
 
 def test_wrong_fact_count_retries(monkeypatch):
-    bad_facts = dict(FACTS, facts_basic=["один факт"])           # 1 вместо 5
+    bad_facts = dict(FACTS, facts_basic=[])       # 0 — вне диапазона 1–5
     calls = _fake_openai(monkeypatch, [json.dumps(bad_facts), json.dumps(FACTS),
                                        json.dumps(QUESTIONS),
                                        json.dumps(VERDICTS_OK)])

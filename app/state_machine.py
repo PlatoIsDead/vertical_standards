@@ -86,6 +86,8 @@ _STATE_HINTS = {
     "EXAM": "Что дальше: ответь буквой A–D · *Выйти* — пауза теста",
     "WAITING_HR": ("Что дальше: жди допуска HR · *Мои курсы* · *Документы* · "
                    "задавай вопросы по стандартам"),
+    "EXAM_READY": ("Что дальше: *Начать* — начать экзамен · *Мои курсы* · "
+                   "*Документы* · задавай вопросы по стандартам"),
     None: "Что дальше: *Мои курсы* · *Документы* · *Помощь*",
 }
 
@@ -187,6 +189,8 @@ def _dispatch(user_id: str, message: str, dialog_id: str,
         return _handle_test(session, message, "basic", chunks)
     elif state == "WAITING_HR":
         return _handle_waiting_hr(session, message, chunks, embeddings)
+    elif state == "EXAM_READY":
+        return _handle_exam_ready(session, message, chunks, embeddings)
     elif state == "EXAM":
         return _handle_test(session, message, "exam", chunks)
     elif state == "DONE":
@@ -229,6 +233,12 @@ def start_onboarding(user_id: str, dialog_id: str) -> str | None:
 
 def _exam_pass_threshold(questions: dict) -> int:
     return round(len(questions.get("exam_questions", [])) * 0.7)
+
+
+def _basic_pass_threshold(questions: dict) -> int:
+    """31.08 (решение юзера): базовый сдан при 60% верных — «3 из 5»;
+    масштабируется с адаптивным числом вопросов."""
+    return max(1, round(len(questions.get("basic_questions", [])) * 0.6))
 
 
 def _retake_fork_text(user_id: str) -> str | None:
@@ -493,6 +503,9 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
         if c["id"] == current_id:
             if session and session["state"] == "WAITING_HR":
                 lines.append(f"▶️ {name} — базовый сдан, ждёт допуска HR")
+            elif session and session["state"] == "EXAM_READY":
+                lines.append(f"▶️ {name} — допущен к экзамену, "
+                             "напиши *Начать*")
             elif session and session["state"] == "BASIC_TEST":
                 lines.append(f"▶️ {name} — базовый тест на вопросе "
                              f"{session['current_q_idx'] + 1}")
@@ -521,7 +534,7 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
             c["n"] = n
             if state == "BASIC_TEST" or (state == "EXAM" and q_idx > 0):
                 c["status"] = "paused"       # 19.08: тест на паузе
-            elif state == "EXAM":
+            elif state in ("EXAM", "EXAM_READY"):
                 c["status"] = "admitted"
             elif state == "WAITING_HR":
                 c["status"] = "waiting"
@@ -534,7 +547,7 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
                              f"{q_idx + 1}")
             elif state == "EXAM" and q_idx > 0:
                 lines.append(f"{n}. ⏸ {name} — экзамен на вопросе {q_idx + 1}")
-            elif state == "EXAM":
+            elif state in ("EXAM", "EXAM_READY"):
                 lines.append(f"{n}. 🎓 {name} — допущен к экзамену")
             else:
                 lines.append(f"{n}. ⏳ {name}")
@@ -580,6 +593,12 @@ def _handle_course_switch(session: dict, n: int) -> str:
                 return (f"🎓 Экзамен по курсу *{name}* — поехали!\n\n"
                         + format_question(q_list[idx], idx, len(q_list), "exam"))
             return f"🎓 Курс *{name}*: вопросы экзамена не найдены. Обратись к HR."
+        if existing["state"] == "EXAM_READY":
+            questions = get_course_questions(course["id"])
+            n_exam = len(questions.get("exam_questions", []))
+            return (f"🎓 Курс *{name}*: базовый сдан, ты допущен к экзамену "
+                    f"({n_exam} вопросов). Нажми кнопку или напиши *Начать*, "
+                    "когда будешь готов.")
         if existing["state"] == "WAITING_HR":
             return (f"⏳ Курс *{name}*: базовый тест сдан, ждём допуска HR "
                     "к экзамену. Пока можешь задавать вопросы по документам "
@@ -598,7 +617,7 @@ def _handle_course_switch(session: dict, n: int) -> str:
 
     # Строки с ответами/прогрессом (ожидание, паузы тестов) НЕ репоинтим —
     # паркуем и создаём новую (19.08: из теста тоже можно уйти)
-    if session["state"] in ("WAITING_HR", "BASIC_TEST", "EXAM"):
+    if session["state"] in ("WAITING_HR", "EXAM_READY", "BASIC_TEST", "EXAM"):
         new = create_session(user_id, session["dialog_id"], course["id"])
         if session.get("role"):
             update_session(new["id"], role=session["role"])
@@ -636,14 +655,19 @@ def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> st
 
     if "готов" in message.lower():
         questions = get_course_questions(session["course_id"])
-        if not questions.get("basic_questions"):
+        basic_q = questions.get("basic_questions", [])
+        if not basic_q:
             return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
 
-        update_session(session["id"], state="BASIC_TEST", q_idx=0)
+        # 31.08: пересдача базового после провала — прошлые ответы фазы стереть
+        # (иначе _finish_phase сосчитает обе попытки — ловушка _handle_retake)
+        delete_session_answers(session["id"], "basic")
+        update_session(session["id"], state="BASIC_TEST", q_idx=0,
+                       score_basic=0)
 
-        first_q = questions["basic_questions"][0]
-        return "✅ Отлично! Начинаем базовый тест — 5 вопросов.\n\n" + \
-               format_question(first_q, 0, 5, "basic")
+        return (f"✅ Отлично! Начинаем базовый тест — "
+                f"{len(basic_q)} вопрос(ов).\n\n"
+                + format_question(basic_q[0], 0, len(basic_q), "basic"))
 
     return _rag_reply(session, message, chunks, embeddings)
 
@@ -804,31 +828,47 @@ def _finish_phase(session: dict, phase: str, questions: dict,
     prefix = (last_feedback + "\n\n") if last_feedback else ""
 
     if phase == "basic":
+        # 31.08 (решение юзера): допуск к экзамену АВТОМАТИЧЕСКИЙ по порогу
+        # 60% («3 из 5»), HR получает FYI; провал = пересдача базового.
         total = len(questions.get("basic_questions", []))
-        update_session(session["id"], state="WAITING_HR", q_idx=0,
+        threshold = _basic_pass_threshold(questions)
+        label = _employee_label(session["user_id"])
+        if correct_count < threshold:
+            # Сброс ответов фазы: _finish_phase считает ВСЕ строки фазы
+            # (ловушка _handle_retake) — без чистки попытки схлопнутся
+            update_session(session["id"], state="READING", q_idx=0,
+                           score_basic=0)
+            delete_session_answers(session["id"], "basic")
+            notify_hr(f"📋 Сотрудник {label} не сдал базовый тест "
+                      f"({correct_count}/{total}, нужно {threshold}) — "
+                      "перечитывает документ и пересдаёт.")
+            return prefix + (
+                f"❌ Базовый тест не сдан: *{correct_count}/{total}* "
+                f"(нужно {threshold}).\n\n"
+                "Перечитай документ и напиши *Готов* — попробуем ещё раз."
+            )
+        exam_q = questions.get("exam_questions", [])
+        if not exam_q:
+            update_session(session["id"], state="DONE", q_idx=0,
+                           score_basic=correct_count)
+            notify_hr(f"📋 Сотрудник {label} сдал базовый тест "
+                      f"({correct_count}/{total}); экзамена у курса нет — "
+                      "обучение завершено.")
+            return prefix + (
+                f"🏁 Базовый тест сдан: *{correct_count}/{total}*!\n"
+                "Экзаменационных вопросов у этого курса нет — "
+                "обучение завершено. 🎉"
+            )
+        update_session(session["id"], state="EXAM_READY", q_idx=0,
                        score_basic=correct_count)
-        # Флаг кнопок читаем env-ом в момент вызова: state_machine не может
-        # импортировать bitrix_bot.BUTTONS_ENABLED (циклический импорт).
-        admit_kb = None
-        if os.getenv("BUTTONS_ENABLED", "0") == "1":
-            emp = get_employee(session["user_id"])
-            admit_kb = keyboards.hr_admit(
-                session["user_id"], (emp or {}).get("full_name"))
-        notify_hr(
-            f"📋 Сотрудник {_employee_label(session['user_id'])} "
-            f"завершил базовый тест.\n"
-            f"Результат: {correct_count}/{total}\n\n"
-            f"Чтобы допустить к экзамену, напиши:\n"
-            f"Допустить {session['user_id']}",
-            # kwarg только при реальной клавиатуре — двойники notify_hr в
-            # тестах без параметра keyboard остаются валидными
-            **({"keyboard": admit_kb} if admit_kb else {}),
-        )
+        notify_hr(f"📋 Сотрудник {label} сдал базовый тест "
+                  f"({correct_count}/{total}) — допущен к экзамену "
+                  "автоматически.")
         return prefix + (
-            f"🏁 Базовый тест завершён! Результат: *{correct_count}/{total}*\n\n"
-            "Ожидаем решения HR о допуске к экзамену — придёт уведомление.\n"
-            "Что дальше: *Мои курсы* · *Документы* · задавай вопросы "
-            "по стандартам."
+            f"🏁 Базовый тест сдан: *{correct_count}/{total}*!\n\n"
+            f"🎓 Ты допущен к экзамену: {len(exam_q)} вопросов, "
+            f"проходной балл {_exam_pass_threshold(questions)}.\n"
+            "Нажми кнопку или напиши *Начать*, когда будешь готов."
         )
 
     # Exam phase finished
@@ -881,6 +921,32 @@ def _handle_waiting_hr(session: dict, message: str,
         return ("⏳ Экзамен по этому курсу откроется после допуска HR — "
                 "придёт уведомление.\nПока можешь задавать вопросы по "
                 "документам или пройти другой курс: *Мои курсы*.")
+    return _rag_reply(session, message, chunks, embeddings)
+
+
+def _handle_exam_ready(session: dict, message: str,
+                       chunks: list, embeddings) -> str:
+    """Допущен к экзамену (31.08): экзамен стартует ТОЛЬКО явной командой —
+    до этого свободны RAG, меню, документы и другие курсы."""
+    cmd = message.strip().lower()
+    if cmd in _MENU_COMMANDS:
+        return _my_courses_text(session["user_id"], session.get("role"))
+    if cmd in _DOC_COMMANDS:
+        return _my_documents_text(session.get("role"), chunks)
+    m_switch = _SWITCH_RE.match(cmd)
+    if m_switch:
+        return _handle_course_switch(session, int(m_switch.group(1)))
+    if cmd in ("пересдать", "пересдача"):
+        return ("Пересдать прошлый экзамен можно будет после завершения "
+                "текущего курса.")
+    if cmd in ("начать", "готов", "экзамен"):
+        questions = get_course_questions(session["course_id"])
+        q_list = questions.get("exam_questions", [])
+        if not q_list:
+            return "Ошибка: вопросы экзамена не найдены. Обратись к HR."
+        update_session(session["id"], state="EXAM", q_idx=0)
+        return ("🎓 Экзамен — поехали!\n\n"
+                + format_question(q_list[0], 0, len(q_list), "exam"))
     return _rag_reply(session, message, chunks, embeddings)
 
 

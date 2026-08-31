@@ -66,6 +66,7 @@ from app.hr_tools import (
     build_report_text,
     correct_option,
     format_question_card,
+    phase_lens,
     parse_replacement,
     question_by_ref,
 )
@@ -552,7 +553,9 @@ def _wizard_step_text(pending: dict) -> str:
         return (f"Шаг 6/6: правильный ответ.\nСейчас: {d['correct']}\n\n"
                 "Пришли букву A–D или точку (.) — оставить.")
     # confirm
-    preview = format_question_card(pending["doc_name"], d, pending["q_num"])
+    preview = format_question_card(pending["doc_name"], d, pending["q_num"],
+                                   pending.get("basic_len", 5),
+                                   pending.get("exam_len", 10))
     return ("Проверь вопрос:\n\n" + preview
             + "\n\n💾 Сохранить — записать · 🔄 Заново — с первого шага · "
               "Отмена — выйти без изменений.")
@@ -582,10 +585,12 @@ async def _wizard_input(user_id: str, pending: dict,
             )
             course_id, q_num = pending["course_id"], pending["q_num"]
             saved = question_by_ref(questions, q_num)
+            b, e = phase_lens(questions)
             _pending_edits.pop(user_id, None)
             return (f"✅ Вопрос {q_num} сохранён.\n\n"
-                    + format_question_card(pending["doc_name"], saved, q_num),
-                    keyboards.hr_question_card(course_id, q_num))
+                    + format_question_card(pending["doc_name"], saved, q_num,
+                                           b, e),
+                    keyboards.hr_question_card(course_id, q_num, b + e))
         if low == "заново":
             pending["step"] = "text"
             return _wizard_step_text(pending), keyboards.hr_wizard_step()
@@ -865,7 +870,8 @@ async def _handle_employee_message(user_id: str, question: str,
         in_test = bool(after and after["state"] in ("BASIC_TEST", "EXAM"))
         is_menu = (q_lower in _MENU_COMMANDS
                    and (after is None or after["state"] in
-                        ("READING", "WAITING_HR", "BASIC_TEST", "EXAM")))
+                        ("READING", "WAITING_HR", "EXAM_READY",
+                         "BASIC_TEST", "EXAM")))
         if is_menu or (q_lower in ("выйти", "выход") and in_test):
             role = (after.get("role") if after
                     else await asyncio.to_thread(_last_known_role, user_id))
@@ -1215,8 +1221,8 @@ async def _handle_hr_message(user_id: str, question: str,
                 cname = (display_name(course["doc_name"]) if course
                          else f"курс №{waiting['course_id']}")
                 if in_place:
-                    msg = ("🎓 HR допустил тебя к экзамену! "
-                           "Напиши что-нибудь, чтобы начать.")
+                    msg = ("🎓 HR допустил тебя к экзамену! Нажми кнопку "
+                           "или напиши *Начать*, когда будешь готов.")
                     kbd = (keyboards.start_button("🎓 Начать экзамен")
                            if BUTTONS_ENABLED else None)
                 else:
@@ -1230,9 +1236,10 @@ async def _handle_hr_message(user_id: str, question: str,
                                 **_kb_kwargs(kbd))
                 text = f"✅ Сотрудник {target_uid} допущен к экзамену ({cname})."
             else:
-                # Легаси-форс: строки WAITING_HR нет — активную сессию в EXAM
+                # Легаси-форс: строки WAITING_HR нет — активную в EXAM_READY
+                # (31.08: старт экзамена — только кнопкой)
                 found = await asyncio.to_thread(update_session_by_user,
-                                                target_uid, "EXAM", 0)
+                                                target_uid, "EXAM_READY", 0)
                 if found:
                     emp_dialog = await asyncio.to_thread(get_session_dialog_id,
                                                          target_uid)
@@ -1241,7 +1248,8 @@ async def _handle_hr_message(user_id: str, question: str,
                                     if BUTTONS_ENABLED else None)
                         await _send(
                             emp_dialog,
-                            "🎓 HR допустил тебя к экзамену! Напиши что-нибудь, чтобы начать.",
+                            "🎓 HR допустил тебя к экзамену! Нажми кнопку "
+                            "или напиши *Начать*, когда будешь готов.",
                             BOT_ID, client_id,
                             **_kb_kwargs(start_kb),
                         )
@@ -1266,27 +1274,31 @@ async def _handle_hr_message(user_id: str, question: str,
                 questions = await asyncio.to_thread(get_course_questions, course_id)
                 basic = questions.get("basic_questions", [])
                 exam = questions.get("exam_questions", [])
-                # Сквозная нумерация 1–15: 1–5 базовые, 6–15 экзамен
-                # (та же, что в команде «Изменить»)
+                # Сквозная нумерация 1–B базовые, B+1–B+E экзамен
+                # (та же, что в команде «Изменить»); длины адаптивные (31.08)
+                b, e = len(basic), len(exam)
                 lines = [f"📋 *{course['doc_name']}*\n"]
-                lines.append("*Базовые вопросы (1–5):*")
+                lines.append(f"*Базовые вопросы (1–{b}):*")
                 for i, q in enumerate(basic, 1):
                     lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
-                lines.append("\n*Экзаменационные вопросы (6–15):*")
-                for i, q in enumerate(exam, 6):
+                lines.append(f"\n*Экзаменационные вопросы ({b + 1}–{b + e}):*")
+                for i, q in enumerate(exam, b + 1):
                     lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
                 lines.append(f"\nДля активации: Подтвердить {course_id}")
-                lines.append(f"Изменить вопрос: Изменить {course_id}.{{номер 1–15}}")
+                lines.append(f"Изменить вопрос: Изменить {course_id}"
+                             f".{{номер 1–{b + e}}}")
                 text = "\n".join(lines)
                 kb = keyboards.hr_course_actions(course_id)
             else:
                 questions = await asyncio.to_thread(get_course_questions, course_id)
                 q = question_by_ref(questions, q_num)
+                b, e = phase_lens(questions)
                 if q is None:
-                    text = "❌ Номер вопроса — от 1 до 15."
+                    text = f"❌ Номер вопроса — от 1 до {b + e}."
                 else:
-                    text = format_question_card(course["doc_name"], q, q_num)
-                    kb = keyboards.hr_question_card(course_id, q_num)
+                    text = format_question_card(course["doc_name"], q, q_num,
+                                                b, e)
+                    kb = keyboards.hr_question_card(course_id, q_num, b + e)
 
     elif msg_lower.startswith("изменить"):
         # 17.08: пошаговый визард вместо one-shot; форматы «N q» и «N.q»
@@ -1302,12 +1314,14 @@ async def _handle_hr_message(user_id: str, question: str,
             else:
                 questions = await asyncio.to_thread(get_course_questions, course_id)
                 q = question_by_ref(questions, q_num)
+                b, e = phase_lens(questions)
                 if q is None:
                     text = ("❌ Номер вопроса — от 1 (первый базовый) "
-                            "до 15 (последний экзаменационный).")
+                            f"до {b + e} (последний экзаменационный).")
                 else:
                     _pending_edits[user_id] = {
                         "course_id": course_id, "q_num": q_num,
+                        "basic_len": b, "exam_len": e,
                         "doc_name": course["doc_name"], "step": "text",
                         "draft": {"text": q["text"],
                                   "options": list(q["options"]),
@@ -1327,10 +1341,14 @@ async def _handle_hr_message(user_id: str, question: str,
             course_id = int(m.group(1))
             q_num = int(m.group(2)) if m.group(2) else None
             course = await asyncio.to_thread(get_course_by_id, course_id)
+            q_total = 0
+            if course:
+                _qs = await asyncio.to_thread(get_course_questions, course_id)
+                q_total = sum(phase_lens(_qs))
             if not course:
                 text = f"❌ Курс №{course_id} не найден."
-            elif q_num is not None and not (1 <= q_num <= 15):
-                text = "❌ Номер вопроса — от 1 до 15."
+            elif q_num is not None and not (1 <= q_num <= q_total):
+                text = f"❌ Номер вопроса — от 1 до {q_total}."
             else:
                 doc_chunks = [c for c in chunks
                               if c.get("doc_name") == course["doc_name"]]
@@ -1341,7 +1359,8 @@ async def _handle_hr_message(user_id: str, question: str,
                     # LLM долго — вебхук не ждёт (паттерн _build_and_send_report)
                     asyncio.create_task(_regenerate_and_notify(
                         dialog_id, client_id, course, q_num, doc_chunks))
-                    what = (f"вопрос {q_num}" if q_num else "все 15 вопросов")
+                    what = (f"вопрос {q_num}" if q_num
+                            else f"все {q_total} вопросов")
                     text = (f"⏳ Генерирую заново {what} курса "
                             f"«{course['doc_name']}» — пришлю результат…")
 
@@ -1541,10 +1560,12 @@ async def _regenerate_and_notify(dialog_id: str, client_id: str, course: dict,
                 update_course_questions, course["id"],
                 json.dumps(new_questions, ensure_ascii=False))
             first = question_by_ref(new_questions, 1)
-            text = (f"✅ Курс «{course['doc_name']}»: 15 вопросов пересозданы "
-                    "(прежние, включая ручные правки, затёрты).\n\n"
-                    + format_question_card(course["doc_name"], first, 1))
-            kb = keyboards.hr_question_card(course["id"], 1)
+            b, e = phase_lens(new_questions)
+            text = (f"✅ Курс «{course['doc_name']}»: {b + e} вопросов "
+                    "пересозданы (прежние, включая ручные правки, "
+                    "затёрты).\n\n"
+                    + format_question_card(course["doc_name"], first, 1, b, e))
+            kb = keyboards.hr_question_card(course["id"], 1, b + e)
         else:
             questions = await asyncio.to_thread(get_course_questions,
                                                 course["id"])
@@ -1565,10 +1586,12 @@ async def _regenerate_and_notify(dialog_id: str, client_id: str, course: dict,
             await asyncio.to_thread(
                 update_course_questions, course["id"],
                 json.dumps(questions, ensure_ascii=False))
+            b, e = phase_lens(questions)
             text = (f"✅ Вопрос {q_num} курса «{course['doc_name']}» "
                     "пересоздан.\n\n"
-                    + format_question_card(course["doc_name"], new_q, q_num))
-            kb = keyboards.hr_question_card(course["id"], q_num)
+                    + format_question_card(course["doc_name"], new_q, q_num,
+                                           b, e))
+            kb = keyboards.hr_question_card(course["id"], q_num, b + e)
         await _send(dialog_id, text, HR_BOT_ID, client_id,
                     **_kb_kwargs(kb if BUTTONS_ENABLED else None))
     except Exception as exc:

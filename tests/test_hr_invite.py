@@ -190,7 +190,8 @@ def test_allow_by_email(env):
     db.create_session("600", "u600", course_id)  # READING
 
     _post_hr(client, "Допустить petr@x.ru")
-    assert _wait_for(lambda: db.get_session("600")["state"] == "EXAM")
+    # 31.08: допуск ведёт в EXAM_READY — экзамен стартует кнопкой «Начать»
+    assert _wait_for(lambda: db.get_session("600")["state"] == "EXAM_READY")
 
     assert _wait_for(lambda: any(m[0] == "d9" for m in sent))
     assert "допущен к экзамену" in next(m for m in sent if m[0] == "d9")[1]

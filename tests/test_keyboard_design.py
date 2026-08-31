@@ -21,6 +21,7 @@ SAMPLES = {
         test_options=["До заезда гостя", "В день заезда",
                       "После выезда", "В любой момент"]),
     "waiting": kb.for_session({"state": "WAITING_HR"}),
+    "exam_ready": kb.for_session({"state": "EXAM_READY"}),
     "menu_small": kb.courses_menu([(1, "Курс о конфиденциальности", "todo"),
                                    (2, "Пожарная безопасность", "waiting"),
                                    (3, "Бронирование", "admitted")],
@@ -44,6 +45,8 @@ SAMPLES = {
     "card_1": kb.hr_question_card(5, 1),
     "card_7": kb.hr_question_card(5, 7),
     "card_15": kb.hr_question_card(5, 15),
+    "card_total6": kb.hr_question_card(7, 6, total=6),
+    "card_mid6": kb.hr_question_card(7, 3, total=6),
     "wiz_step": kb.hr_wizard_step(),
     "wiz_confirm": kb.hr_wizard_confirm(),
     "cancel": kb.hr_cancel_edit(),
@@ -210,6 +213,20 @@ def test_admit_and_invite_trim():
     assert len(invite["TEXT"]) == 34
     assert invite["COMMAND_PARAMS"] == \
         "Пригласить very.long.address@subdomain.becar.ru"
+
+
+def test_exam_ready_and_adaptive_card():
+    ready = _buttons(SAMPLES["exam_ready"])
+    assert (ready[0]["TEXT"], ready[0]["COMMAND_PARAMS"]) == \
+        ("🎓 Начать экзамен", "Начать")
+    assert ready[0]["BG_COLOR"] == "#BEDC3C" and ready[0]["DISPLAY"] == "BLOCK"
+    # 31.08: адаптивное число вопросов — danger на ПОСЛЕДНЕМ (total), не на 15
+    last6 = _buttons(SAMPLES["card_total6"])
+    assert last6[-1]["COMMAND_PARAMS"] == "Подтвердить 7"
+    assert "▶️ Далее" not in [b["TEXT"] for b in last6]
+    mid6 = _buttons(SAMPLES["card_mid6"])
+    assert "▶️ Далее" in [b["TEXT"] for b in mid6]
+    assert not any(b["COMMAND_PARAMS"].startswith("Подтвердить") for b in mid6)
 
 
 def test_resume_and_retake_menu():

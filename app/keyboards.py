@@ -112,6 +112,15 @@ def for_session(session: dict | None, fork: bool = False,
             return [_btn(f"{letter} · {body}", letter, display="BLOCK")
                     for letter, body in zip("ABCD", test_options)] + pause
         return [_btn(x, width=70) for x in ("A", "B", "C", "D")] + pause
+    if state == "EXAM_READY":
+        # 31.08: авто-допуск — экзамен стартует ТОЛЬКО кнопкой/командой
+        return [_btn("🎓 Начать экзамен", "Начать", display="BLOCK",
+                     role="primary"),
+                dict(_NEWLINE),
+                _btn("📚 Мои курсы", "Мои курсы", width=150),
+                _btn("📄 Документы", "Документы", width=130),
+                dict(_NEWLINE),
+                _btn("❓ Помощь", "Помощь", width=130, role="service")]
     if state == "WAITING_HR":
         # Действовать нечему — primary здесь быть не должно (спека)
         return [_btn("📚 Мои курсы", "Мои курсы", display="BLOCK"),
@@ -248,13 +257,14 @@ def hr_course_actions(course_id: int) -> list:
             _hr_btn(f"Подтвердить {course_id}", width=160, role="danger")]
 
 
-def hr_question_card(course_id: int, q_num: int) -> list:
-    """Клавиатура карточки «Вопросы N.q» (сквозная нумерация 1–15)."""
+def hr_question_card(course_id: int, q_num: int, total: int = 15) -> list:
+    """Клавиатура карточки «Вопросы N.q» (сквозная нумерация 1–total;
+    total = фактическое число вопросов курса, 31.08 адаптивная генерация)."""
     rows: list = []
     if q_num > 1:
         rows.append(_hr_btn("⬅️ Назад", f"Вопросы {course_id}.{q_num - 1}",
                             width=96))
-    if q_num < 15:
+    if q_num < total:
         rows.append(_hr_btn("▶️ Далее", f"Вопросы {course_id}.{q_num + 1}",
                             width=96))
     rows += [
@@ -265,7 +275,7 @@ def hr_question_card(course_id: int, q_num: int) -> list:
         _hr_btn("📄 Все вопросы", f"Вопросы {course_id} все", width=160,
                 role="service"),
     ]
-    if q_num == 15:   # необратимое — последним рядом
+    if q_num == total:   # необратимое — последним рядом
         rows += [dict(_NEWLINE),
                  _hr_btn("Подтвердить и запустить", f"Подтвердить {course_id}",
                          display="BLOCK", role="danger")]

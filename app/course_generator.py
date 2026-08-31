@@ -23,17 +23,24 @@ load_dotenv()
 MAX_CONTEXT_CHARS = 120_000  # весь документ; кап — защита от гигантов
 
 FACTS_PROMPT = """Ты методист учебных курсов для сотрудников апарт-отелей «Вертикаль».
-Из фрагментов документа извлеки РОВНО 15 ключевых положений, которые сотрудник обязан знать.
+СНАЧАЛА оцени объём и насыщенность документа и реши, сколько всего вопросов
+для него осмысленно (question_budget): от 3 до 15. Короткая инструкция на
+полстраницы не тянет на 15 вопросов — не выдумывай воду; большой насыщенный
+регламент заслуживает полных 15. Затем извлеки ключевые положения, которые
+сотрудник обязан знать: примерно треть простых и две трети сложных.
 Ответь строго в JSON формате:
 {
+  "question_budget": 12,
   "course_summary": "краткое описание курса (2-3 предложения)",
   "facts_basic": ["...", "..."],
   "facts_exam": ["...", "..."]
 }
 Требования:
-- facts_basic — ровно 5 простых фактов/правил (что, где, кто, сколько).
-- facts_exam — ровно 10 положений посложнее: процессы, алгоритмы, исключения,
-  границы ответственности.
+- facts_basic — простые факты/правила (что, где, кто, сколько): от 1 до 5 штук,
+  примерно треть question_budget.
+- facts_exam — положения посложнее: процессы, алгоритмы, исключения,
+  границы ответственности; от 2 до 10 штук, остальные две трети бюджета.
+- facts_basic + facts_exam = question_budget; сложных не меньше, чем простых.
 - Каждое положение — конкретное проверяемое утверждение ИЗ ТЕКСТА документа и обязано
   содержать хотя бы один конкретный элемент: шаг процедуры, число или порог, срок,
   роль/ответственного либо конкретное действие (кому позвонить, что нажать, что записать).
@@ -57,8 +64,10 @@ QUESTIONS_FROM_FACTS_PROMPT = """Ты составляешь тест для с�
   "exam_questions": [ { "та же структура" } ]
 }
 Требования:
-- basic_questions — по одному вопросу на каждое из 5 положений facts_basic (итого ровно 5).
-- exam_questions — по одному вопросу на каждое из 10 положений facts_exam (итого ровно 10).
+- basic_questions — по одному вопросу на КАЖДОЕ положение facts_basic
+  (ровно столько вопросов, сколько положений передано).
+- exam_questions — по одному вопросу на КАЖДОЕ положение facts_exam
+  (ровно столько вопросов, сколько положений передано).
 - Ровно 4 варианта. ПРАВИЛЬНЫЙ ответ ВСЕГДА клади в вариант A (correct всегда "A") —
   порядок вариантов потом перемешает программа.
 - Вопрос проверяет ЗНАНИЕ РАБОТЫ, а не память о документе. ЗАПРЕЩЕНЫ вопросы, на которые
@@ -166,15 +175,16 @@ def _shuffle_options(q: dict) -> dict:
 
 def generate_questions(doc_name: str, chunks: list[dict]) -> dict:
     """
-    Генерация 5 базовых + 10 экзаменационных вопросов в три этапа.
+    Генерация вопросов в три этапа; ЧИСЛО АДАПТИВНОЕ (31.08): модель сама
+    выбирает бюджет 3–15 по объёму документа, ~⅓ базовых и ~⅔ экзаменационных.
 
-    Этап 1: 15 ключевых положений документа (+course_summary).
+    Этап 1: бюджет + ключевые положения документа (+course_summary).
     Этап 2: вопрос с 4 вариантами на каждое положение; буквы перемешивает код.
     Этап 3: критик бракует полые вопросы → один ремонтный раунд (best-effort).
 
     Returns:
         dict прежней схемы + facts_basic/facts_exam: doc_name, course_summary,
-        basic_questions[5], exam_questions[10], facts_basic[5], facts_exam[10].
+        basic_questions[1–5], exam_questions[2–10], facts_basic, facts_exam.
 
     Raises:
         ValueError: если LLM не вернул валидный JSON после ретраев этапов 1–2
@@ -196,11 +206,15 @@ def generate_questions(doc_name: str, chunks: list[dict]) -> dict:
         {"facts_basic": facts["facts_basic"], "facts_exam": facts["facts_exam"]},
         ensure_ascii=False,
     )
+    n_basic, n_exam = len(facts["facts_basic"]), len(facts["facts_exam"])
+    print(f"[course_generator] адаптивный бюджет: {n_basic} базовых "
+          f"+ {n_exam} экзаменационных")
     result = _llm_json(
         client, QUESTIONS_FROM_FACTS_PROMPT,
         f"Документ: {doc_name}\n\nПоложения:\n{facts_json}\n\n"
         f"Контекст документа (для правдоподобных неверных вариантов):\n{context}",
-        max_tokens=6000, validate=_validate_questions,
+        max_tokens=6000,
+        validate=lambda r: _validate_questions(r, n_basic, n_exam),
     )
     for q in result["basic_questions"] + result["exam_questions"]:
         _shuffle_options(q)
@@ -242,11 +256,12 @@ def _run_critic(client: OpenAI, doc_name: str, context: str,
         return
     print(f"[course_generator] критик забраковал {sorted(bad)} — ремонт")
     existing_texts = [q["text"] for q in all_q]
+    n_basic = len(result["basic_questions"])
     for num, reason in bad.items():
-        if not (1 <= num <= 15):
+        if not (1 <= num <= len(all_q)):
             continue
-        q_list, idx = ((result["basic_questions"], num - 1) if num <= 5
-                       else (result["exam_questions"], num - 6))
+        q_list, idx = ((result["basic_questions"], num - 1) if num <= n_basic
+                       else (result["exam_questions"], num - n_basic - 1))
         try:
             new_q = _regen_one_call(client, doc_name, context,
                                     facts_all[num - 1], existing_texts, reason)
@@ -284,13 +299,16 @@ def regenerate_one(doc_name: str, chunks: list[dict], fact: str | None,
 
 
 def _validate_facts(result: dict) -> None:
-    """Raise ValueError if этап 1 вернул не 5+10 положений."""
+    """Raise ValueError if этап 1 вышел из диапазонов адаптивного бюджета."""
     basic = result.get("facts_basic", [])
     exam = result.get("facts_exam", [])
-    if len(basic) != 5:
-        raise ValueError(f"Expected 5 facts_basic, got {len(basic)}")
-    if len(exam) != 10:
-        raise ValueError(f"Expected 10 facts_exam, got {len(exam)}")
+    if not (1 <= len(basic) <= 5):
+        raise ValueError(f"facts_basic: ожидал 1–5, получил {len(basic)}")
+    if not (2 <= len(exam) <= 10):
+        raise ValueError(f"facts_exam: ожидал 2–10, получил {len(exam)}")
+    if len(exam) < len(basic):
+        raise ValueError(f"сложных положений ({len(exam)}) меньше, "
+                         f"чем простых ({len(basic)})")
     if not all(isinstance(f, str) and f.strip() for f in basic + exam):
         raise ValueError("facts must be non-empty strings")
 
@@ -301,7 +319,7 @@ _OPT_STRIP_RE = re.compile(r"^[A-DА-Д][.)]\s*")
 def validate_question(q: dict) -> None:
     """Raise ValueError if a single question dict is invalid.
 
-    Используется генератором (все 15), правкой HR (№3/визард 17.08) и
+    Используется генератором (все вопросы), правкой HR (№3/визард 17.08) и
     перегенерацией. Тексты ошибок по-русски — их видит HR при сохранении."""
     missing = [k for k in ("text", "options", "correct") if k not in q]
     if missing:
@@ -323,15 +341,16 @@ def validate_question(q: dict) -> None:
                          f"получено {q['correct']!r}")
 
 
-def _validate_questions(result: dict) -> None:
-    """Raise ValueError if the question structure is invalid."""
+def _validate_questions(result: dict, n_basic: int = 5,
+                        n_exam: int = 10) -> None:
+    """Raise ValueError если вопросов не по одному на каждое положение."""
     basic = result.get("basic_questions", [])
     exam = result.get("exam_questions", [])
 
-    if len(basic) != 5:
-        raise ValueError(f"Expected 5 basic_questions, got {len(basic)}")
-    if len(exam) != 10:
-        raise ValueError(f"Expected 10 exam_questions, got {len(exam)}")
+    if len(basic) != n_basic:
+        raise ValueError(f"Expected {n_basic} basic_questions, got {len(basic)}")
+    if len(exam) != n_exam:
+        raise ValueError(f"Expected {n_exam} exam_questions, got {len(exam)}")
 
     for q in basic + exam:
         validate_question(q)

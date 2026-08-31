@@ -308,12 +308,13 @@ def get_open_session_for_course(user_id: str, course_id: int) -> dict | None:
 
 
 def admit_session(session_id: int) -> None:
-    """«Допустить»: WAITING_HR → EXAM БЕЗ touch updated_at — допуск снимает
-    блокировку, но не выдёргивает сотрудника из курса, который он проходит
-    сейчас (активная сессия определяется свежестью updated_at)."""
+    """«Допустить»: WAITING_HR → EXAM_READY БЕЗ touch updated_at — допуск
+    снимает блокировку, но не выдёргивает сотрудника из курса, который он
+    проходит сейчас. 31.08: экзамен стартует только кнопкой «Начать» —
+    состояние EXAM_READY, а не сразу EXAM."""
     with _conn() as conn:
         conn.execute(
-            "UPDATE sessions SET state = 'EXAM', current_q_idx = 0 WHERE id = ?",
+            "UPDATE sessions SET state = 'EXAM_READY', current_q_idx = 0 WHERE id = ?",
             (session_id,),
         )
 

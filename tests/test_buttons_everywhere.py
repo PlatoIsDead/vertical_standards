@@ -162,7 +162,9 @@ def test_hr_questions_card_keyboard(hr_env, monkeypatch):
     assert _wait_for(lambda: captured)
     assert "B. 2 ✅" in captured[0]["text"]
     texts = [b["TEXT"] for b in captured[0]["keyboard"] if "TEXT" in b]
-    assert texts == ["▶️ Далее", "✏️ Изменить", "🔄 Заново", "📄 Все вопросы"]
+    # 31.08: в курсе всего 1 вопрос → «Далее» нет, danger-ряд сразу
+    assert texts == ["✏️ Изменить", "🔄 Заново", "📄 Все вопросы",
+                     "Подтвердить и запустить"]
     # последняя карточка: «Далее» нет, необратимое — последним рядом
     last = [b for b in kb.hr_question_card(5, 15) if "TEXT" in b]
     assert "▶️ Далее" not in [b["TEXT"] for b in last]
@@ -371,19 +373,25 @@ def test_notify_hr_gets_menu_keyboard_when_enabled(monkeypatch):
     assert sent[0]["KEYBOARD"] == kb.with_main_menu(kb.hr_main_menu(), hr=True)
 
 
-def test_finish_basic_admit_button_env_gated(monkeypatch):
-    monkeypatch.setattr(sm, "get_session_answers", lambda sid, phase: [])
+def test_finish_basic_notify_fyi_no_admit_button(monkeypatch):
+    """31.08: авто-допуск — HR получает FYI без кнопки «Допустить»."""
+    monkeypatch.setattr(sm, "get_session_answers",
+                        lambda sid, phase: [{"is_correct": 1}])
     monkeypatch.setattr(sm, "update_session", lambda *a, **kw: None)
     monkeypatch.setattr(sm, "_employee_label", lambda uid: "X")
     captured = {}
     monkeypatch.setattr(
         sm, "notify_hr",
-        lambda msg, keyboard=None: captured.update(kb=keyboard))
+        lambda msg, keyboard=None: captured.update(msg=msg, kb=keyboard))
     session = {"id": 1, "user_id": "500"}
 
     monkeypatch.setenv("BUTTONS_ENABLED", "1")
-    sm._finish_phase(session, "basic", {"basic_questions": []})
-    assert captured["kb"] == kb.hr_admit("500")
+    questions = {"basic_questions": [{"text": "Б?"}],
+                 "exam_questions": [{"text": "Э?"}]}
+    reply = sm._finish_phase(session, "basic", questions)
+    assert captured["kb"] is None
+    assert "допущен к экзамену автоматически" in captured["msg"]
+    assert "Начать" in reply and "Э?" not in reply         # без автостарта
 
     monkeypatch.setenv("BUTTONS_ENABLED", "0")
     sm._finish_phase(session, "basic", {"basic_questions": []})

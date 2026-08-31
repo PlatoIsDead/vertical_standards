@@ -245,20 +245,60 @@ def test_finish_phase_notify_has_name(env, monkeypatch):
     sm.process_message("u1", "Готов", "d1", [], None)      # BASIC_TEST, 1 вопрос
     sm.process_message("u1", "A", "d1", [], None)          # финиш базового
     assert notes and "Иван Иванов, Администратор (ID: u1)" in notes[0]
-    assert "Допустить u1" in notes[0]                      # команда — по ID
+    # 31.08: авто-допуск — FYI вместо «Допустить»; экзамена в фикстуре нет
+    assert "сдал базовый тест (1/1)" in notes[0]
+    assert "Допустить" not in notes[0]
 
 
-def test_waiting_hr_menu(env, monkeypatch):
+def test_exam_ready_menu(env, monkeypatch):
+    """31.08: допуск автоматический; EXAM_READY не блокирует — меню и RAG
+    свободны, экзамен стартует только командой «Начать»."""
     monkeypatch.setattr(sm, "notify_hr", lambda text: None)
+    course = db.get_course_by_doc_name("Стандарты.docx")
+    db.update_course_questions(course["id"],
+                               json.dumps(_EXAM2, ensure_ascii=False))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
     sm.process_message("u1", "Готов", "d1", [], None)
-    sm.process_message("u1", "A", "d1", [], None)          # → WAITING_HR
+    reply = sm.process_message("u1", "A", "d1", [], None)  # базовый 1/1 сдан
+    assert "допущен к экзамену" in reply
+    assert db.get_session("u1")["state"] == "EXAM_READY"
     reply = sm.process_message("u1", "Мои курсы", "d1", [], None)
     assert "📚 Твои курсы" in reply
-    # 17.08: ожидание допуска не блокирует — вопросы уходят в RAG
     reply2 = sm.process_message("u1", "что дальше?", "d1", [], None)
     assert reply2.startswith("MOCK_ANSWER")
+    assert db.get_session("u1")["state"] == "EXAM_READY"   # RAG не стартует
+    reply3 = sm.process_message("u1", "Начать", "d1", [], None)
+    assert "Э1?" in reply3                                 # старт — командой
+    assert db.get_session("u1")["state"] == "EXAM"
+
+
+def test_basic_fail_retake(env, monkeypatch):
+    """31.08: ниже порога (60%) — базовый пересдаётся с чистого счёта."""
+    monkeypatch.setattr(sm, "notify_hr", lambda text: None)
+    two_q = {"course_summary": "s",
+             "basic_questions": [
+                 {"text": "Б1?", "options": ["A. 1", "B. 2"], "correct": "A"},
+                 {"text": "Б2?", "options": ["A. 1", "B. 2"], "correct": "A"}],
+             "exam_questions": [
+                 {"text": "Э?", "options": ["A. 1", "B. 2"], "correct": "A"}]}
+    course = db.get_course_by_doc_name("Стандарты.docx")
+    db.update_course_questions(course["id"],
+                               json.dumps(two_q, ensure_ascii=False))
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    sm.process_message("u1", "Готов", "d1", [], None)
+    sm.process_message("u1", "B", "d1", [], None)          # 0/…
+    reply = sm.process_message("u1", "B", "d1", [], None)  # 0/2 < порога 1
+    assert "не сдан" in reply and "Готов" in reply
+    session = db.get_session("u1")
+    assert session["state"] == "READING"
+    assert db.get_session_answers(session["id"], "basic") == []  # чисто
+    sm.process_message("u1", "Готов", "d1", [], None)      # вторая попытка
+    sm.process_message("u1", "A", "d1", [], None)
+    reply = sm.process_message("u1", "A", "d1", [], None)  # 2/2 — сдан
+    assert "Базовый тест сдан" in reply and "*2/2*" in reply
+    assert db.get_session("u1")["state"] == "EXAM_READY"
 
 
 def test_waiting_park_switch_admit_exam(env, monkeypatch):
@@ -283,34 +323,42 @@ def test_waiting_park_switch_admit_exam(env, monkeypatch):
     sm.process_message("u1", "1", "d1", [], None)          # роль → первый курс
     first_course = db.get_session("u1")["course_id"]       # порядок не важен
     sm.process_message("u1", "Готов", "d1", [], None)
-    sm.process_message("u1", "A", "d1", [], None)          # базовый → WAITING_HR
-    a_row = db.get_waiting_session("u1")
-    assert a_row and a_row["course_id"] == first_course
+    sm.process_message("u1", "A", "d1", [], None)          # базовый → EXAM_READY
+    a_row = db.get_session("u1")
+    assert a_row["course_id"] == first_course and a_row["state"] == "EXAM_READY"
 
-    # Переключение из ожидания: строка первого курса паркуется, второму — новая
+    # Переключение из допуска: строка первого курса паркуется, второму — новая
     reply = sm.process_message("u1", "Выбрать 1", "d1", [], None)
     assert "Переключил курс" in reply
     active = db.get_session("u1")
     assert active["course_id"] != first_course and active["state"] == "READING"
     assert active["id"] != a_row["id"]
-    assert db.get_waiting_session("u1")["id"] == a_row["id"]   # ожидание живо
+    assert db.get_session_by_id(a_row["id"])["state"] == "EXAM_READY"  # жива
 
-    menu, _ = sm.my_courses("u1", active.get("role"))
-    assert "ждёт допуска HR" in menu
-
-    # Допуск НЕ выдёргивает из текущего курса
-    db.admit_session(a_row["id"])
-    assert db.get_session("u1")["id"] == active["id"]
     menu2, sel = sm.my_courses("u1", active.get("role"))
     assert "допущен к экзамену" in menu2
 
-    # Вход в допущенный экзамен через «Выбрать»
+    # Возврат через «Выбрать» — приглашение, экзамен стартует только «Начать»
     n = next(i + 1 for i, c in enumerate(sel) if c["id"] == first_course)
     reply = sm.process_message("u1", f"Выбрать {n}", "d1", [], None)
-    assert "Экзамен" in reply and "Э?" in reply
+    assert "допущен к экзамену" in reply and "Начать" in reply
+    reply = sm.process_message("u1", "Начать", "d1", [], None)
+    assert "Э?" in reply
     sm.process_message("u1", "A", "d1", [], None)          # сдать (1 вопрос)
     assert db.get_session_by_id(a_row["id"])["state"] == "DONE"
     assert db.get_session("u1")["id"] == active["id"]      # активен снова второй
+
+
+def test_legacy_waiting_hr_admit(env, monkeypatch):
+    """Легаси-строка WAITING_HR (создана до 31.08) — «Допустить» переводит
+    её в EXAM_READY, старт экзамена кнопкой."""
+    monkeypatch.setattr(sm, "notify_hr", lambda *a, **kw: None)
+    course = db.get_course_by_doc_name("Стандарты.docx")
+    row = db.create_session("u2", "d2", course["id"])
+    db.update_session(row["id"], state="WAITING_HR")
+    assert db.get_waiting_session("u2")["id"] == row["id"]
+    db.admit_session(row["id"])
+    assert db.get_session_by_id(row["id"])["state"] == "EXAM_READY"
 
 
 # ── Протокол 05.08: BB-код, выбор курса ──────────────────────────────────────
@@ -424,9 +472,10 @@ def test_test_pause_and_resume(env, monkeypatch):
     reply = sm.process_message("u1", f"Выбрать {n}", "d1", [], None)
     assert "Продолжаем базовый тест" in reply and "Б2?" in reply
     reply = sm.process_message("u1", "A", "d1", [], None)  # дорешать
-    assert "Базовый тест завершён" in reply
-    row = db.get_waiting_session("u1")
-    assert row["course_id"] == first_course
+    assert "Базовый тест сдан" in reply                    # 2/2, экзамена нет
+    row = next(x for x in db.get_sessions_by_user("u1")
+               if x["course_id"] == first_course)
+    assert row["state"] == "DONE"
     assert row["score_basic"] == 2                         # без задвоений
 
 
@@ -502,7 +551,7 @@ def test_continue_returns_to_question(env, monkeypatch):
     assert "Б?" in reply                                     # тот же вопрос
     assert db.get_session("u1")["current_q_idx"] == 0        # прогресс цел
     reply = sm.process_message("u1", "A", "d1", [], None)    # отвечает дальше
-    assert "Базовый тест завершён" in reply
+    assert "Базовый тест сдан" in reply                      # 31.08: авто-допуск
     assert "Что дальше" in reply                             # хвост-подсказка
 
 

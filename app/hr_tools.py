@@ -3,8 +3,10 @@ app/hr_tools.py — чистые функции инструментов HR (д�
 через чат, «История», «Отчёт». Без сети и БД (role_name читает только локальный
 data/roles.json) — всё тестируется напрямую.
 
-Нумерация вопросов в UI сквозная (смета): 1–5 = базовый тест, 6–15 = экзамен.
-В answers.question_id хранится индекс ВНУТРИ фазы (0-based) — не путать.
+Нумерация вопросов в UI сквозная: 1–B = базовый тест, B+1–B+E = экзамен,
+где B/E — фактические длины (адаптивная генерация 31.08; дефолты 5/10 —
+совместимость со старыми курсами). В answers.question_id хранится индекс
+ВНУТРИ фазы (0-based) — не путать.
 """
 import json
 import re
@@ -34,6 +36,7 @@ _STATE_LABELS = {
     "READING": "изучает материал",
     "BASIC_TEST": "проходит базовый тест",
     "WAITING_HR": "ждёт допуска к экзамену",
+    "EXAM_READY": "допущен к экзамену",
     "EXAM": "сдаёт экзамен",
 }
 
@@ -43,23 +46,34 @@ def _norm_letter(raw: str) -> str:
     return _CYR_TO_LAT.get(letter, letter)
 
 
-def resolve_question_ref(q_num: int) -> tuple[str, int]:
-    """UI-номер 1–15 → (фаза, индекс внутри фазы). 1–5 базовые, 6–15 экзамен."""
-    if 1 <= q_num <= 5:
+def resolve_question_ref(q_num: int, basic_len: int = 5,
+                         exam_len: int = 10) -> tuple[str, int]:
+    """UI-номер → (фаза, индекс внутри фазы). 1–B базовые, B+1–B+E экзамен."""
+    if 1 <= q_num <= basic_len:
         return "basic", q_num - 1
-    if 6 <= q_num <= 15:
-        return "exam", q_num - 6
-    raise ValueError(f"Номер вопроса — от 1 до 15, получил {q_num}")
+    if basic_len < q_num <= basic_len + exam_len:
+        return "exam", q_num - basic_len - 1
+    raise ValueError(f"Номер вопроса — от 1 до {basic_len + exam_len}, "
+                     f"получил {q_num}")
 
 
-def ui_number(phase: str, question_id: int) -> int:
-    """Обратный маппинг: (фаза, индекс) → сквозной номер 1–15."""
-    return question_id + (1 if phase == "basic" else 6)
+def ui_number(phase: str, question_id: int, basic_len: int = 5) -> int:
+    """Обратный маппинг: (фаза, индекс) → сквозной номер."""
+    return question_id + (1 if phase == "basic" else basic_len + 1)
+
+
+def phase_lens(questions: dict) -> tuple[int, int]:
+    """(len basic, len exam) курса; пустой dict → легаси-дефолт 5/10."""
+    basic = questions.get("basic_questions")
+    exam = questions.get("exam_questions")
+    if basic is None and exam is None:
+        return 5, 10
+    return len(basic or []), len(exam or [])
 
 
 def question_by_ref(questions: dict, q_num: int) -> dict | None:
     try:
-        phase, idx = resolve_question_ref(q_num)
+        phase, idx = resolve_question_ref(q_num, *phase_lens(questions))
     except ValueError:
         return None
     q_list = questions.get(f"{phase}_questions", [])
@@ -74,8 +88,9 @@ def correct_option(q: dict) -> str:
                  if o.strip().upper().startswith(prefix)), q.get("correct", "?"))
 
 
-def format_question_full(q: dict, q_num: int) -> str:
-    phase, _ = resolve_question_ref(q_num)
+def format_question_full(q: dict, q_num: int, basic_len: int = 5,
+                         exam_len: int = 10) -> str:
+    phase, _ = resolve_question_ref(q_num, basic_len, exam_len)
     label = "базовый тест" if phase == "basic" else "экзамен"
     lines = [f"*Вопрос {q_num}* ({label}):", q["text"], ""] + list(q["options"])
     lines.append(f"Ответ: {q['correct']}")
@@ -84,12 +99,13 @@ def format_question_full(q: dict, q_num: int) -> str:
     return "\n".join(lines)
 
 
-def format_question_card(doc_name: str, q: dict, q_num: int) -> str:
+def format_question_card(doc_name: str, q: dict, q_num: int,
+                         basic_len: int = 5, exam_len: int = 10) -> str:
     """Карточка вопроса «как видит сотрудник» + ✅ на правильном (17.08:
     «Вопросы N» листает карточки вместо простыни-ответника)."""
-    phase, idx = resolve_question_ref(q_num)
-    sub = (f"Базовый блок — вопрос {idx + 1}/5" if phase == "basic"
-           else f"Экзамен — вопрос {idx + 1}/10")
+    phase, idx = resolve_question_ref(q_num, basic_len, exam_len)
+    sub = (f"Базовый блок — вопрос {idx + 1}/{basic_len}" if phase == "basic"
+           else f"Экзамен — вопрос {idx + 1}/{exam_len}")
     lines = [f"📋 *{doc_name}*", sub, "", f"{q_num}. {q['text']}", ""]
     correct_prefix = (q.get("correct") or "") + "."
     for o in q.get("options", []):
@@ -145,7 +161,7 @@ def parse_replacement(raw: str) -> dict | None:
 def apply_replacement(questions: dict, q_num: int, repl: dict) -> dict:
     """Замена 1:1 вопроса q_num (id исходного вопроса сохраняется). ValueError
     при невалидном номере/вопросе. Количество вопросов не меняется никогда."""
-    phase, idx = resolve_question_ref(q_num)
+    phase, idx = resolve_question_ref(q_num, *phase_lens(questions))
     q_list = questions.get(f"{phase}_questions", [])
     if idx >= len(q_list):
         raise ValueError(f"В курсе нет вопроса №{q_num}")
@@ -192,7 +208,8 @@ def build_history_text(employee_label: str, sessions: list[dict],
             q_list = questions.get(f"{a['phase']}_questions", [])
             q = q_list[a["question_id"]] if a["question_id"] < len(q_list) else {}
             mark = "✓" if a["is_correct"] == 1 else "✗"
-            line = (f"{ui_number(a['phase'], a['question_id'])}. {mark} "
+            b_len = len(questions.get("basic_questions", [])) or 5
+            line = (f"{ui_number(a['phase'], a['question_id'], b_len)}. {mark} "
                     f"{(q.get('text') or '')[:60]} — ответ {a['user_answer']}")
             if a["is_correct"] != 1:
                 line += f" (верно: {q.get('correct', '?')})"
