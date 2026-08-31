@@ -32,8 +32,15 @@ def test_hr_main_menu():
     menu = _btns(kb.hr_main_menu(True))
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in menu] == [
         ("📚 Курсы на проверке", "Курсы"),
+        ("👁 Вопросы курса", "Вопросы"),
+        ("✅ Подтвердить курс", "Подтвердить"),
+        ("✏️ Изменить вопрос", "Изменить"),
+        ("✉️ Пригласить сотрудника", "Пригласить"),
+        ("🎓 Допустить к экзамену", "Допустить"),
+        ("📋 История сотрудника", "История"),
         ("📊 Отчёт по обучению", "Отчёт"),
-        ("👥 Руководители", "Руководители")]
+        ("👥 Руководители", "Руководители"),
+        ("⚙️ Править руководителей", "Руководитель")]
     assert all(b["COMMAND"] == "hrsay" and b["DISPLAY"] == "BLOCK"
                for b in menu)
     assert menu[0]["BG_COLOR"] == "#BEDC3C"               # очередь непуста
@@ -113,8 +120,12 @@ def test_hr_help_menu_keyboard(hr_env, monkeypatch):
     assert _wait_for(lambda: captured)
     menu = _btns(captured[0]["keyboard"])
     assert [b["COMMAND_PARAMS"] for b in menu] == \
-        ["Курсы", "Отчёт", "Руководители"]
+        ["Курсы", "Вопросы", "Подтвердить", "Изменить", "Пригласить",
+         "Допустить", "История", "Отчёт", "Руководители", "Руководитель"]
     assert menu[0]["BG_COLOR"] == "#DDEFF8"               # очередь пуста
+    assert "Вопросы 44" in captured[0]["text"]
+    assert "Пригласить n.sharapov@proptech.digital" in captured[0]["text"]
+    assert "Руководитель добавить n.sharapov@proptech.digital" in captured[0]["text"]
 
 
 def test_hr_no_keyboard_flag_off(hr_env):

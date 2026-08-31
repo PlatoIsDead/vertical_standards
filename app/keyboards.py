@@ -175,15 +175,31 @@ def employee_main_menu() -> list:
 # ── HR-бот ───────────────────────────────────────────────────────────────────
 
 def hr_main_menu(has_pending: bool = True) -> list:
-    """Стопка BLOCK; «Курсы на проверке» — primary только при непустой
-    очереди (лайм отмечает то, ради чего HR открывает бота)."""
+    """Постоянная палитра всех HR-действий.
+
+    Команды с параметрами открывают понятный запрос ввода; выбор курса и
+    вопроса остаётся контекстным, чтобы не показывать устаревшие ID."""
     return [
         _hr_btn("📚 Курсы на проверке", "Курсы", display="BLOCK",
                 role="primary" if has_pending else "secondary"),
         dict(_NEWLINE),
+        _hr_btn("👁 Вопросы курса", "Вопросы", display="BLOCK"),
+        dict(_NEWLINE),
+        _hr_btn("✅ Подтвердить курс", "Подтвердить", display="BLOCK"),
+        dict(_NEWLINE),
+        _hr_btn("✏️ Изменить вопрос", "Изменить", display="BLOCK"),
+        dict(_NEWLINE),
+        _hr_btn("✉️ Пригласить сотрудника", "Пригласить", display="BLOCK"),
+        dict(_NEWLINE),
+        _hr_btn("🎓 Допустить к экзамену", "Допустить", display="BLOCK"),
+        dict(_NEWLINE),
+        _hr_btn("📋 История сотрудника", "История", display="BLOCK"),
+        dict(_NEWLINE),
         _hr_btn("📊 Отчёт по обучению", "Отчёт", display="BLOCK"),
         dict(_NEWLINE),
         _hr_btn("👥 Руководители", "Руководители", display="BLOCK"),
+        dict(_NEWLINE),
+        _hr_btn("⚙️ Править руководителей", "Руководитель", display="BLOCK"),
     ]
 
 

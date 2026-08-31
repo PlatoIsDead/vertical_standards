@@ -1110,7 +1110,8 @@ async def _handle_hr_message(user_id: str, question: str,
     elif msg_lower.startswith("подтвердить"):
         parts = question.split()
         if len(parts) < 2:
-            text = "❌ Укажи номер курса: Подтвердить {N}"
+            text = ("✅ Сначала выбери курс: нажми «Курсы на проверке», "
+                    "затем «Подтвердить» рядом с нужным курсом.")
         else:
             try:
                 course_id = int(parts[-1])
@@ -1137,7 +1138,8 @@ async def _handle_hr_message(user_id: str, question: str,
     elif msg_lower.startswith("пригласить"):
         email = _extract_email(question)
         if not email:
-            text = "❌ Укажи email сотрудника: Пригласить ivanov@company.ru"
+            text = ("✉️ Напиши email сотрудника. Например: "
+                    "Пригласить n.sharapov@proptech.digital")
         else:
             try:
                 user = await _bitrix_user_by_email(email)
@@ -1195,7 +1197,8 @@ async def _handle_hr_message(user_id: str, question: str,
             else:
                 target_uid = emp["bitrix_uid"]
         if len(parts) < 2:
-            text = "❌ Укажи ID или email сотрудника: Допустить {user_id или email}"
+            text = ("🎓 Напиши ID или email сотрудника. Например: "
+                    "Допустить n.sharapov@proptech.digital")
         elif target_uid:
             # 17.08: допуск целится в WAITING_HR-строку (свойство курса), а не
             # в активную сессию — сотрудник мог уйти проходить другой курс.
@@ -1248,9 +1251,8 @@ async def _handle_hr_message(user_id: str, question: str,
         # «N все» — прежняя простыня со всеми ответами
         m = re.match(r"^вопросы\s+(\d+)(?:\.(\d+))?(\s+все)?$", msg_lower)
         if not m:
-            text = ("❌ Формат: Вопросы {N} — по карточке, "
-                    "Вопросы {N}.{вопрос 1–15} — конкретный, "
-                    "Вопросы {N} все — списком")
+            text = ("👁 Нажми «Курсы на проверке», затем «Вопросы» рядом с "
+                    "нужным курсом. Или напиши, например: Вопросы 44")
         else:
             course_id = int(m.group(1))
             q_num = int(m.group(2)) if m.group(2) else 1
@@ -1287,7 +1289,8 @@ async def _handle_hr_message(user_id: str, question: str,
         # 17.08: пошаговый визард вместо one-shot; форматы «N q» и «N.q»
         m = re.match(r"^изменить\s+(\d+)[.\s]+(\d+)$", msg_lower)
         if not m:
-            text = "❌ Формат: Изменить {курс}.{вопрос 1–15} (или через пробел)"
+            text = ("✏️ Открой «Вопросы» нужного курса и нажми «Изменить» "
+                    "под вопросом. Например: Изменить 44.6")
         else:
             course_id, q_num = int(m.group(1)), int(m.group(2))
             course = await asyncio.to_thread(get_course_by_id, course_id)
@@ -1342,7 +1345,8 @@ async def _handle_hr_message(user_id: str, question: str,
     elif msg_lower.startswith("история"):
         parts = question.split()
         if len(parts) < 2:
-            text = "❌ Укажи email или ID: История ivanov@company.ru"
+            text = ("📋 Напиши ID или email сотрудника. Например: "
+                    "История n.sharapov@proptech.digital")
         else:
             target = parts[-1]
             uid, label = None, target
@@ -1415,7 +1419,10 @@ async def _handle_hr_message(user_id: str, question: str,
             text = (f"✅ {email} удалён." if removed
                     else f"⚠️ {email} не найден в списке.")
         else:
-            text = ("❌ Формат: Руководители | Руководитель добавить {email} "
+            text = ("⚙️ Напиши действие и email. Например: Руководитель "
+                    "добавить n.sharapov@proptech.digital\n"
+                    "Или: Руководитель удалить n.sharapov@proptech.digital\n\n"
+                    "Формат: Руководители | Руководитель добавить {email} "
                     "[старший] | Руководитель удалить {email}")
 
     elif msg_lower.startswith(("аббревиатура", "аббревиатуры")):
@@ -1488,15 +1495,25 @@ async def _handle_hr_message(user_id: str, question: str,
         text = (
             "Доступные команды:\n"
             "• *Курсы* — список курсов на проверке\n"
+            "  Например: *Курсы* — откроет все курсы, ожидающие активации.\n"
             "• *Вопросы {N}* — посмотреть вопросы курса\n"
+            "  Например: *Вопросы 44* — покажет сгенерированные вопросы курса №44.\n"
             "• *Подтвердить {N}* — активировать курс\n"
+            "  Например: *Подтвердить 44* — активирует курс №44 и разошлёт его сотрудникам.\n"
             "• *Изменить {курс} {вопрос 1–15}* — править вопрос курса\n"
+            "  Например: *Изменить 44 6* — откроет правку шестого вопроса курса №44.\n"
             "• *Пригласить {email}* — дать доступ и начать обучение\n"
+            "  Например: *Пригласить n.sharapov@proptech.digital* — сотрудник получит доступ и первое сообщение.\n"
             "• *Допустить {email или ID}* — допустить сотрудника к экзамену\n"
+            "  Например: *Допустить n.sharapov@proptech.digital* — откроет экзамен после базового теста.\n"
             "• *История {email или ID}* — вопросы и ответы сотрудника\n"
+            "  Например: *История n.sharapov@proptech.digital* — покажет ход и результаты обучения.\n"
             "• *Отчёт* — сводка: кто прошёл обучение и с каким результатом\n"
+            "  Например: *Отчёт* — покажет общую сводку по сотрудникам.\n"
             "• *Руководители* — реестр получателей эскалаций\n"
-            "• *Руководитель добавить/удалить {email} [старший]* — правка реестра"
+            "  Например: *Руководители* — покажет текущих получателей эскалаций.\n"
+            "• *Руководитель добавить/удалить {email} [старший]* — правка реестра\n"
+            "  Например: *Руководитель добавить n.sharapov@proptech.digital старший* — добавит старшего получателя эскалаций."
         )
         has_pending = bool(await asyncio.to_thread(get_pending_courses))
         kb = keyboards.hr_main_menu(has_pending)
