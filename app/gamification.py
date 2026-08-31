@@ -120,6 +120,13 @@ def build_weekly_rating(rows: list[dict], employees_by_uid: dict[str, dict],
 def _post_to_feed(title: str, message: str) -> bool:
     """log.blogpost.add с DEST=["UA"] (все сотрудники). Retry только на сетевых
     ошибках; отказ прав/параметров не ретраим — лог и False."""
+    # Выключено 31.08 по решению юзера: клиенту нужны штатные «Благодарности»
+    # (значок в профиле), а REST их создавать не умеет (UF_GRATITUDE в белый
+    # список log.blogpost.* не входит — проверено живьём). Посты-суррогаты не
+    # показываем, ждём ответа Bitrix-эксперта про кастомный метод.
+    if os.getenv("FEED_POSTS_ENABLED", "0") != "1":
+        print(f"[gamification] feed posts disabled — пропущен пост {title!r}")
+        return False
     webhook = os.getenv("BITRIX_WEBHOOK_URL", "")
     if not webhook:
         print("[gamification] BITRIX_WEBHOOK_URL missing — пост не отправлен")
