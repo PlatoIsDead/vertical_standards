@@ -109,7 +109,7 @@ def test_invite_requires_email(env):
     client, sent, _ = env
     _post_hr(client, "Пригласить")
     assert _wait_for(lambda: any(m[0] == "d9" for m in sent))
-    assert "Укажи email" in next(m for m in sent if m[0] == "d9")[1]
+    assert "Напиши email" in next(m for m in sent if m[0] == "d9")[1]
 
 
 def test_invite_already_learning(env):

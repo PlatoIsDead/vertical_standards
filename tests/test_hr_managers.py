@@ -89,7 +89,7 @@ def test_add_remove_and_senior(env):
 def test_bad_format(env):
     client, sent = env
     _post_hr(client, "Руководитель добавить")                  # без email
-    assert _wait_for(lambda: any("❌ Формат" in m[1] for m in sent))
+    assert _wait_for(lambda: any("Формат: Руководители" in m[1] for m in sent))
 
 
 def test_non_hr_rejected(env):

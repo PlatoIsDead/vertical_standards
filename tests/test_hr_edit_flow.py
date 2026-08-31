@@ -161,7 +161,7 @@ def test_edit_bad_refs(env):
     client, sent, course_id = env
     assert "не найден" in _post_and_reply(client, sent, "Изменить 999 7")
     assert "от 1" in _post_and_reply(client, sent, f"Изменить {course_id} 16")
-    assert "Формат" in _post_and_reply(client, sent, "Изменить")
+    assert "Например: Изменить" in _post_and_reply(client, sent, "Изменить")
 
 
 def test_history_by_email(env):

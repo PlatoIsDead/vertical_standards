@@ -181,8 +181,8 @@ def employee_main_menu() -> list:
     return [
         _btn("📚 Мои курсы", "Мои курсы", display="BLOCK"),
         dict(_NEWLINE),
-        _btn("📄 Документы", width=140),
-        _btn("❓ Помощь", width=120),
+        _btn("📄 Документы", "Документы", width=140),
+        _btn("❓ Помощь", "Помощь", width=120, role="service"),
     ]
 
 
