@@ -960,6 +960,10 @@ def notify_hr(message: str, keyboard: list | None = None) -> None:
         print(f"[notify_hr] Config missing — message not sent: {message[:80]}")
         return
 
+    # notify_hr bypasses bitrix_bot._send, so it needs the same universal
+    # navigation fallback for HR notifications sent by the state machine.
+    if keyboard is None and os.getenv("BUTTONS_ENABLED", "0") == "1":
+        keyboard = keyboards.hr_main_menu()
     hr_ids = [x.strip() for x in hr_ids_str.split(",") if x.strip()]
     for hr_id in hr_ids:
         payload = {"BOT_ID": bot_id, "DIALOG_ID": bare_dialog(hr_id),

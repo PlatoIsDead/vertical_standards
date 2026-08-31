@@ -158,6 +158,20 @@ def start_button(label: str, payload: str = "Начать",
     return [_btn(label, payload, display="BLOCK", role=role)]
 
 
+def employee_main_menu() -> list:
+    """Нейтральная навигация, когда у сотрудника ещё нет сессии.
+
+    Нужна как безопасный fallback для служебных и проактивных сообщений:
+    каждая команда уже понимается FSM и не зависит от курса или роли.
+    """
+    return [
+        _btn("📚 Мои курсы", "Мои курсы", display="BLOCK"),
+        dict(_NEWLINE),
+        _btn("📄 Документы", width=140),
+        _btn("❓ Помощь", width=120),
+    ]
+
+
 # ── HR-бот ───────────────────────────────────────────────────────────────────
 
 def hr_main_menu(has_pending: bool = True) -> list:

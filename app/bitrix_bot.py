@@ -730,6 +730,21 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
     # otherwise Bitrix rejects imbot.message.add with 403.
     if not client_id:
         client_id = HR_CLIENT_ID if str(bot_id) == str(HR_BOT_ID) else BOT_CLIENT_ID
+    # Every outgoing message keeps the conversation actionable when buttons are
+    # enabled. Specific flows pass a more useful keyboard explicitly; this is
+    # the catch-all for notifications, errors, and future call sites.
+    if BUTTONS_ENABLED and keyboard is None:
+        try:
+            if str(bot_id) == str(HR_BOT_ID):
+                keyboard = keyboards.hr_main_menu()
+            else:
+                keyboard = (await _session_keyboard(dialog_id)
+                            or keyboards.employee_main_menu())
+        except Exception as exc:
+            # A keyboard must never prevent delivery of the message itself.
+            keyboard = (keyboards.hr_main_menu() if str(bot_id) == str(HR_BOT_ID)
+                        else keyboards.employee_main_menu())
+            print(f"KEYBOARD fallback skipped (dialog={dialog_id}): {exc!r}")
     payload = {
         "BOT_ID": bot_id,
         "DIALOG_ID": dialog_id,

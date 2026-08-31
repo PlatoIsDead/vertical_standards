@@ -32,6 +32,7 @@ SAMPLES = {
     "start": kb.start_button("▶ Начать обучение"),
     "start_menu": kb.start_button("📚 Мои курсы", "Мои курсы",
                                   role="secondary"),
+    "employee_menu": kb.employee_main_menu(),
     "hr_menu": kb.hr_main_menu(True),
     "hr_menu_empty": kb.hr_main_menu(False),
     "hr_list": kb.hr_course_list([1, 2], 1, 0),

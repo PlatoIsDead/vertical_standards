@@ -342,6 +342,24 @@ def test_notify_hr_keyboard_key(monkeypatch):
     assert sent[1]["KEYBOARD"] == [{"TEXT": "Допустить 5"}]
 
 
+def test_notify_hr_gets_menu_keyboard_when_enabled(monkeypatch):
+    sent = []
+
+    def fake_post(url, json=None, timeout=None):
+        sent.append(json)
+
+        class R:
+            status_code = 200
+        return R()
+
+    monkeypatch.setattr(sm.httpx, "post", fake_post)
+    monkeypatch.setenv("BITRIX_WEBHOOK_URL", "http://x/")
+    monkeypatch.setenv("HR_USER_IDS", "77")
+    monkeypatch.setenv("BUTTONS_ENABLED", "1")
+    sm.notify_hr("служебное уведомление")
+    assert sent[0]["KEYBOARD"] == kb.hr_main_menu()
+
+
 def test_finish_basic_admit_button_env_gated(monkeypatch):
     monkeypatch.setattr(sm, "get_session_answers", lambda sid, phase: [])
     monkeypatch.setattr(sm, "update_session", lambda *a, **kw: None)
@@ -414,6 +432,38 @@ def test_broadcast_course_no_keyboard_flag_off(send_trap, monkeypatch):
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", False)
     asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, ["1"]))
     assert send_trap[0]["keyboard"] is None
+
+
+def test_send_adds_contextual_fallback_keyboard(monkeypatch):
+    """Ни одно новое/служебное сообщение не остаётся без следующего шага."""
+    sent = []
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json=None):
+            sent.append(json)
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(bot, "get_session", lambda uid: None)
+    monkeypatch.setattr(bot, "_retake_fork_text", lambda uid: None)
+    asyncio.run(bot._send("500", "служебное", bot.BOT_ID))
+    asyncio.run(bot._send("77", "HR-уведомление", bot.HR_BOT_ID))
+    assert sent[0]["KEYBOARD"] == kb.employee_main_menu()
+    assert sent[1]["KEYBOARD"] == kb.hr_main_menu()
 
 
 def test_reminders_carry_state_keyboard(send_trap, monkeypatch):
