@@ -368,7 +368,7 @@ def test_notify_hr_gets_menu_keyboard_when_enabled(monkeypatch):
     monkeypatch.setenv("HR_USER_IDS", "77")
     monkeypatch.setenv("BUTTONS_ENABLED", "1")
     sm.notify_hr("служебное уведомление")
-    assert sent[0]["KEYBOARD"] == kb.hr_main_menu()
+    assert sent[0]["KEYBOARD"] == kb.with_main_menu(kb.hr_main_menu(), hr=True)
 
 
 def test_finish_basic_admit_button_env_gated(monkeypatch):
@@ -473,8 +473,8 @@ def test_send_adds_contextual_fallback_keyboard(monkeypatch):
     monkeypatch.setattr(bot, "_retake_fork_text", lambda uid: None)
     asyncio.run(bot._send("500", "служебное", bot.BOT_ID))
     asyncio.run(bot._send("77", "HR-уведомление", bot.HR_BOT_ID))
-    assert sent[0]["KEYBOARD"] == kb.employee_main_menu()
-    assert sent[1]["KEYBOARD"] == kb.hr_main_menu()
+    assert sent[0]["KEYBOARD"] == kb.with_main_menu(kb.employee_main_menu())
+    assert sent[1]["KEYBOARD"] == kb.with_main_menu(kb.hr_main_menu(), hr=True)
 
 
 def test_reminders_carry_state_keyboard(send_trap, monkeypatch):

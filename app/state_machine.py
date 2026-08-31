@@ -962,8 +962,10 @@ def notify_hr(message: str, keyboard: list | None = None) -> None:
 
     # notify_hr bypasses bitrix_bot._send, so it needs the same universal
     # navigation fallback for HR notifications sent by the state machine.
-    if keyboard is None and os.getenv("BUTTONS_ENABLED", "0") == "1":
-        keyboard = keyboards.hr_main_menu()
+    if os.getenv("BUTTONS_ENABLED", "0") == "1":
+        if keyboard is None:
+            keyboard = keyboards.hr_main_menu()
+        keyboard = keyboards.with_main_menu(keyboard, hr=True)
     hr_ids = [x.strip() for x in hr_ids_str.split(",") if x.strip()]
     for hr_id in hr_ids:
         payload = {"BOT_ID": bot_id, "DIALOG_ID": bare_dialog(hr_id),

@@ -745,6 +745,9 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
             keyboard = (keyboards.hr_main_menu() if str(bot_id) == str(HR_BOT_ID)
                         else keyboards.employee_main_menu())
             print(f"KEYBOARD fallback skipped (dialog={dialog_id}): {exc!r}")
+    if BUTTONS_ENABLED:
+        keyboard = keyboards.with_main_menu(
+            keyboard, hr=str(bot_id) == str(HR_BOT_ID))
     payload = {
         "BOT_ID": bot_id,
         "DIALOG_ID": dialog_id,

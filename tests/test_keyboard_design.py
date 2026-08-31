@@ -33,6 +33,8 @@ SAMPLES = {
     "start_menu": kb.start_button("📚 Мои курсы", "Мои курсы",
                                   role="secondary"),
     "employee_menu": kb.employee_main_menu(),
+    "employee_with_menu": kb.with_main_menu(kb.start_button("Start")),
+    "hr_with_menu": kb.with_main_menu(kb.hr_question_card(5, 1), hr=True),
     "hr_menu": kb.hr_main_menu(True),
     "hr_menu_empty": kb.hr_main_menu(False),
     "hr_list": kb.hr_course_list([1, 2], 1, 0),
@@ -52,7 +54,7 @@ SAMPLES = {
 # ЖЕЛЕЗНЫЙ ИНВАРИАНТ: payload'ы — только команды, которые понимает FSM/HR
 ALLOWED_PAYLOADS = [
     r"^(Готов|Мои курсы|Роль|Пересдать|Далее|Начать|Отмена|Сохранить|Заново|\.)$",
-    r"^(Документы|Выйти|Продолжить|Помощь)$",   # 19.08–26.08: навигация
+    r"^(Документы|Выйти|Продолжить|Помощь|Меню)$",   # 19.08–26.08: навигация
     r"^[A-D]$",
     r"^\d{1,2}$",                       # выбор роли
     r"^Выбрать \d+$",

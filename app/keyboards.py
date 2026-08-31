@@ -44,6 +44,20 @@ def _hr_btn(text: str, payload: str = None, display: str = "LINE",
     return _btn(text, payload, display, command="hrsay", role=role, width=width)
 
 
+def with_main_menu(keyboard: list | None, hr: bool = False) -> list:
+    """Add the universal main-menu escape hatch without mutating input."""
+    rows = list(keyboard or [])
+    if any(item.get("TEXT") == "🏠 Меню" for item in rows):
+        return rows
+    if rows and rows[-1].get("TYPE") != "NEWLINE":
+        rows.append(dict(_NEWLINE))
+    button = (_hr_btn("🏠 Меню", "Меню", display="BLOCK", role="service")
+              if hr else
+              _btn("🏠 Меню", "Мои курсы", display="BLOCK", role="service"))
+    rows.append(button)
+    return rows
+
+
 # ── Employee-бот ─────────────────────────────────────────────────────────────
 
 def for_session(session: dict | None, fork: bool = False,
