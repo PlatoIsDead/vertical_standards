@@ -1017,10 +1017,11 @@ async def _broadcast_new_standard(file_name: str, detail_url: str | None,
     """«Стандарт доступен сразу после загрузки» — тест назначается позже,
     после «Подтвердить» (флоу 19.08). Fire-and-forget, _send сам ретраит."""
     uids = await asyncio.to_thread(_standard_recipients, doc_roles)
-    text = (f"📄 Новый стандарт доступен: *{display_name(file_name)}*\n"
-            + (f"{detail_url}\n" if detail_url else "")
-            + "Уже можешь читать его и задавать мне вопросы по нему. "
-              "Тест будет назначен позже.")
+    name = display_name(file_name)
+    link = f"[URL={detail_url}]{name}[/URL]" if detail_url else f"*{name}*"
+    text = (f"📄 Новый стандарт доступен: {link}\n"
+            "Уже можешь читать его и задавать мне вопросы по нему. "
+            "Тест будет назначен позже.")
     for uid in uids:
         await _send(f"u{uid}", text, BOT_ID)
 
