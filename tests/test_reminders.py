@@ -113,3 +113,16 @@ def test_escalation_transient_failure_not_marked(env, monkeypatch):
     with pytest.raises(bot.httpx.ConnectError):
         asyncio.run(bot._check_escalations(NOW_10MSK))
     assert db.get_escalated(1) == set()                     # НЕ помечено — доставит позже
+
+
+def test_reminder_keyboard_in_test_no_letters(env, monkeypatch):
+    """01.09 (ревью): напоминание сотруднику в тесте — без A–D, вместо них
+    [▶ Продолжить …] (payload «Продолжить» понимает _handle_test)."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 1, "state": "EXAM",
+                                     "current_q_idx": 2})
+    kbd = asyncio.run(bot._reminder_keyboard("600"))
+    btns = [b for b in kbd if "TEXT" in b]
+    assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in btns] == \
+        [("▶ Продолжить экзамен", "Продолжить")]

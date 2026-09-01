@@ -86,7 +86,7 @@ def test_standard_recipients(monkeypatch):
     monkeypatch.setattr(bot, "get_all_employees", lambda: [
         {"bitrix_uid": "1"}, {"bitrix_uid": "2"}, {"bitrix_uid": "3"}])
     roles_by = {"1": "admin_reception", "2": "engineer", "3": None}
-    monkeypatch.setattr(bot, "_last_known_role", lambda uid: roles_by[uid])
+    monkeypatch.setattr(bot, "resolve_role_cached", lambda uid: roles_by[uid])
     assert bot._standard_recipients(["admin_reception"]) == ["1"]
     assert set(bot._standard_recipients(["all_staff"])) == {"1", "2", "3"}
 

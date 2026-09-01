@@ -119,6 +119,9 @@ def init_db() -> None:
         _ensure_column(conn, "employees", "work_position", "TEXT")
         # 19.08: право смены роли выдаёт HR (дефолт 1 — поведение прежнее)
         _ensure_column(conn, "employees", "can_switch_role", "INTEGER DEFAULT 1")
+        # 01.09: роль назначает HR при «Пригласить» — главнее авто-роли по
+        # отделу и памяти сессии; NULL = легаси (старый флоу выбора)
+        _ensure_column(conn, "employees", "role", "TEXT")
         # Гейт поллера: файлы, обработанные ДО появления processed_files,
         # известны по courses.doc_id — сидируем, чтобы их не переобработать.
         # 19.08: архивные курсы НЕ сидируем — иначе чистка индекса
@@ -537,6 +540,18 @@ def set_can_switch_role(bitrix_uid: str, allowed: bool) -> bool:
         cur = conn.execute(
             "UPDATE employees SET can_switch_role = ? WHERE bitrix_uid = ?",
             (1 if allowed else 0, str(bitrix_uid)),
+        )
+        return cur.rowcount > 0
+
+
+def set_employee_role(bitrix_uid: str, role_id: str | None) -> bool:
+    """01.09: роль сотрудника выбирает HR при «Пригласить» (кнопки/цифра).
+    Также синхронизируется при смене роли самим сотрудником (команда «Роль»,
+    если разрешена). True = сотрудник найден."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE employees SET role = ? WHERE bitrix_uid = ?",
+            (role_id, str(bitrix_uid)),
         )
         return cur.rowcount > 0
 

@@ -46,8 +46,10 @@ def test_for_session_states():
     test_kb = _btns(kb.for_session({"state": "BASIC_TEST"}))
     assert [b["COMMAND_PARAMS"] for b in test_kb] == \
         ["A", "B", "C", "D", "Выйти", "Помощь"]   # 19.08/26.08: пауза, помощь
-    assert kb.for_session({"state": "EXAM"}) == kb.for_session(
-        {"state": "BASIC_TEST"})
+    exam_kb = _btns(kb.for_session({"state": "EXAM"}))
+    assert [b["COMMAND_PARAMS"] for b in exam_kb] == \
+        ["A", "B", "C", "D", "Выйти", "Помощь"]      # payload'ы прежние
+    assert exam_kb[4]["TEXT"] == "⏸ Отложить экзамен"  # 01.09: имя фазы
     waiting = _btns(kb.for_session({"state": "WAITING_HR"}))
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in waiting] == \
         [("📚 Мои курсы", "Мои курсы"), ("📄 Документы", "Документы"),
@@ -101,7 +103,9 @@ def test_keyboard_attached_when_flag_on(monkeypatch):
     monkeypatch.setattr(bot, "get_session",
                         lambda uid: {"course_id": 5, "state": "BASIC_TEST"})
     monkeypatch.setattr(bot, "get_course_questions", lambda cid: {})
-    monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "ok")
+    # 01.09: A–D прикладываются только к сообщению С ВОПРОСОМ
+    monkeypatch.setattr(bot, "process_message",
+                        lambda *a, **kw: "📝 Базовый тест — Вопрос 1/5\n\nЧ?")
     captured = []
 
     async def fake_send(dialog_id, text, bot_id=None, client_id="",

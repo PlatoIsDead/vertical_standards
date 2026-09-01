@@ -58,6 +58,26 @@ def test_auto_role_from_seen_departments(env):
     assert session["role"] == "housekeeper" and session["state"] == "READING"
 
 
+def test_hr_assigned_role_beats_department(env):
+    """01.09: явный выбор HR при «Пригласить» (employees.role) главнее
+    авто-роли по отделу (№8)."""
+    db.set_employee_role("u1", "admin_reception")        # выбор HR: СПиР
+    db.mark_user_seen("u1", "[1307]")                    # отдел: горничная
+
+    reply = sm.process_message("u1", "привет", "d1", [], None)
+    assert "назначил HR" in reply and "СПиР" in reply
+    assert db.get_session("u1")["role"] == "admin_reception"
+
+
+def test_hr_assigned_role_gone_from_registry_ignored(env):
+    """Роль, пропавшая из реестра, игнорируется — идёт обычная резолюция."""
+    db.set_employee_role("u1", "ghost_role")
+    db.mark_user_seen("u1", "[1307]")
+
+    sm.process_message("u1", "привет", "d1", [], None)
+    assert db.get_session("u1")["role"] == "housekeeper"  # фолбэк: отдел
+
+
 def test_auto_role_beats_session_memory(env):
     """Перевод в другой отдел должен менять роль: отдел > память сессии."""
     std = db.get_course_by_doc_name("Стандарты.docx")["id"]

@@ -52,6 +52,13 @@ SAMPLES = {
     "cancel": kb.hr_cancel_edit(),
     "invite": kb.hr_invite("a.petrova@becar.ru"),
     "admit": kb.hr_admit("28528", "Анна Петрова"),
+    # 01.09: HR-выбор роли («Пригласить»/«Роль {email}») + экзамен-лейблы
+    "hr_roles_2": kb.hr_role_select([("a", "Ресепшн"), ("b", "Хаускипинг")]),
+    "hr_roles_17": kb.hr_role_select([(f"r{i}", f"Роль {i}")
+                                      for i in range(17)]),
+    "menu_resume_exam": kb.courses_menu([(1, "Курс", "todo")],
+                                        resume_test=True, resume_exam=True),
+    "exam_letters": kb.for_session({"state": "EXAM"}),
 }
 
 # ЖЕЛЕЗНЫЙ ИНВАРИАНТ: payload'ы — только команды, которые понимает FSM/HR

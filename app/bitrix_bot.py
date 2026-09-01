@@ -24,6 +24,7 @@ from app.db import (
     get_course_by_doc_name,
     get_course_by_id,
     get_course_questions,
+    get_employee,
     get_employee_by_email,
     get_escalated,
     get_managers,
@@ -51,6 +52,7 @@ from app.db import (
     save_draft_course,
     seen_users_empty,
     set_can_switch_role,
+    set_employee_role,
     set_course_archived,
     set_meta,
     update_course_questions,
@@ -78,13 +80,15 @@ from app.roles import (
     display_name,
     load_roles_config,
     parse_filename,
+    role_name,
     save_roles_config,
     selectable_roles,
 )
 from app.state_machine import (
     _MENU_COMMANDS,
-    _last_known_role,
+    _format_role_list,
     _retake_fork_text,
+    resolve_role_cached,
     bare_dialog,
     course_roles,
     md_to_bb,
@@ -155,6 +159,58 @@ def _get_pending(user_id: str) -> dict | None:
     return pending
 
 
+def _is_pending_escape(msg_lower: str) -> bool:
+    """Сообщения, которые НЕ потребляются живым pending'ом: отмена, «Меню»
+    (универсальная кнопка — иначе цикл на клавиатуре промпта роли) и любая
+    HR-команда (важнее забытого pending)."""
+    return (msg_lower in ("отмена", "cancel", "меню")
+            or msg_lower.startswith(_HR_COMMAND_PREFIXES))
+
+
+def _pending_dedup_key(key: str, pending: dict) -> str:
+    """Суффикс дедуп-ключа для сообщений, уходящих В pending-обработчик.
+    Ревью 01.09 (CONFIRMED): единый «#step» на всё давал обе инверсии —
+    ретрай вебхука «Пригласить» при живом pending не дедупился (двойной
+    промпт), а одинаковая цифра двух приглашений подряд глоталась.
+    Ключ различает pending'и (uid) и попытки (attempt растёт при сбое
+    завершения — ретрай HR после «попробуй ещё раз» не гасится дедупом)."""
+    kind = pending.get("kind")
+    if kind in ("invite", "role_change"):
+        tag = "inv" if kind == "invite" else "rc"
+        return f"{key}#{tag}{pending['uid']}a{pending.get('attempt', 0)}"
+    return f"{key}#step{pending.get('step', '')}"
+
+
+def _pending_cancel_text(pending: dict) -> str:
+    """«Отмена» pending'а — честный текст: при повторном приглашении
+    сотрудник ОСТАЁТСЯ в whitelist (ревью 01.09, CONFIRMED) — не врать,
+    что он «не приглашён»."""
+    kind = pending.get("kind")
+    if kind == "invite":
+        if is_employee_allowed(pending["uid"]):
+            return (f"Приглашение {pending['fio']} отменено; ранее выданный "
+                    "доступ и роль сохраняются.")
+        return f"Приглашение {pending['fio']} отменено — доступ не выдан."
+    if kind == "role_change":
+        return f"Смена роли {pending['fio']} отменена."
+    return "Правка отменена."
+
+
+def _pending_dropped_text(pending: dict) -> str | None:
+    """Дроп pending'а командой/«Меню»: выбор роли не бросаем молча — HR
+    должен знать, что приглашение/смена роли НЕ завершены. Визард правки
+    как раньше умирает тихо (None)."""
+    kind = pending.get("kind")
+    if kind == "invite":
+        return (f"⚠️ Выбор роли для {pending['fio']} отменён — приглашение "
+                f"не завершено. Повтори: Пригласить {pending['email']}")
+    if kind == "role_change":
+        return (f"⚠️ Выбор роли для {pending['fio']} отменён — смена роли "
+                f"не выполнена. Повтори: Роль "
+                f"{pending.get('email') or pending['uid']}")
+    return None
+
+
 def _is_duplicate(user_id: str, dialog_id: str, question: str) -> bool:
     """True if this (user, text) arrived within DEDUP_WINDOW_SEC; also prunes stale keys.
 
@@ -194,7 +250,7 @@ def _deadline_items() -> list[dict]:
     sessions_by_uid = {str(e["bitrix_uid"]):
                        get_sessions_by_user(str(e["bitrix_uid"]))
                        for e in employees}
-    roles_by_uid = {str(e["bitrix_uid"]): _last_known_role(str(e["bitrix_uid"]))
+    roles_by_uid = {str(e["bitrix_uid"]): resolve_role_cached(str(e["bitrix_uid"]))
                     for e in employees}
     return deadlines.assignments_with_deadlines(
         employees, courses, sessions_by_uid, roles_by_uid,
@@ -231,7 +287,7 @@ async def _maybe_send_reminders(now_utc: "datetime | None" = None):
         text = deadlines.build_reminder_text(uid_items)
         if text:
             await _send(f"u{uid}", text, BOT_ID,
-                        **_kb_kwargs(await _session_keyboard(uid)))
+                        **_kb_kwargs(await _reminder_keyboard(uid)))
             sent += 1
     # Метка ПОСЛЕ отправки: упали посреди — следующий час дошлёт (риск
     # частичного дубля меньше, чем потерянный день напоминаний)
@@ -622,6 +678,116 @@ async def _wizard_input(user_id: str, pending: dict,
     return _wizard_step_text(pending), kb
 
 
+# ── «Пригласить» / «Роль {email}»: роль выбирает HR (01.09), не сотрудник ────
+
+def _employee_role_name(uid: str) -> str:
+    """Русское имя HR-назначенной роли сотрудника (для текстов HR)."""
+    emp = get_employee(uid)
+    role = (emp or {}).get("role")
+    return role_name(role) if role else "не назначена"
+
+
+async def _finish_invite(uid: str, email: str, fio: str,
+                         work_position: str | None, hr_user_id: str,
+                         role_id: str | None = None) -> str:
+    """Завершение «Пригласить»: whitelist + автостарт обучения.
+    role_id — выбор HR; пишется в employees.role ДО start_onboarding, чтобы
+    резолюция роли шла единым путём внутри state_machine.
+    Идемпотентна при ретрае (upsert/UPDATE/гейт сессии) — сбой посреди
+    не теряет приглашение, HR повторяет цифру (_role_pick_input)."""
+    await asyncio.to_thread(add_employee, uid, email, fio, hr_user_id,
+                            work_position)   # refresh email/ФИО — и при повторе
+    if await asyncio.to_thread(get_session, uid):
+        # Гонка двух HR / повтор: роль НЕ перезаписываем — ответ, выглядящий
+        # как no-op, не должен менять состояние (ревью 01.09)
+        current = await asyncio.to_thread(_employee_role_name, uid)
+        return (f"ℹ️ {fio} уже проходит обучение (роль: {current}). "
+                f"Сменить роль: Роль {email}")
+    if role_id:
+        await asyncio.to_thread(set_employee_role, uid, role_id)
+    first_msg = await asyncio.to_thread(start_onboarding, uid, f"u{uid}")
+    if first_msg is None:
+        return (f"✅ {fio} добавлен в доступ. Активных курсов нет — "
+                f"после активации курса отправь: Пригласить {email}")
+    # Автостарт идёт от EMPLOYEE-бота: client_id формы принадлежит HR-боту —
+    # _send возьмёт BOT_CLIENT_ID из .env
+    new_session = await asyncio.to_thread(get_session, uid)
+    start_kb = (keyboards.for_session(new_session, False, selectable_roles())
+                if BUTTONS_ENABLED else None)
+    asyncio.create_task(_send(f"u{uid}", first_msg, BOT_ID,
+                              **_kb_kwargs(start_kb)))
+    # №11: course_id=0 = этап выбора роли (легаси-фолбэк), файл уйдёт
+    # после выбора (хук в bot_handler)
+    if new_session and new_session["course_id"]:
+        asyncio.create_task(_send_course_file(f"u{uid}",
+                                              new_session["course_id"]))
+    role_suffix = f" Роль: {role_name(role_id)}." if role_id else ""
+    if new_session is None:
+        # Открытой сессии нет = маркер «курсов для роли нет» (course_id=0,
+        # DONE) — не врать HR про «отправил первое сообщение» (ревью 01.09)
+        return (f"✅ {fio} ({email}) добавлен в доступ.{role_suffix} "
+                "Курсов для этой роли пока нет — сотрудник получит анонс "
+                "при активации подходящего курса.")
+    return (f"✅ {fio} ({email}) приглашён — отправил ему первое сообщение."
+            + role_suffix)
+
+
+async def _finish_role_change(pending: dict, role_id: str) -> str:
+    """«Роль {email}» → цифра: сменить employees.role в любой момент —
+    единственный способ HR исправить ошибочную роль обучающегося (ревью
+    01.09: повторное «Пригласить» блокируется гейтом «уже проходит»).
+    Сессии не трогаем: текущий курс доезжает, новая роль — со следующего."""
+    uid, fio = pending["uid"], pending["fio"]
+    ok = await asyncio.to_thread(set_employee_role, uid, role_id)
+    if not ok:
+        return f"⚠️ Сотрудник {fio} не найден среди приглашённых."
+    label = role_name(role_id)
+    asyncio.create_task(_send(
+        f"u{uid}",
+        f"ℹ️ HR назначил тебе роль *{label}*. Текущий курс не прерывается; "
+        "следующие курсы будут по новой роли.",
+        BOT_ID))
+    return (f"✅ Роль {fio} теперь {label} — применится со следующего "
+            "курса.")
+
+
+async def _role_pick_input(user_id: str, pending: dict,
+                           raw: str) -> tuple[str, list | None]:
+    """Ответ HR на выбор роли (приглашение / «Роль {email}»): цифра 1–N.
+    Резолв — по СНАПШОТУ options из pending: roles.json могли править руками
+    в 600-секундном окне, цифра должна значить то, что HR видел на экране.
+    Pop pending — ТОЛЬКО после успешного завершения (паттерн визарда: pop
+    после сохранения) — сбой сети/БД не теряет приглашение, HR повторяет
+    цифру; attempt растёт, чтобы ретрай не гасился дедупом."""
+    options = pending["options"]
+    m = re.match(r"^\s*(\d+)\s*[.)]?\s*$", raw.strip())
+    if not m or not (1 <= int(m.group(1)) <= len(options)):
+        pending["expires"] = time.monotonic() + PENDING_EDIT_TTL
+        return ((f"Ответь цифрой от 1 до {len(options)} — роль для "
+                 f"{pending['fio']} (или «Отмена»):\n\n"
+                 + _format_role_list(options)),
+                keyboards.hr_role_select(options))
+    role_id, _label = options[int(m.group(1)) - 1]
+    try:
+        if pending.get("kind") == "role_change":
+            text = await _finish_role_change(pending, role_id)
+        else:
+            text = await _finish_invite(pending["uid"], pending["email"],
+                                        pending["fio"],
+                                        pending["work_position"],
+                                        user_id, role_id)
+    except Exception as exc:
+        print(f"[role-pick] FINISH ERROR ({pending.get('kind')}): {exc!r}")
+        pending["attempt"] = pending.get("attempt", 0) + 1
+        pending["expires"] = time.monotonic() + PENDING_EDIT_TTL
+        return ((f"⚠️ Не получилось завершить (сбой связи или базы). "
+                 f"Ответь цифрой ещё раз — роль для {pending['fio']} — "
+                 "или «Отмена»."),
+                keyboards.hr_role_select(options))
+    _pending_edits.pop(user_id, None)
+    return text, None
+
+
 async def _bitrix_user_by_email(email: str) -> dict | None:
     """user.get по email. Фильтр плоскими полями — как в официальном примере доков
     (data/referance/bitrix24_docs.md, «Примеры кода» user.get); если живьём фильтр
@@ -782,6 +948,10 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
 
 _OPT_BODY_RE = re.compile(r"^[A-D][.)]\s*(.*)$", re.DOTALL)
 
+# 01.09: маркер «в сообщении есть вопрос теста» (format_question:
+# «📝 {label} — Вопрос {i+1}/{total}») — гейт для A–D-клавиатуры
+_QUESTION_RE = re.compile(r"— Вопрос \d+/\d+")
+
 
 async def _test_options(session: dict | None) -> list | None:
     """Тела вариантов текущего вопроса (BASIC_TEST/EXAM) — для BLOCK-кнопок
@@ -815,6 +985,20 @@ async def _session_keyboard(user_id: str) -> list | None:
         fork = (await asyncio.to_thread(_retake_fork_text, user_id)) is not None
     return keyboards.for_session(session, fork, selectable_roles(),
                                  test_options=await _test_options(session))
+
+
+async def _reminder_keyboard(uid: str) -> list | None:
+    """Клавиатура напоминания о дедлайне (№9). Сотруднику в тесте НЕ
+    прикладывать A–D (ревью 01.09: буквы ответов под напоминанием) —
+    вместо них [▶ Продолжить …]; «🏠 Меню» добавит with_main_menu."""
+    if not BUTTONS_ENABLED:
+        return None
+    session = await asyncio.to_thread(get_session, uid)
+    if session and session["state"] in ("BASIC_TEST", "EXAM"):
+        label = ("▶ Продолжить экзамен" if session["state"] == "EXAM"
+                 else "▶ Продолжить тест")
+        return keyboards.start_button(label, "Продолжить")
+    return await _session_keyboard(uid)
 
 
 async def _handle_employee_message(user_id: str, question: str,
@@ -865,16 +1049,23 @@ async def _handle_employee_message(user_id: str, question: str,
                                          test_options=await _test_options(after))
         # Ответ на «Мои курсы» → курсы BLOCK-кнопками (дизайн 17.08).
         # 21.08: меню работает отовсюду — из тестов (⏸ пауза) и при
-        # session None; из паузы первая кнопка — [▶ Продолжить тест]
+        # session None; из паузы первая кнопка — [▶ Продолжить тест].
+        # 01.09 (фидбек юзера «Помощь в паузе возвращает в тест»):
+        # A–D — ТОЛЬКО у сообщения с вопросом; любой другой ответ в
+        # тестовом состоянии (Помощь, Документы, RAG, пауза) получает
+        # resume-навигацию. Tradeoff: RAG-ответ посреди активного теста
+        # теряет A–D под собой — [▶ Продолжить] возвращает вопрос одним
+        # тапом; интуитивность важнее скорости.
         q_lower = question.strip().lower()
         in_test = bool(after and after["state"] in ("BASIC_TEST", "EXAM"))
+        non_question = in_test and not _QUESTION_RE.search(text)
         is_menu = (q_lower in _MENU_COMMANDS
                    and (after is None or after["state"] in
                         ("READING", "WAITING_HR", "EXAM_READY",
                          "BASIC_TEST", "EXAM")))
-        if is_menu or (q_lower in ("выйти", "выход") and in_test):
+        if is_menu or non_question:
             role = (after.get("role") if after
-                    else await asyncio.to_thread(_last_known_role, user_id))
+                    else await asyncio.to_thread(resolve_role_cached, user_id))
             _, selectable = await asyncio.to_thread(my_courses, user_id, role)
             retake = False
             if after is None:
@@ -884,7 +1075,8 @@ async def _handle_employee_message(user_id: str, question: str,
                 [(c["n"], display_name(c["doc_name"]), c["status"])
                  for c in selectable],
                 reading=bool(after and after["state"] == "READING"),
-                resume_test=in_test, retake=retake)
+                resume_test=in_test, retake=retake,
+                resume_exam=bool(after and after["state"] == "EXAM"))
             if menu_kb:
                 keyboard = menu_kb
 
@@ -977,7 +1169,7 @@ def _course_recipients(course: dict) -> list[str]:
                 if s["state"] == "DONE"}
         if course["id"] in done:
             continue
-        role = _last_known_role(uid)
+        role = resolve_role_cached(uid)
         if role and ({role, ALL_STAFF} & croles):
             uids.append(uid)
         elif role is None and ALL_STAFF in croles:
@@ -1004,7 +1196,7 @@ def _standard_recipients(doc_roles: list[str]) -> list[str]:
     uids = []
     for e in get_all_employees():
         uid = e["bitrix_uid"]
-        role = _last_known_role(uid)
+        role = resolve_role_cached(uid)
         if role and ({role, ALL_STAFF} & doc):
             uids.append(uid)
         elif role is None and ALL_STAFF in doc:
@@ -1051,12 +1243,14 @@ async def _handle_hr_message(user_id: str, question: str,
                              dedup_key: str | None = None) -> None:
     """Общий путь HR-бота: текст из чата ("/hr") и нажатие HR-кнопки
     ("/command", команда hrsay) обрабатываются одинаково."""
-    # Внутри визарда ключ дедупа включает шаг: «.» на соседних шагах легальна,
-    # дубль-доставка ответа на ОДИН шаг гасится.
+    # Ключ дедупа: суффикс pending'а — ТОЛЬКО у сообщений, которые реально
+    # уйдут в pending-обработчик (эскейпы дедупятся по голому ключу — ретрай
+    # вебхука «Пригласить» при живом pending раньше двоил промпт).
     wiz = _get_pending(user_id)
+    msg_lower = question.lower()
     key = dedup_key or question
-    if wiz:
-        key = f"{key}#step{wiz.get('step', '')}"
+    if wiz and not _is_pending_escape(msg_lower):
+        key = _pending_dedup_key(key, wiz)
     if _is_duplicate(user_id, dialog_id, key):
         print(f"DEDUP skip HR (dialog={dialog_id}): {question!r}")
         return
@@ -1073,23 +1267,32 @@ async def _handle_hr_message(user_id: str, question: str,
         return
 
     kb: list | None = None  # клавиатура ветки; уходит только при BUTTONS_ENABLED
-    msg_lower = question.lower()
 
-    # ── Двухшаговая правка вопроса: живой pending перехватывает сообщение ────
+    # ── Живой pending перехватывает сообщение: визард правки вопроса или
+    # выбор роли (приглашение / «Роль {email}») ──────────────────────────────
     pending = _get_pending(user_id)
     if pending:
+        role_pick = pending.get("kind") in ("invite", "role_change")
         if msg_lower in ("отмена", "cancel"):
             _pending_edits.pop(user_id, None)
-            asyncio.create_task(_send(dialog_id, "Правка отменена.",
+            cancel_text = await asyncio.to_thread(_pending_cancel_text,
+                                                  pending)
+            asyncio.create_task(_send(dialog_id, cancel_text,
                                       HR_BOT_ID, client_id))
             return
-        if not msg_lower.startswith(_HR_COMMAND_PREFIXES):
-            text, kb = await _wizard_input(user_id, pending, question)
+        if not _is_pending_escape(msg_lower):
+            handler = _role_pick_input if role_pick else _wizard_input
+            text, kb = await handler(user_id, pending, question)
             asyncio.create_task(_send(
                 dialog_id, text, HR_BOT_ID, client_id,
                 **_kb_kwargs(kb if BUTTONS_ENABLED else None)))
             return
-        _pending_edits.pop(user_id, None)  # команда важнее забытой правки
+        # Команда/«Меню» важнее забытого pending; выбор роли не бросаем молча
+        _pending_edits.pop(user_id, None)
+        dropped = _pending_dropped_text(pending)
+        if dropped:
+            asyncio.create_task(_send(dialog_id, dropped, HR_BOT_ID,
+                                      client_id))
 
     m_courses = re.match(r"^(?:курсы|курс|список)(?:\s+(\d+))?$", msg_lower)
     if m_courses:
@@ -1163,37 +1366,41 @@ async def _handle_hr_message(user_id: str, question: str,
                     uid = str(user.get("ID"))
                     fio = (f"{user.get('NAME', '')} {user.get('LAST_NAME', '')}".strip()
                            or email)
-                    await asyncio.to_thread(
-                        add_employee, uid, email, fio, user_id,
-                        (user.get("WORK_POSITION") or "").strip() or None)
+                    position = (user.get("WORK_POSITION") or "").strip() or None
+                    options = selectable_roles()
                     if await asyncio.to_thread(get_session, uid):
-                        text = f"ℹ️ {fio} уже проходит обучение."
+                        # Повторное приглашение освежает email/ФИО (как раньше);
+                        # роль НЕ трогаем — для смены есть «Роль {email}»
+                        await asyncio.to_thread(add_employee, uid, email, fio,
+                                                user_id, position)
+                        current = await asyncio.to_thread(_employee_role_name,
+                                                          uid)
+                        text = (f"ℹ️ {fio} уже проходит обучение "
+                                f"(роль: {current}). "
+                                f"Сменить роль: Роль {email}")
+                    elif options and await asyncio.to_thread(get_active_courses):
+                        # 01.09: роль выбирает HR — цифрой/кнопкой, не сотрудник.
+                        # В whitelist пишем ПОСЛЕ выбора («Отмена» = не приглашён);
+                        # без активных курсов роль не спрашиваем (прежний ответ).
+                        # options — СНАПШОТ: цифра резолвится по списку,
+                        # который HR видел, даже если roles.json поправят
+                        _pending_edits[user_id] = {
+                            "kind": "invite", "uid": uid, "email": email,
+                            "fio": fio, "work_position": position,
+                            "options": options,
+                            "expires": time.monotonic() + PENDING_EDIT_TTL,
+                        }
+                        text = (f"🧑‍💼 {fio} ({email}) найден. "
+                                "Выбери роль сотрудника:\n\n"
+                                + _format_role_list(options)
+                                + "\n\nОтветь цифрой (например: 1). "
+                                  "«Отмена» — не приглашать.")
+                        kb = keyboards.hr_role_select(options)
                     else:
-                        first_msg = await asyncio.to_thread(
-                            start_onboarding, uid, f"u{uid}"
-                        )
-                        if first_msg is None:
-                            text = (
-                                f"✅ {fio} добавлен в доступ. Активных курсов нет — "
-                                f"после активации курса отправь: Пригласить {email}"
-                            )
-                        else:
-                            # Автостарт идёт от EMPLOYEE-бота: client_id формы
-                            # принадлежит HR-боту — _send возьмёт BOT_CLIENT_ID из .env
-                            new_session = await asyncio.to_thread(get_session, uid)
-                            start_kb = (keyboards.for_session(
-                                new_session, False, selectable_roles())
-                                if BUTTONS_ENABLED else None)
-                            asyncio.create_task(_send(f"u{uid}", first_msg,
-                                                      BOT_ID,
-                                                      **_kb_kwargs(start_kb)))
-                            # №11: course_id=0 = этап выбора роли, файл уйдёт
-                            # после выбора (хук в bot_handler)
-                            if new_session and new_session["course_id"]:
-                                asyncio.create_task(_send_course_file(
-                                    f"u{uid}", new_session["course_id"]))
-                            text = (f"✅ {fio} ({email}) приглашён — "
-                                    "отправил ему первое сообщение.")
+                        # Легаси: конфиг ролей пуст или курсов нет —
+                        # прежний путь без выбора роли
+                        text = await _finish_invite(uid, email, fio,
+                                                    position, user_id)
 
     elif msg_lower.startswith("допустить"):
         parts = question.split()
@@ -1422,7 +1629,10 @@ async def _handle_hr_message(user_id: str, question: str,
         parts = question.split()
         email = _extract_email(question)
         sub = parts[1].lower() if len(parts) >= 2 else ""
-        if len(parts) == 1:
+        # 01.09 (фидбек юзера): голое «Руководитель» (кнопка «⚙️ Править
+        # руководителей») раньше показывало СПИСОК, как «Руководители», —
+        # подсказка формата правки была недостижима; теперь она в else
+        if len(parts) == 1 and msg_lower == "руководители":
             managers = await asyncio.to_thread(get_managers)
             if managers:
                 mlines = ["👥 Руководители (получают эскалации):"]
@@ -1509,10 +1719,49 @@ async def _handle_hr_message(user_id: str, question: str,
                 text = (f"✅ Сотрудник {target} "
                         + ("может выбирать роль сам (команда «Роль»)."
                            if allow else
-                           "больше не выбирает роль — она определяется отделом."))
+                           "больше не выбирает роль — её назначает HR "
+                           "(или отдел Битрикса)."))
             else:
                 text = (f"⚠️ Сотрудник {target} не найден среди приглашённых. "
                         "Сначала: Пригласить {email}")
+
+    elif msg_lower == "роль":
+        text = ("⚙️ Напиши: Роль {email или ID} — сменю роль сотрудника "
+                "(спрошу цифрой из списка).\n"
+                "Право самостоятельной смены: Роль разрешить/запретить "
+                "{email или ID}.")
+
+    elif re.match(r"^роль\s+\S+$", msg_lower):
+        # 01.09: смена роли сотрудника HR-ом в любой момент — повторное
+        # «Пригласить» блокируется гейтом «уже проходит обучение»
+        target = question.split(maxsplit=1)[1].strip()
+        email = _extract_email(question)
+        if email:
+            emp = await asyncio.to_thread(get_employee_by_email, email)
+        else:
+            emp = await asyncio.to_thread(get_employee, target)
+        if emp is None:
+            text = (f"⚠️ {target} не найден среди приглашённых. "
+                    f"Сначала: Пригласить {target}")
+        else:
+            options = selectable_roles()
+            if not options:
+                text = "⚠️ Реестр ролей пуст — сменить роль нельзя."
+            else:
+                fio = emp.get("full_name") or emp["bitrix_uid"]
+                current = await asyncio.to_thread(_employee_role_name,
+                                                  emp["bitrix_uid"])
+                _pending_edits[user_id] = {
+                    "kind": "role_change", "uid": emp["bitrix_uid"],
+                    "fio": fio, "email": emp.get("email"),
+                    "options": options,
+                    "expires": time.monotonic() + PENDING_EDIT_TTL,
+                }
+                text = (f"🧑‍💼 Кем назначить {fio}? Сейчас роль: {current}.\n\n"
+                        + _format_role_list(options)
+                        + "\n\nОтветь цифрой (например: 1). "
+                          "«Отмена» — оставить как есть.")
+                kb = keyboards.hr_role_select(options)
 
     else:
         text = (
@@ -1526,9 +1775,11 @@ async def _handle_hr_message(user_id: str, question: str,
             "• *Изменить {курс} {вопрос 1–15}* — править вопрос курса\n"
             "  Например: *Изменить 44 6* — откроет правку шестого вопроса курса №44.\n"
             "• *Пригласить {email}* — дать доступ и начать обучение\n"
-            "  Например: *Пригласить n.sharapov@proptech.digital* — сотрудник получит доступ и первое сообщение.\n"
+            "  Например: *Пригласить n.sharapov@proptech.digital* — бот спросит роль сотрудника (цифрой), затем сотрудник получит доступ и первое сообщение.\n"
             "• *Допустить {email или ID}* — допустить сотрудника к экзамену\n"
             "  Например: *Допустить n.sharapov@proptech.digital* — откроет экзамен после базового теста.\n"
+            "• *Роль {email или ID}* — сменить роль сотрудника\n"
+            "  Например: *Роль n.sharapov@proptech.digital* — покажу список ролей, ответь цифрой; применится со следующего курса.\n"
             "• *История {email или ID}* — вопросы и ответы сотрудника\n"
             "  Например: *История n.sharapov@proptech.digital* — покажет ход и результаты обучения.\n"
             "• *Отчёт* — сводка: кто прошёл обучение и с каким результатом\n"

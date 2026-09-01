@@ -195,11 +195,68 @@ def test_role_remembered_after_done(env):
 
     reply = sm.process_message("u1", "привет", "d1", [], None)
     assert "1. Горничная" not in reply                      # меню НЕ показано
+    # 01.09 (ревью): выбор в меню НЕ пишет employees.role — роль легаси-
+    # сотрудника приходит из памяти сессии («помню»), не из ветки HR
     assert "помню" in reply
     new = db.get_session("u1")
     assert new["role"] == "admin_reception"
     # следующий непройденный для роли — all_staff «Стандарты»
     assert new["course_id"] == db.get_course_by_doc_name("Стандарты.docx")["id"]
+
+
+def test_role_switch_is_temporary_for_hr_assigned(env, monkeypatch):
+    """01.09 (ревью): «Роль» сотрудника НЕ пишет employees.role — просмотр
+    другой роли сессионный, на следующем курсе возвращается HR-роль."""
+    monkeypatch.setattr(sm, "notify_hr", lambda text: None)
+    db.set_employee_role("u1", "housekeeper")
+    fo_id = _add_course("FO Ресепшн.docx", "d-fo")
+    hskp_id = _add_course("HSKP Уборка.docx", "d-h")
+    sm.process_message("u1", "привет", "d1", [], None)      # авто: HR-роль
+    session = db.get_session("u1")
+    assert session["role"] == "housekeeper"
+
+    reply = sm.process_message("u1", "Роль", "d1", [], None)
+    assert "1." in reply                                    # меню открылось
+    reply = sm.process_message("u1", "2", "d1", [], None)   # admin_reception
+    assert "временно" in reply                              # честная приписка
+    assert db.get_session("u1")["role"] == "admin_reception"
+    assert db.get_employee("u1")["role"] == "housekeeper"   # HR-роль цела
+
+    db.update_session(db.get_session("u1")["id"], state="DONE")
+    reply = sm.process_message("u1", "привет", "d1", [], None)
+    # следующий курс — снова по HR-роли (не по подсмотренной): FO-курс мимо
+    assert "назначил HR" in reply
+    new = db.get_session("u1")
+    assert new["role"] == "housekeeper"
+    assert new["course_id"] in (hskp_id,
+                                db.get_course_by_doc_name("Стандарты.docx")["id"])
+    assert new["course_id"] != fo_id
+
+
+def test_exit_outside_test_not_rag(env):
+    """01.09: «Выйти» вне теста — вежливый ответ, не RAG."""
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)           # READING
+    reply = sm.process_message("u1", "Выйти", "d1", [], None)
+    assert "нет активного теста" in reply
+    assert "MOCK_ANSWER" not in reply
+
+
+def test_exam_pause_says_exam(env, monkeypatch):
+    """01.09: пауза в экзамене называется экзаменом."""
+    monkeypatch.setattr(sm, "notify_hr", lambda text: None)
+    course = db.get_course_by_doc_name("Стандарты.docx")
+    db.update_course_questions(course["id"],
+                               json.dumps(_EXAM2, ensure_ascii=False))
+    sm.process_message("u1", "привет", "d1", [], None)
+    sm.process_message("u1", "1", "d1", [], None)
+    sm.process_message("u1", "Готов", "d1", [], None)
+    sm.process_message("u1", "A", "d1", [], None)           # базовый сдан
+    sm.process_message("u1", "Начать", "d1", [], None)      # EXAM
+    assert db.get_session("u1")["state"] == "EXAM"
+    reply = sm.process_message("u1", "Выйти", "d1", [], None)
+    assert "Экзамен на паузе" in reply and "Тест на паузе" not in reply
+    assert "пауза экзамена" in sm._STATE_HINTS["EXAM"]
 
 
 def test_legacy_all_done_message(env, monkeypatch):

@@ -103,9 +103,12 @@ def for_session(session: dict | None, fork: bool = False,
                 _btn("❓ Помощь", "Помощь", width=130, role="service")]
     if state in ("BASIC_TEST", "EXAM"):
         # Короткие варианты (все ≤24) — BLOCK с текстом: нажатие не требует
-        # сверки с сообщением; payload — буква (parse_answer)
+        # сверки с сообщением; payload — буква (parse_answer).
+        # 01.09: в экзамене кнопка называет экзамен (payload прежний)
+        pause_label = ("⏸ Отложить экзамен" if state == "EXAM"
+                       else "⏸ Отложить тест")
         pause = [dict(_NEWLINE),
-                 _btn("⏸ Отложить тест", "Выйти", width=160, role="service"),
+                 _btn(pause_label, "Выйти", width=160, role="service"),
                  _btn("❓ Помощь", "Помощь", width=130, role="service")]
         if (test_options and len(test_options) == 4
                 and all(len(b) <= 24 for b in test_options)):
@@ -135,16 +138,20 @@ _STATUS_EMOJI = {"admitted": "🎓", "waiting": "⏳", "todo": "⏳",
 
 
 def courses_menu(items: list, reading: bool = False,
-                 resume_test: bool = False, retake: bool = False) -> list | None:
+                 resume_test: bool = False, retake: bool = False,
+                 resume_exam: bool = False) -> list | None:
     """Ответ на «Мои курсы»: items = [(n, name, status)] ТОЛЬКО выбираемых
     курсов (n = номер «Выбрать N» из my_courses — FSM-совместимость).
     ≤6 — BLOCK с названием (≤38…), больше — сетка «Выбрать N» 3×96.
     Текущий и пройденные курсы кнопками не делаются (нажимать незачем).
     resume_test (21.08, тупик паузы) — primary [▶ Продолжить тест] вместо
-    «Готов»; retake — [🔁 Пересдать экзамен] после курсов."""
+    «Готов» (01.09: resume_exam=True называет экзамен, payload прежний);
+    retake — [🔁 Пересдать экзамен] после курсов."""
     rows: list = []
     if resume_test:
-        rows += [_btn("▶ Продолжить тест", "Продолжить", display="BLOCK",
+        resume_label = ("▶ Продолжить экзамен" if resume_exam
+                        else "▶ Продолжить тест")
+        rows += [_btn(resume_label, "Продолжить", display="BLOCK",
                       role="primary"), dict(_NEWLINE)]
     elif reading:
         rows += [_btn("✅ Готов к тесту", "Готов", display="BLOCK",
@@ -298,6 +305,23 @@ def hr_wizard_confirm() -> list:
 
 def hr_cancel_edit() -> list:
     return [_hr_btn("Отмена", width=120, role="service")]
+
+
+def hr_role_select(options: list) -> list:
+    """01.09: выбор роли приглашаемого — HR-зеркало employee-ROLE_SELECT
+    (payload — цифра, её ловит pending «Пригласить» в _handle_hr_message).
+    ≤8 ролей — BLOCK с названием, больше — сетка цифр 5×52 (292px)."""
+    if len(options) <= 8:
+        rows = [_hr_btn(f"{i} · {_trim(name, 38)}", str(i), display="BLOCK")
+                for i, (_rid, name) in enumerate(options, 1)]
+    else:
+        rows = []
+        for i in range(1, len(options) + 1):
+            if i > 1 and (i - 1) % 5 == 0:
+                rows.append(dict(_NEWLINE))
+            rows.append(_hr_btn(str(i), width=52))
+    rows += [dict(_NEWLINE), _hr_btn("Отмена", width=120, role="service")]
+    return rows
 
 
 def hr_invite(email: str) -> list:

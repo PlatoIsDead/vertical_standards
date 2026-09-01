@@ -70,7 +70,8 @@ _HELP_TEXT = (
     "• Отвечаю на вопросы по стандартам твоего отдела — просто напиши вопрос\n"
     "• *Мои курсы* — твоё обучение и переключение между курсами\n"
     "• *Документы* — стандарты твоего отдела со ссылками\n"
-    "• *Готов* — начать тест по текущему курсу · *Выйти* — пауза теста\n"
+    "• *Готов* — начать тест по текущему курсу · *Выйти* — пауза · "
+    "*Продолжить* — вернуться к тесту\n"
     "• *Роль* — сменить роль\n"
     "• *Помощь* — показать эту подсказку ещё раз"
 )
@@ -83,7 +84,7 @@ _STATE_HINTS = {
     "READING": ("Что дальше: *Готов* — начать тест · *Мои курсы* · "
                 "*Документы* · или просто задай вопрос по стандарту"),
     "BASIC_TEST": "Что дальше: ответь буквой A–D · *Выйти* — пауза теста",
-    "EXAM": "Что дальше: ответь буквой A–D · *Выйти* — пауза теста",
+    "EXAM": "Что дальше: ответь буквой A–D · *Выйти* — пауза экзамена",
     "WAITING_HR": ("Что дальше: жди допуска HR · *Мои курсы* · *Документы* · "
                    "задавай вопросы по стандартам"),
     "EXAM_READY": ("Что дальше: *Начать* — начать экзамен · *Мои курсы* · "
@@ -143,9 +144,9 @@ def _dispatch(user_id: str, message: str, dialog_id: str,
         # раньше их съедал retake-форк или они молча назначали новый курс
         # (живой тупик Дмитрия на встрече 21.08)
         if cmd in _MENU_COMMANDS:
-            return my_courses(user_id, _last_known_role(user_id))[0]
+            return my_courses(user_id, resolve_role_cached(user_id))[0]
         if cmd in _DOC_COMMANDS:
-            return _my_documents_text(_last_known_role(user_id), chunks)
+            return _my_documents_text(resolve_role_cached(user_id), chunks)
         if cmd in ("пересдать", "пересдача"):
             return _handle_retake(user_id)
         if cmd != "далее":
@@ -158,17 +159,16 @@ def _dispatch(user_id: str, message: str, dialog_id: str,
                 "Добро пожаловать! Активных курсов обучения пока нет.\n"
                 "Обратитесь к HR-менеджеру для назначения обучения."
             )
-        # №11/№8: курс — после роли. Приоритет: отдел Битрикса → память
-        # прошлой сессии → меню; до выбора сессия с сентинелом course_id=0.
+        # №11/№8/01.09: курс — после роли. Приоритет resolve_role: выбор HR
+        # → отдел Битрикса → память прошлой сессии → меню (легаси);
+        # до выбора сессия с сентинелом course_id=0.
         if selectable_roles():
-            auto_role = _role_from_profile(user_id)
-            if auto_role:
-                return _assign_course(user_id, dialog_id, auto_role, None,
-                                      by_department=True)
-            role = _last_known_role(user_id)
+            role, source = resolve_role(user_id)
             if role:
                 return _assign_course(user_id, dialog_id, role, None,
-                                      remembered=True)
+                                      remembered=source == "memory",
+                                      by_department=source == "department",
+                                      by_hr=source == "hr")
             create_session(user_id, dialog_id, 0, state="ROLE_SELECT")
             return _start_role_select()
         course = pick_course_for_role(active_courses, None,
@@ -193,9 +193,9 @@ def _dispatch(user_id: str, message: str, dialog_id: str,
         return _handle_exam_ready(session, message, chunks, embeddings)
     elif state == "EXAM":
         return _handle_test(session, message, "exam", chunks)
-    elif state == "DONE":
-        return _handle_done(session)
     else:
+        # DONE сюда не попадает: get_session отдаёт только незакрытые строки
+        # (state != 'DONE') — завершённые идут веткой session is None выше
         return f"Неизвестное состояние сессии ({state!r}). Обратитесь к HR."
 
 
@@ -210,15 +210,14 @@ def start_onboarding(user_id: str, dialog_id: str) -> str | None:
     courses = get_active_courses()
     if not courses:
         return None
-    # Зеркало ветки session is None в process_message (№11/№8)
+    # Зеркало ветки session is None в process_message (№11/№8/01.09)
     if selectable_roles():
-        auto_role = _role_from_profile(user_id)
-        if auto_role:
-            return _assign_course(user_id, dialog_id, auto_role, None,
-                                  by_department=True)
-        role = _last_known_role(user_id)
+        role, source = resolve_role(user_id)
         if role:
-            return _assign_course(user_id, dialog_id, role, None, remembered=True)
+            return _assign_course(user_id, dialog_id, role, None,
+                                  remembered=source == "memory",
+                                  by_department=source == "department",
+                                  by_hr=source == "hr")
         create_session(user_id, dialog_id, 0, state="ROLE_SELECT")
         return _start_role_select()
     course = pick_course_for_role(courses, None, _done_course_ids(user_id))
@@ -314,6 +313,40 @@ def _last_known_role(user_id: str) -> str | None:
     return None
 
 
+def _hr_assigned_role(user_id: str) -> str | None:
+    """01.09: роль, назначенная HR («Пригласить» / «Роль {email}») —
+    employees.role, пишет ТОЛЬКО HR. Явный выбор HR — главнее авто-роли по
+    отделу и памяти сессии. Роль, пропавшая из реестра, игнорируется."""
+    emp = get_employee(user_id)
+    role = (emp or {}).get("role")
+    valid = load_roles_config().get("roles", {})
+    return role if role and role in valid else None
+
+
+def resolve_role(user_id: str) -> tuple[str | None, str | None]:
+    """Единая резолюция роли для НАЗНАЧЕНИЯ курса: (role_id, источник).
+    Источник: "hr" → "department" (№8) → "memory" (прошлая сессия);
+    (None, None) — роль неизвестна, сотруднику показывается меню."""
+    role = _hr_assigned_role(user_id)
+    if role:
+        return role, "hr"
+    role = _role_from_profile(user_id)
+    if role:
+        return role, "department"
+    role = _last_known_role(user_id)
+    if role:
+        return role, "memory"
+    return None, None
+
+
+def resolve_role_cached(user_id: str) -> str | None:
+    """Роль для потребителей-циклов (рассылки, дедлайны, меню) — БЕЗ сети:
+    HR-назначение → память сессии. Авто-роль по отделу сюда не входит —
+    _role_from_profile может звать user.get (httpx), а эти вызовы идут в
+    цикле по всем сотрудникам (флап-риск; см. PRP invite-hardening)."""
+    return _hr_assigned_role(user_id) or _last_known_role(user_id)
+
+
 def _live_departments(user_id: str) -> list | None:
     """user.get по ID (сотрудник вне WATCH_DEPARTMENT_IDS не попадает в
     seen_portal_users). Любой сбой → None: флап сети не ломает онбординг."""
@@ -350,7 +383,7 @@ def _role_from_profile(user_id: str) -> str | None:
 
 def _assign_course(user_id: str, dialog_id: str, role_id: str,
                    session: dict | None, remembered: bool = False,
-                   by_department: bool = False) -> str:
+                   by_department: bool = False, by_hr: bool = False) -> str:
     """Назначить первый подходящий курс (роль/all_staff, непройденный).
 
     session — живая ROLE_SELECT-сессия (course_id=0) либо None (роль вспомнили
@@ -369,11 +402,18 @@ def _assign_course(user_id: str, dialog_id: str, role_id: str,
         elif not already_flagged:
             marker = create_session(user_id, dialog_id, 0, state="DONE")
             update_session(marker["id"], role=role_id)
-        if not already_flagged:
+        if not already_flagged and not by_hr:
+            # by_hr: роль только что назначил сам HR («Пригласить» /
+            # «Роль {email}») и он уже получил «курсов для роли нет» —
+            # «сотрудник запросил обучение» было бы ложью (ревью 01.09)
             notify_hr(
-                f"👀 Сотрудник (ID: {user_id}) с ролью «{role_name(role_id)}» "
-                "запросил обучение — подходящих активных курсов нет."
+                f"👀 Сотрудник {_employee_label(user_id)} с ролью "
+                f"«{role_name(role_id)}» запросил обучение — подходящих "
+                "активных курсов нет."
             )
+        if by_hr:
+            return (f"📚 Твоя роль: *{role_name(role_id)}* (назначил HR). "
+                    "Подходящих курсов пока нет — напишу, когда появятся.")
         return ("📚 Для твоей роли пока нет назначенных курсов. "
                 "HR уже в курсе — получишь сообщение, когда курс появится.")
     if session:
@@ -384,7 +424,9 @@ def _assign_course(user_id: str, dialog_id: str, role_id: str,
         session = create_session(user_id, dialog_id, course["id"])
         update_session(session["id"], role=role_id)
     role_line = f"✅ Твоя роль: *{role_name(role_id)}*"
-    if remembered:
+    if by_hr:
+        role_line += " (назначил HR; сменить её может HR)"
+    elif remembered:
         role_line += " (помню с прошлого обучения; сменить — команда «Роль»)"
     elif by_department:
         role_line += " (по отделу; сменить — команда «Роль»)"
@@ -432,13 +474,21 @@ def _handle_role_select(session: dict, message: str) -> str:
         )
 
     role_id, role_label = options[int(m.group(1)) - 1]
+    # 01.09 (ревью): employees.role пишет ТОЛЬКО HR («Пригласить» /
+    # «Роль {email}») — выбор сотрудника в меню живёт в session.role:
+    # «посмотреть другую роль» не должен затирать назначение HR.
     if session["course_id"]:
         # Смена роли командой «Роль»: курс уже назначен — НЕ переназначаем
         # (сессия привязана; тестовый инструмент для просмотра других ролей)
         course = get_course_by_id(session["course_id"])
         if course:
             update_session(session["id"], state="READING", role=role_id)
-            return f"✅ Твоя роль: *{role_label}*\n\n" + _start_reading(session, course)
+            note = ""
+            if _hr_assigned_role(session["user_id"]):
+                note = ("\n_(временно, до следующего курса — постоянную "
+                        "роль назначает HR)_")
+            return (f"✅ Твоя роль: *{role_label}*{note}\n\n"
+                    + _start_reading(session, course))
     return _assign_course(session["user_id"], session["dialog_id"],
                           role_id, session)
 
@@ -532,9 +582,11 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
             # Обогащение для BLOCK-кнопок (дизайн 17.08): номер «Выбрать N»
             # и статус едут вместе с курсом, контракт (text, selectable) прежний
             c["n"] = n
-            if state == "BASIC_TEST" or (state == "EXAM" and q_idx > 0):
-                c["status"] = "paused"       # 19.08: тест на паузе
-            elif state in ("EXAM", "EXAM_READY"):
+            if state in ("BASIC_TEST", "EXAM"):
+                # 01.09: EXAM q_idx=0 — экзамен УЖЕ начат (вопрос 1 показан),
+                # «допущен» было бы враньём; «допущен» — только EXAM_READY
+                c["status"] = "paused"       # 19.08: тест/экзамен на паузе
+            elif state == "EXAM_READY":
                 c["status"] = "admitted"
             elif state == "WAITING_HR":
                 c["status"] = "waiting"
@@ -545,9 +597,9 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
             elif state == "BASIC_TEST":
                 lines.append(f"{n}. ⏸ {name} — базовый тест на вопросе "
                              f"{q_idx + 1}")
-            elif state == "EXAM" and q_idx > 0:
+            elif state == "EXAM":
                 lines.append(f"{n}. ⏸ {name} — экзамен на вопросе {q_idx + 1}")
-            elif state in ("EXAM", "EXAM_READY"):
+            elif state == "EXAM_READY":
                 lines.append(f"{n}. 🎓 {name} — допущен к экзамену")
             else:
                 lines.append(f"{n}. ⏳ {name}")
@@ -637,18 +689,23 @@ def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> st
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    if cmd in ("выйти", "выход"):
+        # 01.09: раньше уходило в RAG — бот отвечал «по стандартам» на
+        # служебную команду; хинт состояния допишет _with_hint
+        return "Сейчас нет активного теста — откладывать нечего."
     if cmd in ("пересдать", "пересдача"):
         # Реактивация DONE-сессии при живой текущей дала бы ДВЕ активные —
         # get_session вернул бы не ту. Пересдача — только между курсами.
         return ("Сначала закончи текущий курс — пересдать прошлый экзамен "
                 "можно будет после него.")
     if cmd == "роль":
-        # 19.08: право смены роли выдаёт HR; гейт активен только когда
-        # авто-роль по отделу вообще ВОЗМОЖНА (departments замаплен)
+        # 19.08: право смены роли выдаёт HR; гейт активен только когда роль
+        # назначена ИЗВНЕ — HR при «Пригласить» (01.09) или отделом (№8)
         emp = get_employee(session["user_id"])
         if (emp is not None and not emp.get("can_switch_role", 1)
-                and _role_from_profile(session["user_id"])):
-            return ("🔒 Твоя роль определяется отделом. "
+                and (_hr_assigned_role(session["user_id"])
+                     or _role_from_profile(session["user_id"]))):
+            return ("🔒 Твою роль назначает HR. "
                     "Право выбора ролей выдаёт HR.")
         update_session(session["id"], state="ROLE_SELECT")
         return _start_role_select()
@@ -757,9 +814,11 @@ def _handle_test(session: dict, message: str, phase: str,
     if cmd in _MENU_COMMANDS:
         return _my_courses_text(session["user_id"], session.get("role"))
     if cmd in ("выйти", "выход"):
-        return (f"⏸ Тест на паузе (вопрос {q_idx + 1}/{total}, прогресс "
+        # 01.09: экзамен называется экзаменом (фидбек юзера)
+        label = "Экзамен" if phase == "exam" else "Тест"
+        return (f"⏸ {label} на паузе (вопрос {q_idx + 1}/{total}, прогресс "
                 "сохранён).\n\n"
-                "Что дальше — пока тест на паузе, можно:\n"
+                f"Что дальше — пока {label.lower()} на паузе, можно:\n"
                 "• ▶ *Продолжить* — вернуться к тому же вопросу\n"
                 "• *Выбрать {номер}* — перейти к другому курсу\n"
                 "• *Документы* — открыть список стандартов\n"
@@ -914,6 +973,8 @@ def _handle_waiting_hr(session: dict, message: str,
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    if cmd in ("выйти", "выход"):
+        return "Сейчас нет активного теста — откладывать нечего."
     if cmd in ("пересдать", "пересдача"):
         return ("Пересдать прошлый экзамен можно будет после завершения "
                 "текущего курса.")
@@ -936,6 +997,9 @@ def _handle_exam_ready(session: dict, message: str,
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    if cmd in ("выйти", "выход"):
+        return ("Сейчас нет активного теста — откладывать нечего. "
+                "Экзамен ещё не начат.")
     if cmd in ("пересдать", "пересдача"):
         return ("Пересдать прошлый экзамен можно будет после завершения "
                 "текущего курса.")
@@ -948,22 +1012,6 @@ def _handle_exam_ready(session: dict, message: str,
         return ("🎓 Экзамен — поехали!\n\n"
                 + format_question(q_list[0], 0, len(q_list), "exam"))
     return _rag_reply(session, message, chunks, embeddings)
-
-
-def _handle_done(session: dict) -> str:
-    basic_answers = get_session_answers(session["id"], "basic")
-    exam_answers = get_session_answers(session["id"], "exam")
-    basic_score = sum(1 for a in basic_answers if a["is_correct"] == 1)
-    exam_score = sum(1 for a in exam_answers if a["is_correct"] == 1)
-    tail = "\nЧто дальше: *Мои курсы* · *Документы*"
-    if _retake_fork_text(session["user_id"]):
-        tail += " · *Пересдать*"
-    return (
-        f"📊 Твои результаты обучения:\n"
-        f"• Базовый тест: {basic_score}/{len(basic_answers)}\n"
-        f"• Экзамен: {exam_score}/{len(exam_answers)}\n\n"
-        "Обучение завершено." + tail
-    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

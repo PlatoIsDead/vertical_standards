@@ -412,7 +412,8 @@ def test_my_courses_open_state_labels(monkeypatch):
     ])
     text, sel = sm.my_courses("u1", None)
     assert "ждёт допуска HR" in text
-    assert "допущен к экзамену" in text
+    # 01.09: EXAM-строка = экзамен уже начат (вопрос показан), не «допущен»
+    assert "экзамен на вопросе 1" in text
     assert len(sel) == 2 and "напиши *Выбрать" in text
 
 
@@ -513,7 +514,9 @@ def test_notify_hr_about_user_invite_button(send_trap, monkeypatch):
     assert send_trap[0]["keyboard"] is None
 
 
-def test_invite_autostart_keyboard(hr_env, monkeypatch):
+def test_invite_role_prompt_keyboard(hr_env, monkeypatch):
+    """01.09: «Пригласить» сперва спрашивает роль у HR — кнопки-цифры hrsay;
+    после ответа цифрой автостарт уходит сотруднику."""
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
     monkeypatch.setattr(bot, "selectable_roles", lambda: [("a", "A"), ("b", "B")])
 
@@ -522,20 +525,34 @@ def test_invite_autostart_keyboard(hr_env, monkeypatch):
                 "EMAIL": "ivan@x.ru"}
 
     monkeypatch.setattr(bot, "_bitrix_user_by_email", fake_lookup)
+    monkeypatch.setattr(bot, "get_active_courses", lambda: [{"id": 1}])
     monkeypatch.setattr(bot, "add_employee", lambda *a, **kw: None)
+    roles_set = {}
+    monkeypatch.setattr(bot, "set_employee_role",
+                        lambda uid, rid: roles_set.update({uid: rid}) or True)
     started = {}
     monkeypatch.setattr(bot, "start_onboarding",
-                        lambda uid, d: started.update(uid=uid) or "Выбери роль")
+                        lambda uid, d: started.update(uid=uid) or "Поехали")
     monkeypatch.setattr(
         bot, "get_session",
-        lambda uid: ({"course_id": 0, "state": "ROLE_SELECT"}
+        lambda uid: ({"course_id": 0, "state": "READING", "role": "b"}
                      if started else None))
     client, captured = hr_env
     _post_hr(client, "Пригласить ivan@x.ru")
-    assert _wait_for(lambda: any(c["dialog"] == "u500" for c in captured))
-    emp = next(c for c in captured if c["dialog"] == "u500")
+
+    assert _wait_for(lambda: any(c["dialog"] == "dhr" for c in captured))
+    prompt = next(c for c in captured if c["dialog"] == "dhr")
+    assert "Выбери роль" in prompt["text"]
     assert [(b["TEXT"], b["COMMAND_PARAMS"])
-            for b in _btns(emp["keyboard"])] == [("1 · A", "1"), ("2 · B", "2")]
+            for b in _btns(prompt["keyboard"])] == \
+        [("1 · A", "1"), ("2 · B", "2"), ("Отмена", "Отмена")]
+    assert all(b["COMMAND"] == "hrsay" for b in _btns(prompt["keyboard"]))
+    assert not started                       # до выбора роли автостарта нет
+
+    _post_hr(client, "2")
+    assert _wait_for(lambda: any(c["dialog"] == "u500" for c in captured))
+    assert roles_set == {"500": "b"}
+    assert started == {"uid": "500"}
 
 
 # ── «Выбрать N» после «Мои курсы» ────────────────────────────────────────────
@@ -607,12 +624,67 @@ def test_exit_from_test_gets_menu_keyboard(send_trap, monkeypatch):
         ["Продолжить", "Выбрать 1", "Документы", "Помощь"]
 
 
+def test_help_in_test_gets_resume_keyboard(send_trap, monkeypatch):
+    """01.09 (фидбек юзера): A–D — только у сообщения С ВОПРОСОМ; «Помощь»
+    в тесте (в т.ч. на паузе) получает resume-навигацию, не A–D."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 1, "state": "BASIC_TEST",
+                                     "role": "fo", "current_q_idx": 0})
+    monkeypatch.setattr(bot, "get_course_questions", lambda cid: {})
+    monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "🤖 помощь")
+    monkeypatch.setattr(
+        bot, "my_courses",
+        lambda uid, role: ("t", [{"id": 2, "n": 1, "status": "todo",
+                                  "doc_name": "Б.docx"}]))
+    bot._recent_msgs.clear()
+    _run_employee("Помощь")
+    btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert btns[0]["TEXT"] == "▶ Продолжить тест"
+    assert "A" not in [b["COMMAND_PARAMS"] for b in btns]
+
+
+def test_question_reply_keeps_test_keyboard(send_trap, monkeypatch):
+    """Ответ с вопросом теста — тестовая клавиатура A–D как раньше."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 1, "state": "BASIC_TEST",
+                                     "role": "fo", "current_q_idx": 1})
+    monkeypatch.setattr(bot, "get_course_questions", lambda cid: {})
+    monkeypatch.setattr(bot, "process_message",
+                        lambda *a, **kw: "✅ Верно!\n\n📝 Базовый тест — "
+                                         "Вопрос 2/5\n\nЧ?")
+    bot._recent_msgs.clear()
+    _run_employee("A")
+    btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert [b["COMMAND_PARAMS"] for b in btns][:4] == ["A", "B", "C", "D"]
+
+
+def test_exam_resume_and_pause_labels(send_trap, monkeypatch):
+    """01.09: в экзамене кнопки называют экзамен (payload'ы прежние)."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 1, "state": "EXAM",
+                                     "role": "fo", "current_q_idx": 1})
+    monkeypatch.setattr(bot, "get_course_questions", lambda cid: {})
+    monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "пауза")
+    monkeypatch.setattr(
+        bot, "my_courses",
+        lambda uid, role: ("t", [{"id": 2, "n": 1, "status": "todo",
+                                  "doc_name": "Б.docx"}]))
+    bot._recent_msgs.clear()
+    _run_employee("выйти")
+    btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert btns[0]["TEXT"] == "▶ Продолжить экзамен"
+    assert btns[0]["COMMAND_PARAMS"] == "Продолжить"
+
+
 def test_menu_at_session_none_gets_retake_keyboard(send_trap, monkeypatch):
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
     monkeypatch.setattr(bot, "get_session", lambda uid: None)
     monkeypatch.setattr(bot, "process_message", lambda *a, **kw: "список")
     monkeypatch.setattr(bot, "_retake_fork_text", lambda uid: "форк")
-    monkeypatch.setattr(bot, "_last_known_role", lambda uid: None)
+    monkeypatch.setattr(bot, "resolve_role_cached", lambda uid: None)
     monkeypatch.setattr(
         bot, "my_courses",
         lambda uid, role: ("t", [{"id": 2, "n": 1, "status": "todo",
