@@ -86,18 +86,16 @@ def test_rag_called_with_role_filter(env):
     assert env["role_filter"] == "housekeeper"
 
 
-def test_role_command_switches_role(env):
+def test_role_command_is_hr_only(env):
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-
+    before = db.get_session("u1")
     reply = sm.process_message("u1", "Роль", "d1", [], None)
-    assert "1. Горничная" in reply
-    assert db.get_session("u1")["state"] == "ROLE_SELECT"
-
-    sm.process_message("u1", "2", "d1", [], None)
-    session = db.get_session("u1")
-    assert session["role"] == "admin_reception"
-    assert session["state"] == "READING"
+    after = db.get_session("u1")
+    assert "🔒" in reply and "HR" in reply
+    assert after["state"] == "READING"
+    assert after["role"] == before["role"]
+    assert after["course_id"] == before["course_id"]
 
 
 def test_no_roles_config_falls_back_to_reading(env, monkeypatch):
@@ -204,33 +202,17 @@ def test_role_remembered_after_done(env):
     assert new["course_id"] == db.get_course_by_doc_name("Стандарты.docx")["id"]
 
 
-def test_role_switch_is_temporary_for_hr_assigned(env, monkeypatch):
-    """01.09 (ревью): «Роль» сотрудника НЕ пишет employees.role — просмотр
-    другой роли сессионный, на следующем курсе возвращается HR-роль."""
-    monkeypatch.setattr(sm, "notify_hr", lambda text: None)
+def test_role_command_cannot_override_hr_assignment(env):
+    """Сотрудник не меняет ни HR-роль, ни текущую сессию."""
     db.set_employee_role("u1", "housekeeper")
-    fo_id = _add_course("FO Ресепшн.docx", "d-fo")
-    hskp_id = _add_course("HSKP Уборка.docx", "d-h")
     sm.process_message("u1", "привет", "d1", [], None)      # авто: HR-роль
-    session = db.get_session("u1")
-    assert session["role"] == "housekeeper"
-
+    before = db.get_session("u1")
     reply = sm.process_message("u1", "Роль", "d1", [], None)
-    assert "1." in reply                                    # меню открылось
-    reply = sm.process_message("u1", "2", "d1", [], None)   # admin_reception
-    assert "временно" in reply                              # честная приписка
-    assert db.get_session("u1")["role"] == "admin_reception"
-    assert db.get_employee("u1")["role"] == "housekeeper"   # HR-роль цела
-
-    db.update_session(db.get_session("u1")["id"], state="DONE")
-    reply = sm.process_message("u1", "привет", "d1", [], None)
-    # следующий курс — снова по HR-роли (не по подсмотренной): FO-курс мимо
-    assert "назначил HR" in reply
-    new = db.get_session("u1")
-    assert new["role"] == "housekeeper"
-    assert new["course_id"] in (hskp_id,
-                                db.get_course_by_doc_name("Стандарты.docx")["id"])
-    assert new["course_id"] != fo_id
+    after = db.get_session("u1")
+    assert "🔒" in reply and "HR" in reply
+    assert db.get_employee("u1")["role"] == "housekeeper"
+    assert after["id"] == before["id"]
+    assert after["role"] == before["role"] == "housekeeper"
 
 
 def test_exit_outside_test_not_rag(env):
@@ -290,7 +272,7 @@ def test_free_question_still_goes_to_rag(env):
 def test_start_reading_shows_command_hints(env):
     sm.process_message("u1", "привет", "d1", [], None)
     reply = sm.process_message("u1", "1", "d1", [], None)
-    assert "Мои курсы" in reply and "Роль" in reply
+    assert "Мои курсы" in reply and "*Роль*" not in reply
 
 
 def test_finish_phase_notify_has_name(env, monkeypatch):

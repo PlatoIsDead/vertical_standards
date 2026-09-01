@@ -99,7 +99,6 @@ def for_session(session: dict | None, fork: bool = False,
                 _btn("📚 Мои курсы", "Мои курсы", width=150),
                 _btn("📄 Документы", "Документы", width=130),
                 dict(_NEWLINE),
-                _btn("Роль", width=110, role="service"),
                 _btn("❓ Помощь", "Помощь", width=130, role="service")]
     if state in ("BASIC_TEST", "EXAM"):
         # Короткие варианты (все ≤24) — BLOCK с текстом: нажатие не требует
@@ -139,7 +138,8 @@ _STATUS_EMOJI = {"admitted": "🎓", "waiting": "⏳", "todo": "⏳",
 
 def courses_menu(items: list, reading: bool = False,
                  resume_test: bool = False, retake: bool = False,
-                 resume_exam: bool = False) -> list | None:
+                 resume_exam: bool = False,
+                 show_courses_button: bool = False) -> list | None:
     """Ответ на «Мои курсы»: items = [(n, name, status)] ТОЛЬКО выбираемых
     курсов (n = номер «Выбрать N» из my_courses — FSM-совместимость).
     ≤6 — BLOCK с названием (≤38…), больше — сетка «Выбрать N» 3×96.
@@ -171,13 +171,17 @@ def courses_menu(items: list, reading: bool = False,
     if retake:
         rows += [_btn("🔁 Пересдать экзамен", "Пересдать", display="BLOCK"),
                  dict(_NEWLINE)]
+    if show_courses_button:
+        # В паузе явный вход в список курсов не должен быть
+        # спрятан в «Меню», даже если сейчас нет другого курса.
+        rows += [_btn("📚 Мои курсы", "Мои курсы", display="BLOCK"),
+                 dict(_NEWLINE)]
+
     if rows and rows[-1].get("TYPE") != "NEWLINE":
         rows.append(dict(_NEWLINE))
     # 26.08 («все команды — кнопками»): сервисный ряд всегда виден
     rows += [_btn("📄 Документы", "Документы", width=130, role="service"),
              _btn("❓ Помощь", "Помощь", width=130, role="service")]
-    if reading and not resume_test:
-        rows += [dict(_NEWLINE), _btn("Роль", width=110, role="service")]
     return rows or None
 
 
@@ -259,9 +263,15 @@ def hr_new_course_actions(course_id: int) -> list:
 
 
 def hr_course_actions(course_id: int) -> list:
-    """Пара под простынёй «Вопросы N все»."""
-    return [_hr_btn(f"Вопросы {course_id}", width=130, role="review"),
-            _hr_btn(f"Подтвердить {course_id}", width=160, role="danger")]
+    """Действия под простынёй «Вопросы N все»."""
+    return [
+        _hr_btn("✏️ Править по одному", f"Вопросы {course_id}.1",
+                display="BLOCK", role="review"),
+        dict(_NEWLINE),
+        _hr_btn("🔄 Заново все", f"Перегенерировать {course_id}",
+                width=140),
+        _hr_btn(f"Подтвердить {course_id}", width=150, role="danger"),
+    ]
 
 
 def hr_question_card(course_id: int, q_num: int, total: int = 15) -> list:

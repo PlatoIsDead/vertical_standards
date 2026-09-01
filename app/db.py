@@ -545,9 +545,8 @@ def set_can_switch_role(bitrix_uid: str, allowed: bool) -> bool:
 
 
 def set_employee_role(bitrix_uid: str, role_id: str | None) -> bool:
-    """01.09: роль сотрудника выбирает HR при «Пригласить» (кнопки/цифра).
-    Также синхронизируется при смене роли самим сотрудником (команда «Роль»,
-    если разрешена). True = сотрудник найден."""
+    """Роль сотрудника выбирает HR при инвайте или смене роли.
+    True = сотрудник найден."""
     with _conn() as conn:
         cur = conn.execute(
             "UPDATE employees SET role = ? WHERE bitrix_uid = ?",

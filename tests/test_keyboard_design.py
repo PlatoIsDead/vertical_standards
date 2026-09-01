@@ -171,7 +171,11 @@ def test_courses_menu_layouts():
     assert (small[1]["TEXT"], small[1]["COMMAND_PARAMS"]) == \
         ("⏳ 1 · Курс о конфиденциальности", "Выбрать 1")
     assert small[3]["TEXT"].startswith("🎓 3 · ")          # допущен
-    assert small[-1]["COMMAND_PARAMS"] == "Роль"           # ряд состояния
+    assert small[-1]["COMMAND_PARAMS"] == "Помощь"
+    flat = _buttons(SAMPLES["hr_flat"])
+    assert [b["COMMAND_PARAMS"] for b in flat] == \
+        ["Вопросы 7.1", "Перегенерировать 7",
+         "Подтвердить 7"]
     grid = [b for b in _buttons(SAMPLES["menu_grid"])
             if b["COMMAND_PARAMS"].startswith("Выбрать")]
     assert [b["COMMAND_PARAMS"] for b in grid] == \

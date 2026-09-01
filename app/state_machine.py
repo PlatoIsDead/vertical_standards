@@ -4,7 +4,7 @@ app/state_machine.py — Dialog FSM for employee onboarding.
 States: ROLE_SELECT → READING → BASIC_TEST → WAITING_HR → EXAM → DONE
 
 ROLE_SELECT: сотрудник выбирает роль цифрой; RAG-ответы фильтруются по роли.
-Команда «Роль» в READING — сменить роль (тестирование в разных ролях).
+Команда «Роль» в READING направляет сотрудника к HR.
 
 №11: курс назначается ПОСЛЕ определения роли (память прошлой сессии или меню) —
 первый активный непройденный курс, чьи роли (префиксы в doc_name) пересекаются
@@ -72,7 +72,6 @@ _HELP_TEXT = (
     "• *Документы* — стандарты твоего отдела со ссылками\n"
     "• *Готов* — начать тест по текущему курсу · *Выйти* — пауза · "
     "*Продолжить* — вернуться к тесту\n"
-    "• *Роль* — сменить роль\n"
     "• *Помощь* — показать эту подсказку ещё раз"
 )
 
@@ -427,9 +426,9 @@ def _assign_course(user_id: str, dialog_id: str, role_id: str,
     if by_hr:
         role_line += " (назначил HR; сменить её может HR)"
     elif remembered:
-        role_line += " (помню с прошлого обучения; сменить — команда «Роль»)"
+        role_line += " (помню с прошлого обучения)"
     elif by_department:
-        role_line += " (по отделу; сменить — команда «Роль»)"
+        role_line += " (по отделу; если это ошибка — напиши HR)"
     return role_line + "\n\n" + _start_reading(session, course)
 
 
@@ -510,8 +509,8 @@ def _start_reading(session: dict, course: dict) -> str:
         "Прочитай документ и напиши *Готов*, когда будешь готов к тесту.",
         "Если есть вопросы по материалу — задавай, отвечу на основе стандартов.",
         "",
-        "Команды: *Готов* — начать тест · *Мои курсы* — список курсов · "
-        "*Роль* — сменить роль.",
+        "Команды: *Готов* — начать тест · "
+        "*Мои курсы* — список курсов.",
     ]
     return "\n".join(lines)
 
@@ -699,16 +698,8 @@ def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> st
         return ("Сначала закончи текущий курс — пересдать прошлый экзамен "
                 "можно будет после него.")
     if cmd == "роль":
-        # 19.08: право смены роли выдаёт HR; гейт активен только когда роль
-        # назначена ИЗВНЕ — HR при «Пригласить» (01.09) или отделом (№8)
-        emp = get_employee(session["user_id"])
-        if (emp is not None and not emp.get("can_switch_role", 1)
-                and (_hr_assigned_role(session["user_id"])
-                     or _role_from_profile(session["user_id"]))):
-            return ("🔒 Твою роль назначает HR. "
-                    "Право выбора ролей выдаёт HR.")
-        update_session(session["id"], state="ROLE_SELECT")
-        return _start_role_select()
+        # Сотрудник не меняет организационную роль сам.
+        return "🔒 Роль сотрудника назначает и меняет HR."
 
     if "готов" in message.lower():
         questions = get_course_questions(session["course_id"])
@@ -790,7 +781,8 @@ def _my_documents_text(role_id: str | None, chunks: list) -> str:
         lines += ["", "📖 *Общие:*"] + _section(common_docs)
     lines += ["", "Задавай вопросы по любому из них — отвечу по тексту стандарта."]
     if role_id is None:
-        lines += ["", "Показаны только общие документы — выбери роль: *Роль*."]
+        lines += ["", "Показаны только общие документы. "
+                  "Попроси HR назначить тебе роль."]
     return "\n".join(lines)
 
 

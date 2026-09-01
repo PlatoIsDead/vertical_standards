@@ -55,29 +55,17 @@ def test_my_documents_filtering(monkeypatch):
     assert "Котельная" not in fo and "Гостям" not in fo
     none = sm._my_documents_text(None, CHUNKS)
     assert "Конфиденциальность" in none and "Пожар" not in none
-    assert "выбери роль" in none
+    assert "Попроси HR" in none
     assert "нет документов" in sm._my_documents_text("engineer", [CHUNKS[0]])
 
 
-# ── Гейт «Роль» ──────────────────────────────────────────────────────────────
+# ── Роль меняет только HR ───────────────────────────────────────────────
 
-def test_role_gate(monkeypatch):
+def test_employee_cannot_change_role():
     session = {"id": 1, "user_id": "u1", "state": "READING",
                "role": "fo", "course_id": 1}
-    monkeypatch.setattr(sm, "_start_role_select", lambda: "МЕНЮ РОЛЕЙ")
-    monkeypatch.setattr(sm, "update_session", lambda sid, **kw: None)
-    # запрет + отдел замаплен → отказ
-    monkeypatch.setattr(sm, "get_employee", lambda uid: {"can_switch_role": 0})
-    monkeypatch.setattr(sm, "_role_from_profile",
-                        lambda uid: "admin_reception")
-    assert "🔒" in sm._handle_reading(session, "Роль", [], None)
-    # право есть → меню
-    monkeypatch.setattr(sm, "get_employee", lambda uid: {"can_switch_role": 1})
-    assert sm._handle_reading(session, "Роль", [], None) == "МЕНЮ РОЛЕЙ"
-    # отдел НЕ замаплен → гейт неактивен даже при запрете
-    monkeypatch.setattr(sm, "get_employee", lambda uid: {"can_switch_role": 0})
-    monkeypatch.setattr(sm, "_role_from_profile", lambda uid: None)
-    assert sm._handle_reading(session, "Роль", [], None) == "МЕНЮ РОЛЕЙ"
+    reply = sm._handle_reading(session, "Роль", [], None)
+    assert "🔒" in reply and "HR" in reply
 
 
 # ── Анонс стандарта при загрузке ─────────────────────────────────────────────
@@ -182,17 +170,15 @@ def test_abbrev_add_list_remove(hr_env):
     assert "FIN" not in roles.load_roles_config()["prefixes"]
 
 
-def test_role_allow_deny(hr_env):
+def test_role_allow_deny_is_retired(hr_env):
     client, sent = hr_env
     db.add_employee("500", "ivan@x.ru", "Иван", "9")
     reply = _post_and_reply(client, sent, "Роль запретить ivan@x.ru")
-    assert "больше не выбирает" in reply
-    assert db.get_employee("500")["can_switch_role"] == 0
-    reply = _post_and_reply(client, sent, "Роль разрешить 500")
-    assert "может выбирать" in reply
+    assert "больше не используется" in reply
     assert db.get_employee("500")["can_switch_role"] == 1
-    assert "не найден" in _post_and_reply(client, sent,
-                                          "Роль запретить ghost@x.ru")
+    reply = _post_and_reply(client, sent, "Роль разрешить 500")
+    assert "Роль {email или ID}" in reply
+    assert db.get_employee("500")["can_switch_role"] == 1
 
 
 # ── eval_qa ──────────────────────────────────────────────────────────────────

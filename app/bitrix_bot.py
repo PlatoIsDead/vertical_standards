@@ -51,7 +51,6 @@ from app.db import (
     remove_processed_file,
     save_draft_course,
     seen_users_empty,
-    set_can_switch_role,
     set_employee_role,
     set_course_archived,
     set_meta,
@@ -874,7 +873,8 @@ async def _notify_hr_about_user(user: dict, transfer: bool):
     email = (user.get("EMAIL") or "").strip().lower()
     kb = None
     if transfer:
-        text = f"🔄 {fio} сменил отдел. Если поменялась роль — пусть напишет боту «Роль»."
+        text = (f"🔄 {fio} сменил отдел. Если поменялась роль — "
+                "HR может назначить её командой «Роль {email или ID}».")
     else:
         text = f"👤 Новый сотрудник: {fio} ({email or 'email не указан'})."
         if email:
@@ -1076,7 +1076,8 @@ async def _handle_employee_message(user_id: str, question: str,
                  for c in selectable],
                 reading=bool(after and after["state"] == "READING"),
                 resume_test=in_test, retake=retake,
-                resume_exam=bool(after and after["state"] == "EXAM"))
+                resume_exam=bool(after and after["state"] == "EXAM"),
+                show_courses_button=non_question and not is_menu)
             if menu_kb:
                 keyboard = menu_kb
 
@@ -1701,35 +1702,12 @@ async def _handle_hr_message(user_id: str, question: str,
                     "Аббревиатура удалить {ABBR}")
 
     elif re.match(r"^роль\s+(разрешить|запретить)\b", msg_lower):
-        # 19.08: право смены роли — например, менеджеру смотреть ответы
-        # разных отделов; снятие возвращает роль по отделу
-        m = re.match(r"^роль\s+(разрешить|запретить)\s+(\S+)$", msg_lower)
-        if not m:
-            text = "❌ Формат: Роль разрешить {email или ID} · Роль запретить {email или ID}"
-        else:
-            allow = m.group(1) == "разрешить"
-            target = m.group(2)
-            if "@" in target:
-                emp = await asyncio.to_thread(get_employee_by_email, target)
-                target = emp["bitrix_uid"] if emp else None
-            if target is None:
-                text = (f"⚠️ {m.group(2)} не найден среди приглашённых. "
-                        f"Сначала: Пригласить {m.group(2)}")
-            elif await asyncio.to_thread(set_can_switch_role, target, allow):
-                text = (f"✅ Сотрудник {target} "
-                        + ("может выбирать роль сам (команда «Роль»)."
-                           if allow else
-                           "больше не выбирает роль — её назначает HR "
-                           "(или отдел Битрикса)."))
-            else:
-                text = (f"⚠️ Сотрудник {target} не найден среди приглашённых. "
-                        "Сначала: Пригласить {email}")
+        text = ("ℹ️ Эта команда больше не используется: роль меняет HR. "
+                "Напиши: Роль {email или ID}.")
 
     elif msg_lower == "роль":
-        text = ("⚙️ Напиши: Роль {email или ID} — сменю роль сотрудника "
-                "(спрошу цифрой из списка).\n"
-                "Право самостоятельной смены: Роль разрешить/запретить "
-                "{email или ID}.")
+        text = ("⚙️ Напиши: Роль {email или ID} — сменю роль "
+                "сотрудника (спрошу цифрой из списка).")
 
     elif re.match(r"^роль\s+\S+$", msg_lower):
         # 01.09: смена роли сотрудника HR-ом в любой момент — повторное

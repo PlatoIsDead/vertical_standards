@@ -40,8 +40,7 @@ def test_for_session_states():
     reading = _btns(kb.for_session({"state": "READING"}))
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in reading] == \
         [("✅ Готов к тесту", "Готов"), ("📚 Мои курсы", "Мои курсы"),
-         ("📄 Документы", "Документы"), ("Роль", "Роль"),
-         ("❓ Помощь", "Помощь")]
+         ("📄 Документы", "Документы"), ("❓ Помощь", "Помощь")]
     assert reading[0]["DISPLAY"] == "BLOCK"
     test_kb = _btns(kb.for_session({"state": "BASIC_TEST"}))
     assert [b["COMMAND_PARAMS"] for b in test_kb] == \
