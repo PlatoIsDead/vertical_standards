@@ -378,14 +378,18 @@ def test_invite_no_courses_for_role(env, monkeypatch):
     assert notes == []                                       # без ложного 👀
 
 
-def test_invite_no_active_courses_skips_role_prompt(env):
-    """Курсов нет — роль не спрашиваем, прежний ответ (whitelist сразу)."""
+def test_invite_no_active_courses_still_asks_role(env):
+    """Выбор роли — обязательный шаг «Пригласить» даже без курсов."""
     client, sent, course_id = env
     db.set_course_archived(course_id, True)
     _post_hr(client, "Пригласить ivan@x.ru")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    assert not db.is_employee_allowed("500")
+    _post_hr(client, "1")
     assert _wait_for(lambda: any("Активных курсов нет" in m[1] for m in sent))
     assert bot._get_pending("9") is None
     assert db.is_employee_allowed("500")
+    assert db.get_employee("500")["role"] == "housekeeper"
 
 
 def test_questions_show_correct_option_text(env):

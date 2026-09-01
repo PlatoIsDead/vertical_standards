@@ -706,8 +706,9 @@ async def _finish_invite(uid: str, email: str, fio: str,
         await asyncio.to_thread(set_employee_role, uid, role_id)
     first_msg = await asyncio.to_thread(start_onboarding, uid, f"u{uid}")
     if first_msg is None:
-        return (f"✅ {fio} добавлен в доступ. Активных курсов нет — "
-                f"после активации курса отправь: Пригласить {email}")
+        role_suffix = f" Роль: {role_name(role_id)}." if role_id else ""
+        return (f"✅ {fio} добавлен в доступ.{role_suffix} "
+                "Активных курсов нет.")
     # Автостарт идёт от EMPLOYEE-бота: client_id формы принадлежит HR-боту —
     # _send возьмёт BOT_CLIENT_ID из .env
     new_session = await asyncio.to_thread(get_session, uid)
@@ -1379,10 +1380,9 @@ async def _handle_hr_message(user_id: str, question: str,
                         text = (f"ℹ️ {fio} уже проходит обучение "
                                 f"(роль: {current}). "
                                 f"Сменить роль: Роль {email}")
-                    elif options and await asyncio.to_thread(get_active_courses):
+                    elif options:
                         # 01.09: роль выбирает HR — цифрой/кнопкой, не сотрудник.
                         # В whitelist пишем ПОСЛЕ выбора («Отмена» = не приглашён);
-                        # без активных курсов роль не спрашиваем (прежний ответ).
                         # options — СНАПШОТ: цифра резолвится по списку,
                         # который HR видел, даже если roles.json поправят
                         _pending_edits[user_id] = {
@@ -1398,8 +1398,8 @@ async def _handle_hr_message(user_id: str, question: str,
                                   "«Отмена» — не приглашать.")
                         kb = keyboards.hr_role_select(options)
                     else:
-                        # Легаси: конфиг ролей пуст или курсов нет —
-                        # прежний путь без выбора роли
+                        # Легаси-фолбэк только для пустого реестра ролей:
+                        # кнопки выбора построить не из чего
                         text = await _finish_invite(uid, email, fio,
                                                     position, user_id)
 

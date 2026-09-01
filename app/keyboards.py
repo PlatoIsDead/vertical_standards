@@ -320,16 +320,18 @@ def hr_cancel_edit() -> list:
 def hr_role_select(options: list) -> list:
     """01.09: выбор роли приглашаемого — HR-зеркало employee-ROLE_SELECT
     (payload — цифра, её ловит pending «Пригласить» в _handle_hr_message).
-    ≤8 ролей — BLOCK с названием, больше — сетка цифр 5×52 (292px)."""
+    ≤8 ролей — BLOCK с названием; больше — сетка 2×140px
+    с номером и названием варианта."""
     if len(options) <= 8:
         rows = [_hr_btn(f"{i} · {_trim(name, 38)}", str(i), display="BLOCK")
                 for i, (_rid, name) in enumerate(options, 1)]
     else:
         rows = []
-        for i in range(1, len(options) + 1):
-            if i > 1 and (i - 1) % 5 == 0:
+        for i, (_rid, name) in enumerate(options, 1):
+            if i > 1 and (i - 1) % 2 == 0:
                 rows.append(dict(_NEWLINE))
-            rows.append(_hr_btn(str(i), width=52))
+            rows.append(_hr_btn(f"{i} · {_trim(name, 15)}", str(i),
+                                width=140))
     rows += [dict(_NEWLINE), _hr_btn("Отмена", width=120, role="service")]
     return rows
 
