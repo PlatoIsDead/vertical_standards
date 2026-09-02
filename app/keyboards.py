@@ -10,6 +10,7 @@ Employee-бот — команда «say», HR-бот — «hrsay»: /command р
 команды. Событие нажатия приходит ONIMCOMMANDADD на POST /command.
 Все билдеры чистые (без БД) — данные передаются параметрами из bitrix_bot.
 """
+from app import quiz
 
 # Роли кнопок: (BG_COLOR, TEXT_COLOR). Белый на лайме запрещён (нечитаем).
 _ROLES = {
@@ -128,6 +129,17 @@ def for_session(session: dict | None, fork: bool = False,
         return [_btn("📚 Мои курсы", "Мои курсы", display="BLOCK"),
                 dict(_NEWLINE),
                 _btn("📄 Документы", "Документы", width=130),
+                _btn("❓ Помощь", "Помощь", width=130, role="service")]
+    if state in quiz.PAUSED_STATES:
+        # 02.09: пауза — своё состояние. Букв A–D здесь нет намеренно: ответ
+        # на паузе не засчитывается (кнопка под старым сообщением = промах)
+        label = ("▶ Продолжить экзамен" if state == "PAUSED_EXAM"
+                 else "▶ Продолжить тест")
+        return [_btn(label, "Продолжить", display="BLOCK", role="primary"),
+                dict(_NEWLINE),
+                _btn("📚 Мои курсы", "Мои курсы", width=150),
+                _btn("📄 Документы", "Документы", width=130),
+                dict(_NEWLINE),
                 _btn("❓ Помощь", "Помощь", width=130, role="service")]
     return None
 
@@ -297,6 +309,13 @@ def hr_question_card(course_id: int, q_num: int, total: int = 15) -> list:
                  _hr_btn("Подтвердить и запустить", f"Подтвердить {course_id}",
                          display="BLOCK", role="danger")]
     return rows
+
+
+def hr_oneshot_edit() -> list:
+    """02.09: правка одним сообщением — основной путь; пошаговый визард
+    остаётся за кнопкой для тех, кому так привычнее."""
+    return [_hr_btn("✏️ По шагам", "По шагам", width=140, role="service"),
+            _hr_btn("Отмена", width=120, role="service")]
 
 
 def hr_wizard_step() -> list:

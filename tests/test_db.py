@@ -266,3 +266,71 @@ def test_work_position_column_added_to_existing_table(tmp_path, monkeypatch):
 
     db.add_employee("1", work_position="Техник")
     assert db.get_employee("1")["work_position"] == "Техник"
+
+
+# ── 02.09: разовый бэкфилл роли легаси-аккаунтов ─────────────────────────────
+
+def test_legacy_roles_backfilled_once(tmp_path, monkeypatch):
+    """До 02.09 приглашали только менеджеров: у кого роли нет — «manager».
+    Метка в meta делает это ОДНИМ прогоном на базу."""
+    db_file = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "CREATE TABLE employees (bitrix_uid TEXT PRIMARY KEY, email TEXT,"
+        " full_name TEXT, added_by TEXT, added_at TEXT)"
+    )
+    conn.execute("INSERT INTO employees (bitrix_uid) VALUES ('900')")
+    conn.execute("INSERT INTO employees (bitrix_uid) VALUES ('901')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_PATH", db_file)
+    monkeypatch.setenv("HR_USER_IDS", "")
+
+    db.init_db()
+    assert db.get_employee("900")["role"] == "manager"
+    assert db.get_employee("901")["role"] == "manager"
+    assert db.get_meta("legacy_roles_backfilled")
+
+    # HR сменил роль → повторный старт её НЕ трогает
+    db.set_employee_role("900", "housekeeper")
+    # новый сотрудник без роли ждёт выбора HR, а не получает «manager»
+    db.add_employee("902", added_by="hr")
+    db.init_db()
+    assert db.get_employee("900")["role"] == "housekeeper"
+    assert db.get_employee("902")["role"] is None
+
+
+def test_attempt_column_and_bump(tmp_path, monkeypatch):
+    """02.09: счётчик попыток — сид порядка вариантов A–D на пересдаче."""
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "att.db"))
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+    cid = db.save_draft_course("Д.docx", "1", "{}")
+    s = db.create_session("u1", "d1", cid)
+    assert s["attempt"] == 0
+    assert db.bump_attempt(s["id"]) == 1
+    assert db.bump_attempt(s["id"]) == 2
+    assert db.get_session_by_id(s["id"])["attempt"] == 2
+
+
+def test_attempt_column_added_to_existing_table(tmp_path, monkeypatch):
+    """Живая БД без колонки: миграция ставит 0 существующим строкам."""
+    db_file = str(tmp_path / "old_sessions.db")
+    conn = sqlite3.connect(db_file)
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL, dialog_id TEXT, course_id INTEGER NOT NULL,
+            state TEXT NOT NULL DEFAULT 'READING', current_q_idx INTEGER DEFAULT 0,
+            score_basic INTEGER DEFAULT 0, score_exam INTEGER DEFAULT 0,
+            started_at TEXT, updated_at TEXT
+        );
+        INSERT INTO sessions (user_id, course_id) VALUES ('u9', 1);
+    """)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_PATH", db_file)
+    monkeypatch.setenv("HR_USER_IDS", "")
+    db.init_db()
+    assert db.get_session("u9")["attempt"] == 0
+    assert db.bump_attempt(db.get_session("u9")["id"]) == 1

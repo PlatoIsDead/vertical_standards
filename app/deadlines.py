@@ -16,7 +16,7 @@ import json
 from datetime import datetime, timedelta
 
 from app.hr_tools import _session_status
-from app.roles import ALL_STAFF, display_name
+from app.roles import display_name, role_matches
 from app.state_machine import course_roles
 
 
@@ -55,9 +55,7 @@ def assignments_with_deadlines(employees: list[dict], courses: list[dict],
                 latest_by_course[cid] = s
         for c in courses:
             croles = set(course_roles(c))
-            assigned = ((role and ({role, ALL_STAFF} & croles))
-                        or (role is None and ALL_STAFF in croles))
-            if not assigned:
+            if not role_matches(role, croles):
                 continue
             questions = _safe_questions(c)
             latest = latest_by_course.get(c["id"])

@@ -96,14 +96,20 @@ def test_role_course_broadcast_to_matching_free_employee(env):
     assert not any(m[0] in ("u700", "u800") for m in sent)
 
 
-def test_all_course_reaches_unknown_role_but_not_busy(env):
+def test_all_course_reaches_everyone_with_matching_role(env):
+    """02.09 (фидбек юзера): уведомление приходит и занятому другим курсом —
+    только текстом «ждёт в Мои курсы», без выдёргивания из текущего."""
     client, sent = env
     cid = _draft("ALL Конфиденциальность.docx", "11")
     _post_hr(client, f"Подтвердить {cid}")
 
     assert _wait_for(lambda: any(m[0] == "u800" for m in sent))
     assert any(m[0] == "u600" for m in sent)          # роль ∩ all_staff — тоже да
-    assert not any(m[0] == "u700" for m in sent)      # busy — нет
+    busy = next(m for m in sent if m[0] == "u700")    # busy — тоже уведомлён
+    assert "ждёт в «Мои курсы»" in busy[1]
+    free = next(m for m in sent if m[0] == "u800")
+    assert "чтобы начать обучение" in free[1]
+    assert "📄 Документ:" in busy[1] and "📄 Документ:" in free[1]
 
 
 def test_completed_course_not_rebroadcast_to_finisher(env):

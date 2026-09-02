@@ -47,6 +47,7 @@ SAMPLES = {
     "card_15": kb.hr_question_card(5, 15),
     "card_total6": kb.hr_question_card(7, 6, total=6),
     "card_mid6": kb.hr_question_card(7, 3, total=6),
+    "wiz_oneshot": kb.hr_oneshot_edit(),
     "wiz_step": kb.hr_wizard_step(),
     "wiz_confirm": kb.hr_wizard_confirm(),
     "cancel": kb.hr_cancel_edit(),
@@ -65,6 +66,7 @@ SAMPLES = {
 ALLOWED_PAYLOADS = [
     r"^(Готов|Мои курсы|Роль|Пересдать|Далее|Начать|Отмена|Сохранить|Заново|\.)$",
     r"^(Документы|Выйти|Продолжить|Помощь|Меню)$",   # 19.08–26.08: навигация
+    r"^По шагам$",                      # 02.09: пошаговая правка вопроса
     r"^[A-D]$",
     r"^\d{1,2}$",                       # выбор роли
     r"^Выбрать \d+$",

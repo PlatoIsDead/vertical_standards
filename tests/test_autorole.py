@@ -20,6 +20,9 @@ QUESTIONS = {
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    # 02.09: тесты FSM ассертят конкретные буквы — порядок вариантов
+    # фиксируем каноническим (перемешивание проверяет test_option_shuffle)
+    monkeypatch.setenv("SHUFFLE_OPTIONS", "0")
     monkeypatch.setenv("HR_USER_IDS", "")
     db.init_db()
     db.add_employee("u1", added_by="test")

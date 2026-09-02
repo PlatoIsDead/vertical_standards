@@ -79,6 +79,23 @@ def test_standard_recipients(monkeypatch):
     assert set(bot._standard_recipients(["all_staff"])) == {"1", "2", "3"}
 
 
+def test_standard_recipients_include_manager(monkeypatch, tmp_path):
+    """02.09: «Менеджер» (all_access) получает анонс ЛЮБОГО стандарта."""
+    cfg = tmp_path / "roles.json"
+    cfg.write_text(json.dumps({
+        "roles": {"manager": "Менеджер", "engineer": "Инженер",
+                  "all_staff": "Все"},
+        "all_access": ["manager"], "prefixes": {}, "folders": {},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(roles, "CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(bot, "get_all_employees", lambda: [
+        {"bitrix_uid": "1"}, {"bitrix_uid": "2"}])
+    roles_by = {"1": "manager", "2": "engineer"}
+    monkeypatch.setattr(bot, "resolve_role_cached", lambda uid: roles_by[uid])
+    assert bot._standard_recipients(["admin_reception"]) == ["1"]
+    assert set(bot._standard_recipients(["engineer"])) == {"1", "2"}
+
+
 def test_broadcast_new_standard(monkeypatch):
     sent = []
 
@@ -104,7 +121,7 @@ def test_course_announce_mentions_deadline(monkeypatch):
         sent.append(text)
 
     monkeypatch.setattr(bot, "_send", fake_send)
-    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, ["1"]))
+    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, [("1", False)]))
     assert f"{bot.ESCALATION_DAYS} дней" in sent[0]
 
 

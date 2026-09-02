@@ -71,10 +71,13 @@ def _post_and_reply(client, sent, message, from_user="9", dialog="d9"):
 
 
 def test_wizard_full_pass(env):
-    """17.08: пошаговый визард — текст → A–D → буква → превью → сохранить."""
+    """17.08: пошаговый визард — текст → A–D → буква → превью → сохранить.
+    02.09: он ушёл за кнопку «По шагам», правка открывается одним сообщением."""
     client, sent, course_id = env
     reply = _post_and_reply(client, sent, f"Изменить {course_id}.7")
-    assert "шаг 1/6" in reply and "Экзамен 2?" in reply
+    assert "ОДНИМ сообщением" in reply and "Экзамен 2?" in reply
+    reply = _post_and_reply(client, sent, "По шагам")
+    assert "шаг 1/6" in reply
 
     reply = _post_and_reply(client, sent, "Новый текст?")
     assert "вариант A" in reply
@@ -102,21 +105,61 @@ def test_wizard_full_pass(env):
 
 
 def test_wizard_oneshot_block(env):
-    """Цельный блок по шаблону на шаге 1 → сразу превью (power-user путь)."""
+    """02.09: цельный блок сохраняется СРАЗУ, без превью и «Сохранить»."""
     client, sent, course_id = env
     _post_and_reply(client, sent, f"Изменить {course_id} 3")
     reply = _post_and_reply(client, sent, REPLACEMENT)
-    assert "Проверь вопрос" in reply and "Новый вопрос?" in reply
-    reply = _post_and_reply(client, sent, "Сохранить")
-    assert "сохранён" in reply
+    assert "сохранён" in reply and "Новый вопрос?" in reply
     q = db.get_course_questions(course_id)["basic_questions"][2]
     assert q["text"] == "Новый вопрос?"
     assert q["correct"] == "B"                                # кириллица «В» → B
+    assert not bot._pending_edits
+
+
+def test_oneshot_block_without_answer_line(env):
+    """Живой прогон 02.09: HR прислал блок БЕЗ строки «Ответ:» — раньше он
+    молча уезжал в текст вопроса и визард шёл на шаг 2/6."""
+    client, sent, course_id = env
+    _post_and_reply(client, sent, f"Изменить {course_id}.1")
+    reply = _post_and_reply(
+        client, sent,
+        "1. Новый текст вопроса\n\nA. Правильный\nB. Второй\n"
+        "C. Третий\nD. Четвёртый\n\nПояснение: потому что.")
+    assert "сохранён" in reply
+    q = db.get_course_questions(course_id)["basic_questions"][0]
+    assert q["text"] == "Новый текст вопроса"                 # «1. » срезана
+    assert q["options"] == ["A. Правильный", "B. Второй",
+                            "C. Третий", "D. Четвёртый"]
+    assert q["correct"] == "A"                                # прежний ответ цел
+    assert q["explanation"] == "потому что."
+
+
+def test_oneshot_partial_edits(env):
+    """Точечные правки: один вариант / только ответ / только текст."""
+    client, sent, course_id = env
+    _post_and_reply(client, sent, f"Изменить {course_id}.1")
+    reply = _post_and_reply(client, sent, "B. Совсем другой вариант")
+    assert "сохранён" in reply and "варианты" in reply
+    q = db.get_course_questions(course_id)["basic_questions"][0]
+    assert q["options"][1] == "B. Совсем другой вариант"
+    assert q["options"][0] == "A. 1" and q["text"] == "Базовый 1?"
+
+    bot._recent_msgs.clear()                       # дедуп: та же команда подряд
+    _post_and_reply(client, sent, f"Изменить {course_id}.1")
+    _post_and_reply(client, sent, "Ответ: C")
+    assert db.get_course_questions(course_id)["basic_questions"][0]["correct"] == "C"
+
+    bot._recent_msgs.clear()
+    _post_and_reply(client, sent, f"Изменить {course_id}.1")
+    _post_and_reply(client, sent, "Переписанный вопрос?")
+    q = db.get_course_questions(course_id)["basic_questions"][0]
+    assert q["text"] == "Переписанный вопрос?" and q["correct"] == "C"
 
 
 def test_wizard_rejects_duplicate_options(env):
     client, sent, course_id = env
     _post_and_reply(client, sent, f"Изменить {course_id}.1")
+    _post_and_reply(client, sent, "По шагам")
     _post_and_reply(client, sent, ".")                        # текст оставить
     _post_and_reply(client, sent, "2")                        # A = «2» (дубль B)
     for _ in range(3):

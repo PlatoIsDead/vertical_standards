@@ -87,6 +87,9 @@ def test_rating_dedupes_user_keeps_best():
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    # 02.09: тесты FSM ассертят конкретные буквы — порядок вариантов
+    # фиксируем каноническим (перемешивание проверяет test_option_shuffle)
+    monkeypatch.setenv("SHUFFLE_OPTIONS", "0")
     db.init_db()
     posted = []
     monkeypatch.setattr(gm, "_post_to_feed",
@@ -145,6 +148,7 @@ EXAM_QUESTIONS = {
 @pytest.fixture
 def exam_env(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setenv("SHUFFLE_OPTIONS", "0")        # тест ассертит букву «A»
     monkeypatch.delenv("HR_USER_IDS", raising=False)  # notify_hr молчит офлайн
     db.init_db()
     db.add_employee("u1", "ivan@x.ru", "Иван Иванов", "test")

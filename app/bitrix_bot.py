@@ -67,16 +67,20 @@ from app.hr_tools import (
     build_report_text,
     correct_option,
     format_question_card,
+    format_question_editable,
+    merge_replacement,
     phase_lens,
+    parse_partial_replacement,
+    resolve_question_ref,
     parse_replacement,
     question_by_ref,
 )
-from app import keyboards
+from app import keyboards, quiz
 from app.rag import load_index
 from app.report_excel import build_report_xlsx
 from app.roles import (
-    ALL_STAFF,
     display_name,
+    role_matches,
     load_roles_config,
     parse_filename,
     role_name,
@@ -85,6 +89,8 @@ from app.roles import (
 )
 from app.state_machine import (
     _MENU_COMMANDS,
+    doc_link,
+    format_question,
     _format_role_list,
     _retake_fork_text,
     resolve_role_cached,
@@ -587,10 +593,33 @@ def _extract_email(text: str) -> str | None:
 
 _WIZARD_STEPS = ("text", "opt_a", "opt_b", "opt_c", "opt_d", "correct", "confirm")
 
+# Что HR поправил одним сообщением — для подтверждения «обновил: …»
+_PATCH_LABELS = {"text": "текст", "options": "варианты",
+                 "correct": "правильный ответ", "explanation": "пояснение"}
+
 
 def _wizard_step_text(pending: dict) -> str:
     d = pending["draft"]
     step = pending["step"]
+    if step == "oneshot":
+        # 02.09 (живой прогон): 6 шагов на один вопрос — слишком долго.
+        # Основной путь: скопировать блок, поправить строку, прислать назад.
+        return (f"✏️ Правка вопроса {pending['q_num']} курса "
+                f"«{pending['doc_name']}».\n\n"
+                "Пришли вопрос ОДНИМ сообщением — сохраню сразу или скажу, "
+                "что не разобрал. Формат:\n\n"
+                "Текст вопроса\n"
+                "A. первый вариант\n"
+                "B. второй вариант\n"
+                "C. третий вариант\n"
+                "D. четвёртый вариант\n"
+                "Ответ: A\n"
+                "Пояснение: почему этот ответ верный\n\n"
+                "Сейчас (скопируй и поправь):\n\n"
+                + format_question_editable(d)
+                + "\n\nМожно менять и по кусочкам: одна строка «B. …», "
+                  "«Ответ: C» или «Пояснение: …» — остальное останется.\n"
+                  "«По шагам» — по одному полю · «Отмена» — выйти.")
     n = _WIZARD_STEPS.index(step) + 1
     if step == "text":
         return (f"✏️ Правка вопроса {pending['q_num']} курса "
@@ -623,6 +652,51 @@ async def _wizard_input(user_id: str, pending: dict,
     step = pending["step"]
     val = raw.strip()
     skip = val == "."
+
+    if step == "oneshot":
+        low = val.lower()
+        if low in ("по шагам", "пошагово"):
+            pending["step"] = "text"
+            return _wizard_step_text(pending), keyboards.hr_wizard_step()
+        if skip:
+            return ("Ничего не менял. " + _wizard_step_text(pending),
+                    keyboards.hr_oneshot_edit())
+        patch = parse_partial_replacement(raw)
+        if not patch:
+            return ("❌ Не понял правку. Пришли текст вопроса, строку "
+                    "«B. вариант», «Ответ: C» или «Пояснение: …».\n\n"
+                    + _wizard_step_text(pending),
+                    keyboards.hr_oneshot_edit())
+        merged = merge_replacement(d, patch)
+        questions = await asyncio.to_thread(get_course_questions,
+                                            pending["course_id"])
+        try:
+            questions = apply_replacement(questions, pending["q_num"], merged)
+        except ValueError as exc:
+            return (f"❌ {exc}\n\n" + _wizard_step_text(pending),
+                    keyboards.hr_oneshot_edit())
+        await asyncio.to_thread(
+            update_course_questions, pending["course_id"],
+            json.dumps(questions, ensure_ascii=False),
+        )
+        course_id, q_num = pending["course_id"], pending["q_num"]
+        saved = question_by_ref(questions, q_num)
+        b, e = phase_lens(questions)
+        _pending_edits.pop(user_id, None)
+        changed = ", ".join(_PATCH_LABELS[k] for k in
+                            ("text", "options", "correct", "explanation")
+                            if k in patch)
+        # Эхо — вопрос ГЛАЗАМИ СОТРУДНИКА (фидбек юзера 02.09), чтобы HR видел
+        # ровно то, что получит человек; правильный ответ подписан отдельно
+        phase, idx = resolve_question_ref(q_num, b, e)
+        total = b if phase == "basic" else e
+        preview = format_question(saved, idx, total, phase)
+        return (f"✅ Вопрос {q_num} сохранён (обновил: {changed}).\n\n"
+                "Так его увидит сотрудник:\n\n" + preview
+                + f"\n\n✅ Правильный: {correct_option(saved)}"
+                + (f"\n_{saved['explanation']}_"
+                   if saved.get("explanation") else ""),
+                keyboards.hr_question_card(course_id, q_num, b + e))
 
     if step == "confirm":
         low = val.lower().strip("💾🔄 ")
@@ -947,8 +1021,6 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
     print(f"BITRIX SEND ERROR after 5 attempts (dialog={dialog_id}): {last_exc!r}")
 
 
-_OPT_BODY_RE = re.compile(r"^[A-D][.)]\s*(.*)$", re.DOTALL)
-
 # 01.09: маркер «в сообщении есть вопрос теста» (format_question:
 # «📝 {label} — Вопрос {i+1}/{total}») — гейт для A–D-клавиатуры
 _QUESTION_RE = re.compile(r"— Вопрос \d+/\d+")
@@ -956,23 +1028,22 @@ _QUESTION_RE = re.compile(r"— Вопрос \d+/\d+")
 
 async def _test_options(session: dict | None) -> list | None:
     """Тела вариантов текущего вопроса (BASIC_TEST/EXAM) — для BLOCK-кнопок
-    «A · текст» (дизайн 17.08: все тела ≤24 симв. → нажатие без сверки)."""
-    if not session or session["state"] not in ("BASIC_TEST", "EXAM"):
+    «A · текст» (дизайн 17.08: все тела ≤24 симв. → нажатие без сверки).
+
+    Порядок берём из quiz.question_view — ТОЙ ЖЕ функции, что рисует текст
+    вопроса (02.09). Иначе кнопка «B» пошлёт букву не того варианта, который
+    сотрудник прочитал. В паузе кнопок ответа нет: там буква не засчитывается.
+    """
+    if not session or session["state"] not in quiz.TEST_STATES:
         return None
     questions = await asyncio.to_thread(get_course_questions,
                                         session["course_id"])
-    phase = "basic" if session["state"] == "BASIC_TEST" else "exam"
+    phase = quiz.phase_of(session["state"])
     q_list = questions.get(f"{phase}_questions", [])
     idx = session.get("current_q_idx", 0)
     if not (0 <= idx < len(q_list)):
         return None
-    bodies = []
-    for o in q_list[idx].get("options", []):
-        m = _OPT_BODY_RE.match(str(o).strip())
-        if not m:
-            return None
-        bodies.append(m.group(1).strip())
-    return bodies if len(bodies) == 4 else None
+    return quiz.question_view(session, q_list[idx], phase, idx).bodies
 
 
 async def _session_keyboard(user_id: str) -> list | None:
@@ -995,8 +1066,9 @@ async def _reminder_keyboard(uid: str) -> list | None:
     if not BUTTONS_ENABLED:
         return None
     session = await asyncio.to_thread(get_session, uid)
-    if session and session["state"] in ("BASIC_TEST", "EXAM"):
-        label = ("▶ Продолжить экзамен" if session["state"] == "EXAM"
+    if session and session["state"] in quiz.QUIZ_STATES:
+        label = ("▶ Продолжить экзамен"
+                 if quiz.phase_of(session["state"]) == "exam"
                  else "▶ Продолжить тест")
         return keyboards.start_button(label, "Продолжить")
     return await _session_keyboard(uid)
@@ -1058,12 +1130,12 @@ async def _handle_employee_message(user_id: str, question: str,
         # теряет A–D под собой — [▶ Продолжить] возвращает вопрос одним
         # тапом; интуитивность важнее скорости.
         q_lower = question.strip().lower()
-        in_test = bool(after and after["state"] in ("BASIC_TEST", "EXAM"))
-        non_question = in_test and not _QUESTION_RE.search(text)
+        in_quiz = bool(after and after["state"] in quiz.QUIZ_STATES)
+        non_question = in_quiz and not _QUESTION_RE.search(text)
         is_menu = (q_lower in _MENU_COMMANDS
                    and (after is None or after["state"] in
-                        ("READING", "WAITING_HR", "EXAM_READY",
-                         "BASIC_TEST", "EXAM")))
+                        ("READING", "WAITING_HR", "EXAM_READY")
+                        + quiz.QUIZ_STATES))
         if is_menu or non_question:
             role = (after.get("role") if after
                     else await asyncio.to_thread(resolve_role_cached, user_id))
@@ -1076,8 +1148,8 @@ async def _handle_employee_message(user_id: str, question: str,
                 [(c["n"], display_name(c["doc_name"]), c["status"])
                  for c in selectable],
                 reading=bool(after and after["state"] == "READING"),
-                resume_test=in_test, retake=retake,
-                resume_exam=bool(after and after["state"] == "EXAM"),
+                resume_test=in_quiz, retake=retake,
+                resume_exam=bool(after and quiz.phase_of(after["state"]) == "exam"),
                 show_courses_button=non_question and not is_menu)
             if menu_kb:
                 keyboard = menu_kb
@@ -1156,38 +1228,54 @@ async def command_handler(request: Request):
 
 # ── Рассылка «доступен новый курс» при активации (демо-фидбек A) ─────────────
 
-def _course_recipients(course: dict) -> list[str]:
-    """Кому анонсировать активированный курс (sync — звать через to_thread):
-    в whitelist, БЕЗ активной сессии, курс не пройден, роль пересекается с
-    ролями курса. Роль неизвестна (ни разу не выбирал) → только ALL-курсы,
-    иначе ролевые курсы спамят не тем людям (до №8 роль-из-отдела)."""
+def _course_recipients(course: dict) -> list[tuple[str, bool]]:
+    """Кому анонсировать активированный курс: [(uid, занят ли другим курсом)].
+
+    В whitelist, курс не пройден, роль пересекается с ролями курса. Роль
+    неизвестна (ни разу не выбирал) → только ALL-курсы, иначе ролевые курсы
+    спамят не тем людям. Sync — звать через to_thread."""
     croles = set(course_roles(course))
-    uids = []
+    out = []
     for e in get_all_employees():
         uid = e["bitrix_uid"]
-        if get_session(uid):                      # busy: текущий курс/выбор роли
-            continue
         done = {s["course_id"] for s in get_sessions_by_user(uid)
                 if s["state"] == "DONE"}
         if course["id"] in done:
             continue
         role = resolve_role_cached(uid)
-        if role and ({role, ALL_STAFF} & croles):
-            uids.append(uid)
-        elif role is None and ALL_STAFF in croles:
-            uids.append(uid)
-    return uids
+        if role_matches(role, croles):
+            # 02.09 (фидбек юзера): уведомление получают ВСЕ подходящие, в том
+            # числе занятые другим курсом — им уходит другой текст, а не тишина
+            out.append((uid, bool(get_session(uid))))
+    return out
 
 
-async def _broadcast_course(course: dict, uids: list[str]) -> None:
+async def _broadcast_course(course: dict, recipients: list) -> None:
     """Анонс от EMPLOYEE-бота (BOT_ID): client_id не передаём — _send возьмёт
-    BOT_CLIENT_ID из .env. Последовательно: _send ретраит до 5 раз на флапе."""
-    text = (f"📚 Тебе доступен новый курс: *{display_name(course['doc_name'])}*\n"
-            "Напиши мне любое сообщение, чтобы начать обучение.\n"
-            f"⏰ На прохождение — {ESCALATION_DAYS} дней.")
-    kb = keyboards.start_button("▶ Начать обучение") if BUTTONS_ENABLED else None
-    for uid in uids:
-        await _send(f"u{uid}", text, BOT_ID, **_kb_kwargs(kb))
+    BOT_CLIENT_ID из .env. Последовательно: _send ретраит до 5 раз на флапе.
+
+    02.09 (фидбек юзера): уведомление приходит ВСЕМ подходящим, но текст
+    разный — свободного зовём начать, занятого другим курсом не выдёргиваем.
+    Ссылка на документ есть в ОБОИХ вариантах: раньше она появлялась только
+    вторым шагом, в первом сообщении об обучении."""
+    name = display_name(course["doc_name"])
+    link = doc_link(course)
+    free_text = (f"📚 Тебе доступен новый курс: *{name}*\n"
+                 f"📄 Документ: {link}\n"
+                 "Напиши мне любое сообщение, чтобы начать обучение.\n"
+                 f"⏰ На прохождение — {ESCALATION_DAYS} дней.")
+    busy_text = (f"📚 Добавлен новый курс: *{name}*\n"
+                 f"📄 Документ: {link}\n"
+                 "Он ждёт в «Мои курсы» — закончи текущий и возьмёшь его.\n"
+                 f"⏰ На прохождение — {ESCALATION_DAYS} дней.")
+    free_kb = (keyboards.start_button("▶ Начать обучение")
+               if BUTTONS_ENABLED else None)
+    busy_kb = (keyboards.start_button("📚 Мои курсы", "Мои курсы",
+                                      role="secondary")
+               if BUTTONS_ENABLED else None)
+    for uid, busy in recipients:
+        await _send(f"u{uid}", busy_text if busy else free_text, BOT_ID,
+                    **_kb_kwargs(busy_kb if busy else free_kb))
 
 
 def _standard_recipients(doc_roles: list[str]) -> list[str]:
@@ -1199,9 +1287,7 @@ def _standard_recipients(doc_roles: list[str]) -> list[str]:
     for e in get_all_employees():
         uid = e["bitrix_uid"]
         role = resolve_role_cached(uid)
-        if role and ({role, ALL_STAFF} & doc):
-            uids.append(uid)
-        elif role is None and ALL_STAFF in doc:
+        if role_matches(role, doc):
             uids.append(uid)
     return uids
 
@@ -1531,7 +1617,7 @@ async def _handle_hr_message(user_id: str, question: str,
                     _pending_edits[user_id] = {
                         "course_id": course_id, "q_num": q_num,
                         "basic_len": b, "exam_len": e,
-                        "doc_name": course["doc_name"], "step": "text",
+                        "doc_name": course["doc_name"], "step": "oneshot",
                         "draft": {"text": q["text"],
                                   "options": list(q["options"]),
                                   "correct": q["correct"],
@@ -1539,7 +1625,7 @@ async def _handle_hr_message(user_id: str, question: str,
                         "expires": time.monotonic() + PENDING_EDIT_TTL,
                     }
                     text = _wizard_step_text(_pending_edits[user_id])
-                    kb = keyboards.hr_wizard_step()
+                    kb = keyboards.hr_oneshot_edit()
 
     elif msg_lower.startswith("перегенерировать"):
         m = re.match(r"^перегенерировать\s+(\d+)(?:\.(\d+))?$", msg_lower)
@@ -2107,9 +2193,14 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
         course_row = await asyncio.to_thread(get_course_by_id, course_id)
         n_recipients = len(await asyncio.to_thread(
             _course_recipients, course_row)) if course_row else 0
+        # 02.09: число вопросов адаптивное (31.08) — раньше здесь было зашито
+        # «15 вопросов (5 базовых + 10 экзаменационных)», и HR видел не то,
+        # что в курсе (живой пример: 4 + 8)
+        n_basic, n_exam = phase_lens(questions)
         notify_text = (
             f"📄 Новый документ: *{file_name}*\n"
-            f"15 вопросов (5 базовых + 10 экзаменационных) · "
+            f"{n_basic + n_exam} вопросов ({n_basic} базовых + "
+            f"{n_exam} экзаменационных) · "
             f"{n_recipients} подходящих получателей рассылки.\n"
             "После подтверждения курс активируется и рассылка уйдёт сразу.\n\n"
             f"Посмотреть вопросы: Вопросы {course_id}\n"

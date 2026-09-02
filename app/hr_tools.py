@@ -20,6 +20,8 @@ _CYR_TO_LAT = {"А": "A", "В": "B", "С": "C", "Д": "D"}
 _OPTION_RE = re.compile(r"^([a-dавсд])[.)]\s*(.+)$", re.IGNORECASE)
 _ANSWER_RE = re.compile(r"^ответ\s*[:\-—]\s*(.+)$", re.IGNORECASE)
 _EXPLANATION_RE = re.compile(r"^пояснение\s*[:\-—]\s*(.+)$", re.IGNORECASE)
+# «1. Текст вопроса» из карточки — HR копирует вопрос вместе с номером
+_LEAD_NUM_RE = re.compile(r"^\d{1,2}[.)]\s*")
 
 REPLACEMENT_TEMPLATE = (
     "Текст вопроса\n"
@@ -38,6 +40,8 @@ _STATE_LABELS = {
     "WAITING_HR": "ждёт допуска к экзамену",
     "EXAM_READY": "допущен к экзамену",
     "EXAM": "сдаёт экзамен",
+    "PAUSED_BASIC": "базовый тест на паузе",
+    "PAUSED_EXAM": "экзамен на паузе",
 }
 
 
@@ -115,6 +119,84 @@ def format_question_card(doc_name: str, q: dict, q_num: int,
     if q.get("explanation"):
         lines += ["", f"Пояснение: {q['explanation']}"]
     return "\n".join(lines)
+
+
+def format_question_editable(q: dict) -> str:
+    """Текущий вопрос в формате шаблона — HR копирует, правит строку и шлёт
+    обратно одним сообщением (02.09: 6-шаговый визард был слишком долгим)."""
+    lines = [str(q.get("text", "")).strip()]
+    lines += [str(o).strip() for o in q.get("options", [])]
+    lines.append(f"Ответ: {q.get('correct', '')}")
+    if q.get("explanation"):
+        lines.append(f"Пояснение: {q['explanation']}")
+    return "\n".join(lines)
+
+
+def parse_partial_replacement(raw: str) -> dict:
+    """Разбор ЛЮБОГО подмножества полей вопроса из сообщения HR (02.09).
+
+    Понимает и целый блок, и точечную правку:
+      «B. новый вариант» — только вариант B;
+      «Ответ: C» — только правильный ответ;
+      «Пояснение: …» — только пояснение;
+      строка без префикса — новый текст вопроса (ведущая нумерация «1. »
+      из карточки срезается — HR копирует вопрос вместе с номером).
+
+    Возвращает {} — не распознано ничего. Недостающие поля вызывающий берёт
+    из текущего вопроса: раньше блок без строки «Ответ:» не разбирался вовсе
+    и молча уезжал в текст вопроса (живой прогон 02.09).
+    """
+    text_lines: list[str] = []
+    options: dict[str, str] = {}
+    correct, explanation = None, None
+    seen_option = False
+
+    for line in (ln.strip() for ln in raw.splitlines()):
+        if not line:
+            continue
+        m = _OPTION_RE.match(line)
+        if m:
+            options[_norm_letter(m.group(1))] = m.group(2).strip()
+            seen_option = True
+            continue
+        m = _ANSWER_RE.match(line)
+        if m:
+            correct = _norm_letter(m.group(1))
+            continue
+        m = _EXPLANATION_RE.match(line)
+        if m:
+            explanation = m.group(1).strip()
+            continue
+        if not seen_option:      # текст вопроса — только до первого варианта
+            text_lines.append(line)
+
+    out: dict = {}
+    if text_lines:
+        head = _LEAD_NUM_RE.sub("", text_lines[0], count=1).strip()
+        out["text"] = " ".join([head] + text_lines[1:]).strip()
+    if options:
+        out["options"] = options
+    if correct in ("A", "B", "C", "D"):
+        out["correct"] = correct
+    if explanation is not None:
+        out["explanation"] = explanation
+    return out
+
+
+def merge_replacement(draft: dict, patch: dict) -> dict:
+    """Наложить распознанную правку на текущий вопрос (не мутируя draft)."""
+    out = {"text": draft["text"], "options": list(draft["options"]),
+           "correct": draft["correct"],
+           "explanation": draft.get("explanation", "")}
+    if "text" in patch:
+        out["text"] = patch["text"]
+    for letter, body in (patch.get("options") or {}).items():
+        out["options"]["ABCD".index(letter)] = f"{letter}. {body}"
+    if "correct" in patch:
+        out["correct"] = patch["correct"]
+    if "explanation" in patch:
+        out["explanation"] = patch["explanation"]
+    return out
 
 
 def parse_replacement(raw: str) -> dict | None:

@@ -7,7 +7,7 @@ import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from app.roles import role_mask
+from app.roles import doc_mask, role_mask
 
 load_dotenv()
 
@@ -38,7 +38,8 @@ def cosine_sim(a, b):
     b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-10)
     return b @ a
 
-def answer(query, chunks, embeddings, section_filter, answer_length, role_filter=None):
+def answer(query, chunks, embeddings, section_filter, answer_length,
+           role_filter=None, exclude_doc=None):
     # Flapping WSL2 network times out on OpenAI; SDK does exponential backoff itself.
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=20.0, max_retries=3)
 
@@ -55,6 +56,13 @@ def answer(query, chunks, embeddings, section_filter, answer_length, role_filter
     # Ролевая маска применяется всегда: при role_filter=None она исключает
     # только audience=guest (бот отвечает сотрудникам, не гостям).
     scores = scores * role_mask(chunks, role_filter)
+
+    # 02.09: документ, по которому сотрудник прямо сейчас сдаёт тест, из поиска
+    # исключён — вопросы генерируются из него же. ИМЕННО МАСКОЙ: срезать список
+    # chunks нельзя, chunks[i] и embeddings[i] связаны позицией, и сдвиг
+    # индексов вернул бы куски ровно того документа, который прятали.
+    if exclude_doc:
+        scores = scores * doc_mask(chunks, exclude_doc)
 
     top = np.argsort(scores)[::-1][:16]
     relevant = [{**chunks[i], "score": float(scores[i])} for i in top if scores[i] > 0.01]

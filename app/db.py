@@ -12,6 +12,10 @@ from datetime import datetime
 DB_PATH = os.getenv("DB_PATH") or os.path.join(
     os.path.dirname(__file__), "..", "onboarding.db")
 
+# 02.09: роль легаси-аккаунтов (до перехода на HR-выбор роли приглашали только
+# менеджеров). Должна существовать в data/roles.json — там же она в all_access.
+LEGACY_ROLE = os.getenv("LEGACY_EMPLOYEE_ROLE", "manager")
+
 
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -52,6 +56,7 @@ def init_db() -> None:
                 score_basic   INTEGER DEFAULT 0,
                 score_exam    INTEGER DEFAULT 0,
                 role          TEXT,
+                attempt       INTEGER DEFAULT 0,
                 started_at    TEXT DEFAULT (datetime('now')),
                 updated_at    TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY (course_id) REFERENCES courses(id)
@@ -110,6 +115,11 @@ def init_db() -> None:
             );
         """)
         _ensure_column(conn, "sessions", "role", "TEXT")
+        # 02.09: номер попытки — сид пер-сессионного порядка вариантов A–D.
+        # Пересдача переиспользует ТУ ЖЕ строку сессии: без счётчика порядок
+        # повторился бы, и пересдача сдавалась бы по буквам, записанным в
+        # прошлый заход («Правильный ответ: B» показывается после провала).
+        _ensure_column(conn, "sessions", "attempt", "INTEGER DEFAULT 0")
         # №4: архив курса при удалении файла; детект новой версии при том же file_id
         _ensure_column(conn, "courses", "archived_at", "TEXT")
         _ensure_column(conn, "processed_files", "update_time", "TEXT")
@@ -146,6 +156,27 @@ def init_db() -> None:
                     " VALUES (?, 'hr-seed')",
                     (uid.strip(),),
                 )
+        # 02.09 (решение юзера): до перехода на HR-выбор роли приглашали
+        # ТОЛЬКО менеджеров — разово проставляем им роль «Менеджер»
+        # (all_access в roles.json: видит все стандарты и курсы). Иначе
+        # легаси-аккаунт без роли до сих пор получал меню «выбери роль»,
+        # хотя роль теперь назначает HR. Гейт-метка = ОДИН прогон на БД:
+        # снятую роль новых сотрудников повторный старт не восстановит.
+        if conn.execute(
+            "SELECT value FROM meta WHERE key = 'legacy_roles_backfilled'"
+        ).fetchone() is None:
+            cur = conn.execute(
+                "UPDATE employees SET role = ? WHERE role IS NULL",
+                (LEGACY_ROLE,),
+            )
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES "
+                "('legacy_roles_backfilled', ?)",
+                (datetime.utcnow().isoformat(),),
+            )
+            if cur.rowcount:
+                print(f"[migrate] роль «{LEGACY_ROLE}» проставлена "
+                      f"{cur.rowcount} легаси-сотрудникам")
         # №9: временный сид реестра руководителей (клиент заменит HR-командами)
         conn.execute(
             "INSERT OR IGNORE INTO managers (email, added_by) VALUES (?, 'seed')",
@@ -320,6 +351,20 @@ def admit_session(session_id: int) -> None:
             "UPDATE sessions SET state = 'EXAM_READY', current_q_idx = 0 WHERE id = ?",
             (session_id,),
         )
+
+
+def bump_attempt(session_id: int) -> int:
+    """Новая попытка → новый порядок вариантов. Возвращает НОВОЕ значение,
+    чтобы вызывающий не рендерил вопрос из устаревшего словаря сессии
+    (иначе сотрудник увидит порядок попытки N, а ответ размапится N+1).
+    updated_at не трогаем — его двигает соседний update_session."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET attempt = COALESCE(attempt, 0) + 1"
+            " WHERE id = ?", (session_id,))
+        row = conn.execute("SELECT attempt FROM sessions WHERE id = ?",
+                           (session_id,)).fetchone()
+        return row["attempt"] if row else 0
 
 
 def get_session_by_id(session_id: int) -> dict | None:

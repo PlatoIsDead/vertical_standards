@@ -50,6 +50,33 @@ def role_name(role_id: str) -> str:
     return load_roles_config().get("roles", {}).get(role_id, role_id)
 
 
+def all_access_roles() -> set[str]:
+    """02.09: роли, которым доступны ВСЕ документы и курсы — roles.json
+    "all_access" (сейчас там «Менеджер»). Ключа нет / пуст → поведение
+    прежнее: сверка идёт только по {роль, all_staff}."""
+    cfg = load_roles_config().get("all_access") or []
+    return {str(r) for r in cfg}
+
+
+def role_sees_all(role_id: str | None) -> bool:
+    return bool(role_id) and role_id in all_access_roles()
+
+
+def role_matches(role_id: str | None, doc_roles) -> bool:
+    """Единая сверка «роль ↔ роли документа/курса» (02.09).
+
+    - all_access-роль («Менеджер») — любой документ и курс;
+    - роль не выбрана (None) — только общие (all_staff);
+    - иначе пересечение {роль, all_staff} с ролями документа.
+    """
+    if role_sees_all(role_id):
+        return True
+    target = set(doc_roles or [])
+    if role_id is None:
+        return ALL_STAFF in target
+    return bool({role_id, ALL_STAFF} & target)
+
+
 def roles_for_folder(folder_id: str) -> list[str]:
     return list(load_roles_config().get("folders", {}).get(str(folder_id), []))
 
@@ -120,14 +147,31 @@ def role_mask(chunks: list[dict], role_id: str | None) -> np.ndarray:
 
     - audience=guest исключается ВСЕГДА (бот отвечает только сотрудникам)
     - role_id=None (роль не выбрана / legacy-сессия) — пропускаем всё негостевое
+    - all_access-роль («Менеджер», 02.09) — тоже всё негостевое
     - чанк без ключа roles / с пустым roles = all_staff (обратная совместимость)
     """
+    sees_all = role_id is None or role_sees_all(role_id)
     vals = []
     for c in chunks:
         if c.get("audience") == "guest":
             vals.append(0.0)
             continue
         roles = c.get("roles") or []
-        ok = role_id is None or not roles or ALL_STAFF in roles or role_id in roles
+        ok = sees_all or not roles or ALL_STAFF in roles or role_id in roles
         vals.append(1.0 if ok else 0.0)
     return np.array(vals, dtype=np.float32)
+
+
+def doc_mask(chunks: list[dict], exclude_doc: str) -> np.ndarray:
+    """0/1-маска «чанк НЕ принадлежит документу exclude_doc» (02.09).
+
+    Нужна, чтобы во время теста бот не подсказывал по тому самому документу,
+    по которому идёт проверка. Совпадение — по точному doc_name (то же поле,
+    что в index_store._matches и courses.doc_name).
+
+    ОГРАНИЧЕНИЕ: у легаси-чанков (залитых до пайплайна ингеста) ключа doc_name
+    нет вовсе — такие чанки маска не отфильтрует. Для документов, загруженных
+    через бота, doc_name есть всегда (проверено на боевом кэше 02.09).
+    """
+    return np.array([0.0 if c.get("doc_name") == exclude_doc else 1.0
+                     for c in chunks], dtype=np.float32)

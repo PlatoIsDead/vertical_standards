@@ -185,14 +185,19 @@ def test_hr_edit_wizard_keyboards(hr_env, monkeypatch):
     client, captured = hr_env
     _post_hr(client, "Изменить 5.1")
     assert _wait_for(lambda: captured)
+    # 02.09: правка открывается одним сообщением; шаги — за кнопкой
     assert [b["TEXT"] for b in _btns(captured[0]["keyboard"])] == \
+        ["✏️ По шагам", "Отмена"]
+    _post_hr(client, "По шагам")
+    assert _wait_for(lambda: len(captured) >= 2)
+    assert [b["TEXT"] for b in _btns(captured[1]["keyboard"])] == \
         ["• Оставить", "Отмена"]
     # цельный блок по шаблону → сразу превью с confirm-клавиатурой
     _post_hr(client, "Новый вопрос?\nA. а\nB. б\nC. в\nD. г\nОтвет: A")
-    assert _wait_for(lambda: len(captured) >= 2)
-    assert "Проверь вопрос" in captured[1]["text"]
+    assert _wait_for(lambda: len(captured) >= 3)
+    assert "Проверь вопрос" in captured[2]["text"]
     assert [(b["TEXT"], b["COMMAND_PARAMS"])
-            for b in _btns(captured[1]["keyboard"])] == \
+            for b in _btns(captured[2]["keyboard"])] == \
         [("💾 Сохранить", "Сохранить"), ("🔄 Заново", "Заново"),
          ("Отмена", "Отмена")]
 
@@ -442,7 +447,7 @@ def send_trap(monkeypatch):
 
 def test_broadcast_course_start_button(send_trap, monkeypatch):
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
-    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, ["1", "2"]))
+    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, [("1", False), ("2", False)]))
     assert len(send_trap) == 2
     assert all(c["keyboard"][0]["COMMAND_PARAMS"] == "Начать"
                for c in send_trap)
@@ -450,7 +455,7 @@ def test_broadcast_course_start_button(send_trap, monkeypatch):
 
 def test_broadcast_course_no_keyboard_flag_off(send_trap, monkeypatch):
     monkeypatch.setattr(bot, "BUTTONS_ENABLED", False)
-    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, ["1"]))
+    asyncio.run(bot._broadcast_course({"doc_name": "Д.docx"}, [("1", False)]))
     assert send_trap[0]["keyboard"] is None
 
 
