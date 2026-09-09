@@ -60,6 +60,30 @@ class FakeAsyncClient:
     async def get(self, url):
         return FakeResponse(content=FakeAsyncClient.files.get(url, b""))
 
+    def stream(self, method, url):
+        return FakeStream(FakeAsyncClient.files.get(url, b""))
+
+
+class FakeStream:
+    """httpx.AsyncClient.stream("GET", url) — асинхронный контекст с aiter_bytes."""
+
+    def __init__(self, content: bytes):
+        self._content = content
+        self.status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    async def aiter_bytes(self, size=65536):
+        for i in range(0, len(self._content), size):
+            yield self._content[i:i + size]
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
@@ -433,3 +457,124 @@ def test_same_content_other_name_attaches(env, monkeypatch):
     assert any("то же содержимое" in t for t in notified)
     h = hashlib.sha256(V1_TEXT.encode("utf-8")).hexdigest()
     assert db.get_processed_by_hash(h)["content_hash"] == h
+
+
+# ── Тяжёлые файлы: потолок размера и цикл падений (09.09) ────────────────────
+
+def _hr_capture(monkeypatch):
+    notified = []
+
+    async def fake_send(dialog_id, text, bot_id=None, client_id="", keyboard=None):
+        notified.append(text)
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    monkeypatch.setattr(bot, "_hr_ids", lambda: ["9"])
+    return notified
+
+
+def test_oversized_file_skipped_and_marked(env, monkeypatch):
+    """Файл больше потолка: не качается вовсе, курса нет, HR предупреждён,
+    файл помечен обработанным — иначе поллер брал бы его каждый круг."""
+    notified = _hr_capture(monkeypatch)
+    monkeypatch.setattr(bot, "MAX_DOC_BYTES", 10)
+    monkeypatch.setattr(bot, "MAX_DOC_MB", 10 / (1024 * 1024))
+
+    downloads = []
+    monkeypatch.setattr(bot, "_download_to_file",
+                        lambda *a, **kw: downloads.append(a) or ("h", 0))
+
+    FakeAsyncClient.routes["disk.file.get"] = {
+        "result": {"DOWNLOAD_URL": "https://dl/big", "DETAIL_URL": "https://portal/doc",
+                   "UPDATE_TIME": "T1", "SIZE": "771251595"},
+    }
+    asyncio.run(bot.process_new_document("big1", "Welcome.pptx", ["housekeeper"], "111"))
+
+    assert downloads == []                                  # скачивания не было
+    assert db.get_course_by_doc_name("Welcome.pptx") is None
+    assert db.is_file_processed("big1")
+    assert any("больше лимита" in t for t in notified)
+
+
+def test_download_streams_and_hashes(env, monkeypatch):
+    """Скачивание идёт кусками на диск (не r.content в память), хеш тот же."""
+    import hashlib
+
+    payload = V1_TEXT.encode("utf-8")
+    seen_chunks = []
+
+    async def run():
+        async with bot.httpx.AsyncClient() as client:
+            FakeAsyncClient.files["https://dl/s1"] = payload
+            monkeypatch.setattr(bot, "DOWNLOAD_CHUNK_BYTES", 64)
+            path = str(tmp_dir / "tmp_поток.txt")
+            digest, size = await bot._download_to_file(client, "https://dl/s1", path)
+            seen_chunks.append((digest, size, open(path, "rb").read()))
+
+    tmp_dir = __import__("pathlib").Path(__import__("tempfile").mkdtemp())
+    asyncio.run(run())
+    digest, size, written = seen_chunks[0]
+    assert written == payload
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+
+
+def test_repeated_crash_stops_after_limit(env, monkeypatch):
+    """Файл, роняющий обработку (в т.ч. молча — OOM-kill): после N попыток
+    бот перестаёт его трогать и один раз пишет HR."""
+    notified = _hr_capture(monkeypatch)
+    monkeypatch.setattr(bot, "MAX_INGEST_ATTEMPTS", 3)
+
+    attempts = {"n": 0}
+
+    async def exploding_download(client, url, path):
+        attempts["n"] += 1
+        raise MemoryError("не влезло в память")
+
+    monkeypatch.setattr(bot, "_download_to_file", exploding_download)
+    FakeAsyncClient.routes["disk.file.get"] = {
+        "result": {"DOWNLOAD_URL": "https://dl/x", "DETAIL_URL": "",
+                   "UPDATE_TIME": "T1", "SIZE": "100"},
+    }
+
+    for _ in range(5):
+        bot._ingest_locks.clear()   # каждый прогон — свой луп asyncio.run
+        asyncio.run(bot.process_new_document("crash1", "Битый.txt", ["hk"], "111"))
+
+    assert attempts["n"] == 3                       # 4-я и 5-я даже не качали
+    assert len([t for t in notified if "сорвалась" in t]) == 1
+    assert db.get_ingest_attempt("crash1")["attempts"] == 5
+
+
+def test_new_version_resets_attempt_counter(env, monkeypatch):
+    """Перевыложенный файл (другой UPDATE_TIME) получает попытки заново."""
+    _hr_capture(monkeypatch)
+    monkeypatch.setattr(bot, "MAX_INGEST_ATTEMPTS", 2)
+
+    async def exploding_download(client, url, path):
+        raise MemoryError("не влезло в память")
+
+    monkeypatch.setattr(bot, "_download_to_file", exploding_download)
+
+    def _route(update_time):
+        FakeAsyncClient.routes["disk.file.get"] = {
+            "result": {"DOWNLOAD_URL": "https://dl/x", "DETAIL_URL": "",
+                       "UPDATE_TIME": update_time, "SIZE": "100"},
+        }
+
+    for _ in range(3):
+        _route("T1")
+        bot._ingest_locks.clear()
+        asyncio.run(bot.process_new_document("v1", "Битый.txt", ["hk"], "111"))
+    assert db.get_ingest_attempt("v1")["attempts"] == 3
+
+    _route("T2")
+    bot._ingest_locks.clear()
+    asyncio.run(bot.process_new_document("v1", "Битый.txt", ["hk"], "111"))
+    assert db.get_ingest_attempt("v1")["attempts"] == 1
+
+
+def test_successful_ingest_clears_attempts(env):
+    """Дошли до конца — счётчик обрывов снимается (mark_file_processed)."""
+    db.bump_ingest_attempt("101", "Правила.txt", "T1")
+    _ingest("101", "Правила.txt", "111", V1_TEXT)
+    assert db.get_ingest_attempt("101") is None

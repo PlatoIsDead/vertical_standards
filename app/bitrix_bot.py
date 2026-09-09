@@ -18,6 +18,7 @@ from app.db import (
     add_employee,
     add_manager,
     admit_session,
+    bump_ingest_attempt,
     get_active_courses,
     count_processed_by_doc_name,
     get_all_employees,
@@ -27,6 +28,7 @@ from app.db import (
     get_employee,
     get_employee_by_email,
     get_escalated,
+    get_ingest_attempt,
     get_managers,
     get_meta,
     get_pending_courses,
@@ -46,6 +48,7 @@ from app.db import (
     is_user_seen,
     mark_escalated,
     mark_file_processed,
+    mark_ingest_notified,
     mark_user_seen,
     remove_manager,
     remove_processed_file,
@@ -125,6 +128,13 @@ ESCALATION_CHECK_INTERVAL = 3600
 REPORTS_FOLDER_ID = os.getenv("REPORTS_FOLDER_ID", "")
 # №7: инлайн-кнопки employee-бота — выключены до живой проверки на сервере
 BUTTONS_ENABLED = os.getenv("BUTTONS_ENABLED", "0") == "1"
+# Ингест тяжёлых файлов (09.09): страховочный потолок размера и число попыток
+# до отказа. Оба ограничения появились после Welcome.pptx на 735 МБ — файл
+# скачивался целиком в память и убивал контейнер OOM-killer'ом по кругу.
+MAX_DOC_MB = float(os.getenv("MAX_DOC_MB", "1024"))
+MAX_DOC_BYTES = int(MAX_DOC_MB * 1024 * 1024)
+MAX_INGEST_ATTEMPTS = int(os.getenv("MAX_INGEST_ATTEMPTS", "3"))
+DOWNLOAD_CHUNK_BYTES = 1 << 20
 
 # Initialise DB and load RAG index at startup
 init_db()
@@ -2024,6 +2034,67 @@ async def process_new_document(file_id: str, file_name: str,
         await _ingest_document(file_id, file_name, roles, folder_id, parsed, ext)
 
 
+async def _download_to_file(client, url: str, path: str) -> tuple[str, int]:
+    """Скачать документ на диск потоком. Возвращает (sha256, размер в байтах).
+
+    Хеш считается на лету — держать все байты в памяти ради дедупа копий
+    (17.08) не нужно. Прерывается, как только скачано больше MAX_DOC_BYTES:
+    иначе Диск мог бы залить весь раздел файлом без честного SIZE."""
+    digest = hashlib.sha256()
+    size = 0
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    async with client.stream("GET", url) as resp:
+        resp.raise_for_status()
+        with open(path, "wb") as f:
+            async for chunk in resp.aiter_bytes(DOWNLOAD_CHUNK_BYTES):
+                digest.update(chunk)
+                f.write(chunk)
+                size += len(chunk)
+                if size > MAX_DOC_BYTES:
+                    break
+    return digest.hexdigest(), size
+
+
+async def _report_too_large(file_id: str, file_name: str, folder_id: str,
+                            update_time: str, detail_url: str, size: int) -> None:
+    """Файл больше потолка: курс не создаём, но помечаем обработанным —
+    иначе поллер брался бы за него каждые POLL_INTERVAL. Новая версия файла
+    (другой UPDATE_TIME) снова пойдёт в ингест."""
+    mb = size / (1024 * 1024)
+    print(f"[process_new_document] {file_name}: {mb:.0f} МБ > потолка "
+          f"{MAX_DOC_MB:.0f} МБ — пропуск")
+    await asyncio.to_thread(mark_file_processed, file_id, file_name, folder_id,
+                            update_time, None)
+    text = (f"⚠️ «{file_name}» — {mb:.0f} МБ, это больше лимита "
+            f"{MAX_DOC_MB:.0f} МБ: курс не создан и в поиск документ не попал.\n"
+            "Обычно вес дают вставленные видео и картинки — выложи версию "
+            "полегче (или сохрани текст отдельным файлом), и бот подхватит её сам.")
+    if detail_url:
+        text += f"\n{detail_url}"
+    for hr_id in _hr_ids():
+        await _send(str(hr_id), text, HR_BOT_ID)
+
+
+async def _report_ingest_stuck(file_id: str, file_name: str, detail_url: str,
+                               attempt: int) -> None:
+    """Файл валит обработку раз за разом (в т.ч. молча — OOM-kill): дальше не
+    пробуем, HR пишем один раз. Иначе поллер крутит цикл падений бесконечно."""
+    print(f"[process_new_document] {file_name}: попытка {attempt} > "
+          f"{MAX_INGEST_ATTEMPTS} — файл отложен")
+    row = await asyncio.to_thread(get_ingest_attempt, file_id)
+    if row and row.get("notified_at"):
+        return
+    await asyncio.to_thread(mark_ingest_notified, file_id)
+    text = (f"⚠️ «{file_name}»: обработка сорвалась {MAX_INGEST_ATTEMPTS} раза "
+            "подряд — бот больше не пробует, чтобы не уходить в цикл. "
+            "Курс не создан.\nВыложи документ заново (или другой версией) — "
+            "попытки начнутся с нуля.")
+    if detail_url:
+        text += f"\n{detail_url}"
+    for hr_id in _hr_ids():
+        await _send(str(hr_id), text, HR_BOT_ID)
+
+
 async def _ingest_document(file_id: str, file_name: str, roles: list[str],
                            folder_id: str, parsed: dict, ext: str) -> None:
     """Тело ингеста — строго под _doc_lock(file_name)."""
@@ -2035,8 +2106,9 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
         return
 
     tmp_path = None
+    data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0)) as client:
             # 1. Fetch metadata + DOWNLOAD_URL
             r = await client.post(
                 BITRIX_WEBHOOK_URL + "disk.file.get", json={"id": file_id}
@@ -2050,18 +2122,36 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
                 print(f"[process_new_document] No DOWNLOAD_URL for {file_id}")
                 return
 
-            # 2. Download bytes
-            r2 = await client.get(download_url)
-            r2.raise_for_status()
-            file_bytes = r2.content
-        # 17.08: дедуп переименованных копий — хеш сырого содержимого
-        content_hash = hashlib.sha256(file_bytes).hexdigest()
+            # 1.5. Счётчик попыток ДО скачивания: OOM-kill не даёт отработать
+            # except, и без записи в БД поллер начинал бы всё заново каждые
+            # POLL_INTERVAL (09.09: 18 рестартов подряд на одном файле).
+            attempt = await asyncio.to_thread(
+                bump_ingest_attempt, file_id, file_name, update_time
+            )
+            if attempt > MAX_INGEST_ATTEMPTS:
+                await _report_ingest_stuck(file_id, file_name, detail_url, attempt)
+                return
 
-        # 3. Save to temp path
-        data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
-        tmp_path = os.path.join(data_dir, f"tmp_{file_name}")
-        with open(tmp_path, "wb") as f:
-            f.write(file_bytes)
+            # 1.6. Потолок размера — по метаданным, до единого скачанного байта
+            size_meta = int(str(meta.get("SIZE") or "0") or 0)
+            if size_meta > MAX_DOC_BYTES:
+                await _report_too_large(file_id, file_name, folder_id, update_time,
+                                        detail_url, size_meta)
+                return
+
+            # 2. Скачивание потоком на диск: раньше файл читался целиком в
+            # память (r2.content) — 735 МБ презентации хватило, чтобы
+            # контейнер на 2 ГБ убил OOM-killer (09.09).
+            tmp_path = os.path.join(data_dir, f"tmp_{file_name}")
+            content_hash, size_bytes = await _download_to_file(
+                client, download_url, tmp_path
+            )
+            if size_bytes > MAX_DOC_BYTES:  # SIZE в метаданных соврал/отсутствовал
+                await _report_too_large(file_id, file_name, folder_id, update_time,
+                                        detail_url, size_bytes)
+                return
+            print(f"[process_new_document] downloaded {size_bytes // 1024} КБ "
+                  f"→ {os.path.basename(tmp_path)}")
 
         # 4. Parse to chunks (sync, run in thread) — диспетчер форматов (№4)
         new_chunks = await asyncio.to_thread(parse_file, tmp_path, ext, file_name)

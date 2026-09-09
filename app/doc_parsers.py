@@ -13,6 +13,12 @@ import sys
 
 SUPPORTED_EXTS = ("docx", "md", "pptx", "txt", "pdf")
 
+# Порог «лёгкого» разбора .pptx (09.09): python-pptx поднимает в память ВСЕ части
+# пакета, включая видео и картинки, — презентация Welcome.pptx на 735 МБ клала
+# контейнер по OOM (сервер 2 ГБ). Выше порога текст читается прямо из zip:
+# в память попадают только slideN.xml (десятки КБ), медиа не трогается.
+PPTX_LEAN_BYTES = int(float(os.getenv("PPTX_LEAN_MB", "20")) * 1024 * 1024)
+
 _SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 
@@ -69,7 +75,19 @@ def parse_txt(path: str, file_name: str) -> list[dict]:
 
 
 def parse_pptx(path: str, file_name: str) -> list[dict]:
-    """Слайд с текстом = чанк; heading = титул слайда или «Слайд N»."""
+    """Слайд с текстом = чанк; heading = титул слайда или «Слайд N».
+
+    Тяжёлые презентации (> PPTX_LEAN_BYTES) разбираются по zip — см.
+    parse_pptx_lean: python-pptx на них съедает память размером с файл."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    if size > PPTX_LEAN_BYTES:
+        print(f"[doc_parsers] {file_name}: {size // (1024 * 1024)} МБ — "
+              "лёгкий разбор pptx (текст из zip, без медиа)")
+        return parse_pptx_lean(path, file_name)
+
     from pptx import Presentation  # noqa: PLC0415
 
     prs = Presentation(path)
@@ -88,6 +106,82 @@ def parse_pptx(path: str, file_name: str) -> list[dict]:
             title = ""
         out.append({"text": body, "heading": title or f"Слайд {n}",
                     "section": file_name})
+    return out
+
+
+_NS_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_NS_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_NS_PR = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _slide_order(zf) -> list[str]:
+    """Порядок слайдов из presentation.xml + его rels; фолбэк — числовая
+    сортировка ppt/slides/slideN.xml (лексическая дала бы slide10 после slide1)."""
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+
+    names = set(zf.namelist())
+    try:
+        rels = ET.fromstring(zf.read("ppt/_rels/presentation.xml.rels"))
+        targets = {rel.get("Id"): rel.get("Target") for rel in rels}
+        pres = ET.fromstring(zf.read("ppt/presentation.xml"))
+        order = []
+        for sld in pres.iter(f"{_NS_P}sldId"):
+            target = targets.get(sld.get(f"{_NS_R}id"), "")
+            if not target:
+                continue
+            name = target[1:] if target.startswith("/") else "ppt/" + target
+            name = name.replace("ppt/../", "")
+            if name in names:
+                order.append(name)
+        if order:
+            return order
+    except (KeyError, ET.ParseError) as exc:
+        print(f"[doc_parsers] порядок слайдов из rels не прочитан ({exc}) — "
+              "фолбэк на имена файлов")
+
+    def _num(name: str) -> int:
+        m = re.search(r"slide(\d+)\.xml$", name)
+        return int(m.group(1)) if m else 0
+
+    return sorted((n for n in names
+                   if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)), key=_num)
+
+
+def parse_pptx_lean(path: str, file_name: str) -> list[dict]:
+    """Тот же контракт, что parse_pptx, но текст берётся прямо из zip.
+
+    Читается только XML слайдов, медиа (видео/картинки) не распаковывается —
+    память не зависит от размера презентации. Побочно берёт текст таблиц и
+    сгруппированных фигур, до которых shape.text_frame в parse_pptx не достаёт."""
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+    import zipfile  # noqa: PLC0415
+
+    out = []
+    with zipfile.ZipFile(path) as zf:
+        for n, name in enumerate(_slide_order(zf), 1):
+            try:
+                root = ET.fromstring(zf.read(name))
+            except (KeyError, ET.ParseError) as exc:
+                print(f"[doc_parsers] {file_name}: слайд {name} пропущен ({exc})")
+                continue
+
+            body = re.sub(r"\s+", " ", " ".join(
+                t.text for t in root.iter(f"{_NS_A}t") if t.text)).strip()
+            if len(body) < 30:  # пустые/мусорные слайды — как в parse_pptx
+                continue
+
+            title = ""
+            for sp in root.iter(f"{_NS_P}sp"):
+                ph = next((e for e in sp.iter(f"{_NS_P}ph")), None)
+                if ph is None or ph.get("type") not in ("title", "ctrTitle"):
+                    continue
+                title = re.sub(r"\s+", " ", " ".join(
+                    t.text for t in sp.iter(f"{_NS_A}t") if t.text)).strip()
+                break
+
+            out.append({"text": body, "heading": title or f"Слайд {n}",
+                        "section": file_name})
     return out
 
 

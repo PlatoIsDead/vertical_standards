@@ -106,6 +106,15 @@ def init_db() -> None:
                 added_at TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS ingest_attempts (
+                file_id      TEXT PRIMARY KEY,
+                doc_name     TEXT,
+                update_time  TEXT,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_attempt TEXT,
+                notified_at  TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS escalations (
                 user_id     TEXT NOT NULL,
                 course_id   INTEGER NOT NULL,
@@ -483,7 +492,12 @@ def get_processed_file(file_id: str) -> dict | None:
 def mark_file_processed(file_id: str, doc_name: str, folder_id: str = None,
                         update_time: str = None,
                         content_hash: str = None) -> None:
+    """Файл обработан. Заодно снимает счётчик попыток (ingest_attempts):
+    дошли до конца — прошлые обрывы больше ничего не значат."""
     with _conn() as conn:
+        conn.execute(
+            "DELETE FROM ingest_attempts WHERE file_id = ?", (str(file_id),)
+        )
         conn.execute(
             """INSERT OR REPLACE INTO processed_files
                (file_id, doc_name, folder_id, processed_at, update_time,
@@ -510,6 +524,9 @@ def remove_processed_file(file_id: str) -> None:
     with _conn() as conn:
         conn.execute(
             "DELETE FROM processed_files WHERE file_id = ?", (str(file_id),)
+        )
+        conn.execute(
+            "DELETE FROM ingest_attempts WHERE file_id = ?", (str(file_id),)
         )
 
 
@@ -678,6 +695,58 @@ def get_last_done_session(user_id: str) -> dict | None:
 
 
 # ── Meta (служебные метки, key-value) ────────────────────────────────────────
+
+def bump_ingest_attempt(file_id: str, doc_name: str,
+                        update_time: str = None) -> int:
+    """+1 к счётчику попыток ингеста файла; возвращает номер ТЕКУЩЕЙ попытки.
+
+    Счётчик в БД, а не в памяти процесса: 09.09 контейнер убивал OOM-killer
+    на скачивании 735-мегабайтной презентации — except не отрабатывал, после
+    рестарта поллер видел файл «ещё не обработанным» и всё повторялось (18
+    рестартов). Новая версия файла (другой UPDATE_TIME) обнуляет счётчик."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT attempts, update_time FROM ingest_attempts WHERE file_id = ?",
+            (str(file_id),),
+        ).fetchone()
+        prev = 0 if row is None or (update_time and row["update_time"] != update_time) \
+            else int(row["attempts"] or 0)
+        attempts = prev + 1
+        conn.execute(
+            """INSERT OR REPLACE INTO ingest_attempts
+               (file_id, doc_name, update_time, attempts, last_attempt, notified_at)
+               VALUES (?, ?, ?, ?, datetime('now'),
+                       CASE WHEN ? = 1 THEN NULL ELSE
+                            (SELECT notified_at FROM ingest_attempts
+                             WHERE file_id = ?) END)""",
+            (str(file_id), doc_name, update_time, attempts, attempts, str(file_id)),
+        )
+        return attempts
+
+
+def get_ingest_attempt(file_id: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM ingest_attempts WHERE file_id = ?", (str(file_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def mark_ingest_notified(file_id: str) -> None:
+    """HR предупреждён о зависшем файле — второй раз не пишем."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE ingest_attempts SET notified_at = datetime('now') "
+            "WHERE file_id = ?", (str(file_id),),
+        )
+
+
+def clear_ingest_attempts(file_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM ingest_attempts WHERE file_id = ?", (str(file_id),)
+        )
+
 
 def get_meta(key: str) -> str | None:
     with _conn() as conn:
