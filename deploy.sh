@@ -77,7 +77,8 @@ run "mkdir -p $BASE/src $BASE/state/data"
 
 echo "== 2/5 Код (git archive $REV) → $BASE/src/"
 ARCHIVE=$(mktemp /tmp/vs-src-XXXX.tgz)
-trap 'rm -f "$ARCHIVE"' EXIT
+ROLES_TMP=$(mktemp /tmp/vs-roles-XXXX.json)
+trap 'rm -f "$ARCHIVE" "$ROLES_TMP"' EXIT
 git -C "$LOCAL_DIR" archive --format=tar.gz -o "$ARCHIVE" HEAD "${SRC_PATHS[@]}"
 sync "$ARCHIVE" "$RUSER@$HOST:$BASE/src.tgz"
 run "rm -rf $BASE/src && mkdir -p $BASE/src \
@@ -92,12 +93,25 @@ if ! run "test -f $BASE/state/onboarding.db"; then
   echo "  onboarding.db отсутствует — копирую локальную базу"
   sync "$LOCAL_DIR/onboarding.db" "$RUSER@$HOST:$BASE/state/"
 fi
-for f in chunks_cache.json embeddings_cache.npy roles.json; do
+for f in chunks_cache.json embeddings_cache.npy; do
   if ! run "test -f $BASE/state/data/$f"; then
     echo "  data/$f отсутствует — копирую"
     sync "$LOCAL_DIR/data/$f" "$RUSER@$HOST:$BASE/state/data/"
   fi
 done
+
+# roles.json — не «сидирование, если нет», а СЛИЯНИЕ на каждый деплой.
+# Копия «только при отсутствии» держала на сервере конфиг от 11.08 без роли
+# «Менеджер» и all_access: HR-роль легаси-аккаунтов молча не применялась
+# (09.09). Простая перезапись тоже не годится — HR правит реестр из бота
+# («Аббревиатура добавить FIN …» → save_roles_config), эти правки должны
+# пережить деплой. merge_roles.py доливает недостающее и не трогает
+# расхождения, печатая их в лог.
+echo "  roles.json — слияние git → сервер"
+git -C "$LOCAL_DIR" show HEAD:data/roles.json > "$ROLES_TMP"
+sync "$ROLES_TMP" "$RUSER@$HOST:$BASE/roles_git.json"
+run "python3 $BASE/src/scripts/merge_roles.py $BASE/roles_git.json \
+    $BASE/state/data/roles.json && rm -f $BASE/roles_git.json"
 if ! run "test -d $BASE/state/data/courses"; then
   echo "  data/courses/ отсутствует — копирую"
   sync "$LOCAL_DIR/data/courses" "$RUSER@$HOST:$BASE/state/data/"
