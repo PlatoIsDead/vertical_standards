@@ -40,7 +40,7 @@ from app.db import (
     log_answer,
     update_session,
 )
-from app import keyboards, quiz
+from app import kb_tracker, keyboards, quiz
 from app.gamification import post_exam_congratulation
 from app.rag import answer as rag_answer
 from app.roles import (
@@ -1207,6 +1207,30 @@ def bare_dialog(dialog_id: str) -> str:
     return s[1:] if s.startswith("u") and s[1:].isdigit() else s
 
 
+def _track_keyboard_sync(webhook_url: str, bot_id, dialog_id, resp,
+                         client_id: str = "") -> None:
+    """Синхронный близнец bitrix_bot._track_keyboard для notify_hr (он идёт
+    мимо _send и работает в потоке). 11.09: кнопки только у последнего
+    сообщения HR-бота в диалоге; сбой снятия — старые кнопки остаются, и
+    только."""
+    try:
+        message_id = resp.json().get("result")
+    except Exception:
+        return
+    loser = kb_tracker.register(bot_id, dialog_id, message_id)
+    if loser is None:
+        return
+    try:
+        r = httpx.post(webhook_url + "imbot.message.update",
+                       json=kb_tracker.strip_payload(bot_id, loser, client_id),
+                       timeout=10.0)
+        if r.status_code != 200:
+            print(f"[notify_hr] KEYBOARD strip {r.status_code} (msg={loser}): "
+                  f"{r.text[:200]}")
+    except Exception as exc:
+        print(f"[notify_hr] KEYBOARD strip failed (msg={loser}): {exc!r}")
+
+
 def notify_hr(message: str, keyboard: list | None = None) -> None:
     """Send a message to all HR users via the HR bot."""
     webhook_url = os.getenv("BITRIX_WEBHOOK_URL", "")
@@ -1244,6 +1268,9 @@ def notify_hr(message: str, keyboard: list | None = None) -> None:
                 err = "" if resp.status_code == 200 else f" {resp.text[:200]}"
                 print(f"[notify_hr] → HR {hr_id}: {resp.status_code}"
                       f" (attempt {attempt}){err}")
+                if keyboard and resp.status_code == 200:
+                    _track_keyboard_sync(webhook_url, bot_id, hr_id, resp,
+                                         client_id)
                 break
             except httpx.RequestError as exc:
                 print(f"[notify_hr] retry {attempt}/5 for HR {hr_id}: {exc!r}")

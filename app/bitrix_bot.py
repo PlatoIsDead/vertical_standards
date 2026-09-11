@@ -78,7 +78,7 @@ from app.hr_tools import (
     parse_replacement,
     question_by_ref,
 )
-from app import keyboards, quiz
+from app import kb_tracker, keyboards, quiz
 from app.rag import load_index
 from app.report_excel import build_report_xlsx
 from app.roles import (
@@ -976,6 +976,47 @@ def _kb_kwargs(keyboard: list | None) -> dict:
     return {"keyboard": keyboard} if keyboard else {}
 
 
+def _response_result(resp) -> object:
+    """result из ответа Битрикса; любой сбой разбора → None (кнопки не трекаем,
+    доставка сообщения от этого не зависит)."""
+    try:
+        return resp.json().get("result")
+    except Exception:
+        return None
+
+
+def _track_keyboard(bot_id, dialog_id, message_id, client_id: str = "") -> None:
+    """Сообщение с кнопками отправлено или его кнопку нажали: снять кнопки у
+    предыдущего сообщения этого бота в диалоге (правило — kb_tracker)."""
+    loser = kb_tracker.register(bot_id, dialog_id, message_id)
+    if loser is not None:
+        asyncio.create_task(_strip_keyboard(bot_id, loser, client_id))
+
+
+async def _strip_keyboard(bot_id, message_id: int, client_id: str = "") -> None:
+    """imbot.message.update KEYBOARD=N. Best-effort: неудача оставляет старые
+    кнопки на месте (прежнее поведение) и никогда не роняет обработку."""
+    if not BITRIX_WEBHOOK_URL:
+        return
+    if not client_id:
+        client_id = HR_CLIENT_ID if str(bot_id) == str(HR_BOT_ID) else BOT_CLIENT_ID
+    payload = kb_tracker.strip_payload(bot_id, message_id, client_id)
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    BITRIX_WEBHOOK_URL + "imbot.message.update", json=payload
+                )
+            if resp.status_code != 200:
+                print(f"KEYBOARD strip {resp.status_code} (msg={message_id}): "
+                      f"{resp.text[:200]}")
+            return
+        except Exception as exc:
+            print(f"KEYBOARD strip retry {attempt}/3 (msg={message_id}): {exc!r}")
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)
+
+
 async def _send(dialog_id: str, text: str, bot_id: str = None,
                 client_id: str = "", keyboard: list | None = None) -> None:
     # Network to portal.becar.ru flaps (ConnectTimeout then 200 within seconds),
@@ -1022,6 +1063,10 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
             err = "" if resp.status_code == 200 else f" {resp.text[:200]}"
             print(f"BITRIX SEND: {resp.status_code} → {dialog_id} "
                   f"(attempt {attempt}){err}")
+            if keyboard and resp.status_code == 200:
+                # 11.09: кнопки живут только у последнего сообщения диалога
+                _track_keyboard(bot_id, dialog_id, _response_result(resp),
+                                client_id)
             return
         except Exception as exc:
             last_exc = exc
@@ -1227,6 +1272,14 @@ async def command_handler(request: Request):
 
     # Роутинг по ИМЕНИ команды: hrsay → HR-бот, say/нет поля → employee
     command_name = field("COMMAND").lower()
+
+    # 11.09: нажали кнопку устаревшего сообщения (например, отправленного до
+    # рестарта, когда реестр пуст) — снимаем её; нажали актуальную — no-op,
+    # её снимет ответ, который сейчас уйдёт с новыми кнопками.
+    if message_id:
+        press_bot = field("BOT_ID") or (HR_BOT_ID if command_name == "hrsay"
+                                        else BOT_ID)
+        _track_keyboard(press_bot, dialog_id, message_id, client_id)
     if command_name == "hrsay":
         await _handle_hr_message(user_id, params, dialog_id, client_id,
                                  dedup_key=dedup_key)
