@@ -1,6 +1,13 @@
 """
-app/gamification.py — геймификация (доработка №5): «Благодарность» в Ленту
-новостей после сдачи экзамена + еженедельный рейтинг лучших по обучению.
+app/gamification.py — геймификация (доработка №5): штатная «Благодарность»
+с медалью после сдачи экзамена + еженедельный рейтинг лучших по обучению.
+
+Благодарность (16.09): log.blogpost.add с ВЕРХНЕУРОВНЕВЫМИ GRATITUDE_MEDAL и
+GRATITUDE_EMPLOYEES (внутри UF_GRATITUDE Битрикс их игнорирует — отсюда
+ошибочный вывод 31.08 «REST не умеет»). DEST = только сам сотрудник: медаль
+видна всем в профиле, общая Лента не засоряется. Неизвестный код медали
+Битрикс молча превращает в обычный пост — поэтому после add проверяем
+UF_GRATITUDE и удаляем пост, если благодарность не создалась.
 
 Чистые функции расписания/текстов принимают время параметром (тестируемость).
 Два времени НЕ смешивать: расписание постинга — МСК (UTC+3, без DST),
@@ -120,10 +127,9 @@ def build_weekly_rating(rows: list[dict], employees_by_uid: dict[str, dict],
 def _post_to_feed(title: str, message: str) -> bool:
     """log.blogpost.add с DEST=["UA"] (все сотрудники). Retry только на сетевых
     ошибках; отказ прав/параметров не ретраим — лог и False."""
-    # Выключено 31.08 по решению юзера: клиенту нужны штатные «Благодарности»
-    # (значок в профиле), а REST их создавать не умеет (UF_GRATITUDE в белый
-    # список log.blogpost.* не входит — проверено живьём). Посты-суррогаты не
-    # показываем, ждём ответа Bitrix-эксперта про кастомный метод.
+    # Теперь только еженедельный рейтинг (на всех сотрудников). Выключен 31.08:
+    # посты на всю компанию засоряют Ленту; благодарности за экзамен идут
+    # через _post_gratitude адресно.
     if os.getenv("FEED_POSTS_ENABLED", "0") != "1":
         print(f"[gamification] feed posts disabled — пропущен пост {title!r}")
         return False
@@ -152,6 +158,79 @@ def _post_to_feed(title: str, message: str) -> bool:
     return False
 
 
+def build_gratitude_payload(user_id: int, title: str, message: str,
+                            medal: str) -> dict:
+    """Благодарность видна в Ленте только получателю (и автору вебхука)."""
+    return {
+        "POST_TITLE": title,
+        "POST_MESSAGE": message,
+        "DEST": [f"U{user_id}"],
+        "GRATITUDE_MEDAL": medal,
+        "GRATITUDE_EMPLOYEES": [user_id],
+    }
+
+
+def _post_gratitude(user_id: str, title: str, message: str) -> bool:
+    """Штатная благодарность с медалью. Retry только на сетевых ошибках add;
+    пост без созданной благодарности удаляется (суррогаты не показываем)."""
+    if os.getenv("GRATITUDE_ENABLED", "0") != "1":
+        print(f"[gamification] gratitude disabled — пропущена для {user_id}")
+        return False
+    webhook = os.getenv("BITRIX_WEBHOOK_URL", "")
+    if not webhook:
+        print("[gamification] BITRIX_WEBHOOK_URL missing — благодарность не отправлена")
+        return False
+    uid = str(user_id).removeprefix("u")
+    if not uid.isdigit():
+        print(f"[gamification] gratitude: нечисловой user_id {user_id!r} — пропуск")
+        return False
+    medal = os.getenv("GRATITUDE_MEDAL", "cup")
+    payload = build_gratitude_payload(int(uid), title, message, medal)
+
+    post_id = None
+    for attempt in range(1, 4):
+        try:
+            resp = httpx.post(webhook + "log.blogpost.add", json=payload, timeout=15.0)
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if resp.status_code == 200 and body.get("result"):
+                post_id = body["result"]
+                break
+            print(f"[gamification] gratitude rejected: "
+                  f"{resp.status_code} {resp.text[:200]}")
+            return False
+        except httpx.RequestError as exc:
+            print(f"[gamification] gratitude retry {attempt}/3: {exc!r}")
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    if post_id is None:
+        return False
+
+    try:
+        resp = httpx.post(webhook + "log.blogpost.get",
+                          json={"POST_ID": post_id}, timeout=15.0)
+        posts = resp.json().get("result") or []
+        value = (posts[0].get("UF_GRATITUDE") or {}).get("VALUE") if posts else None
+    except (httpx.RequestError, ValueError) as exc:
+        # Пост создан, проверить не смогли — не удаляем вслепую
+        print(f"[gamification] gratitude {post_id}: проверка не удалась {exc!r}")
+        return True
+    if value:
+        print(f"[gamification] gratitude ok: post {post_id}, medal {medal!r}, user {uid}")
+        return True
+
+    print(f"[gamification] gratitude НЕ создана (медаль {medal!r}?) — "
+          f"удаляю пост {post_id}")
+    try:
+        httpx.post(webhook + "log.blogpost.delete",
+                   json={"POST_ID": post_id}, timeout=15.0)
+    except httpx.RequestError as exc:
+        print(f"[gamification] не удалось удалить пост {post_id}: {exc!r}")
+    return False
+
+
 def post_exam_congratulation(user_id: str, questions: dict,
                              exam_score: int, basic_score: int) -> None:
     """Хук из _finish_phase (только при passed). Любые ошибки глотаются —
@@ -165,7 +244,7 @@ def post_exam_congratulation(user_id: str, questions: dict,
             exam_score, len(questions.get("exam_questions", [])),
             basic_score, len(questions.get("basic_questions", [])),
         )
-        _post_to_feed(title, message)
+        _post_gratitude(str(user_id), title, message)
     except Exception as exc:
         print(f"[gamification] congrats failed: {exc!r}")
 

@@ -174,3 +174,68 @@ def test_failed_exam_no_congrats(exam_env):
     reply = sm.process_message("u1", "B", "d1", [], None)  # 0/1 — не сдан
     assert "Не сдан" in reply
     assert exam_env == []
+
+
+# ── Штатная благодарность (адресно, с медалью) ───────────────────────────────
+
+class _Resp:
+    def __init__(self, body, status=200):
+        self.status_code, self._body, self.text = status, body, str(body)
+
+    def json(self):
+        return self._body
+
+
+@pytest.fixture
+def grat_http(monkeypatch):
+    monkeypatch.setenv("GRATITUDE_ENABLED", "1")
+    monkeypatch.setenv("GRATITUDE_MEDAL", "cup")
+    monkeypatch.setenv("BITRIX_WEBHOOK_URL", "https://portal/rest/1/x/")
+    calls, state = [], {"value": 2349373}
+
+    def fake_post(url, json=None, timeout=None):
+        method = url.rsplit("/", 1)[-1]
+        calls.append((method, json))
+        if method == "log.blogpost.add":
+            return _Resp({"result": 6888})
+        if method == "log.blogpost.get":
+            return _Resp({"result": [{"UF_GRATITUDE": {"VALUE": state["value"]}}]})
+        return _Resp({"result": True})
+
+    monkeypatch.setattr(gm.httpx, "post", fake_post)
+    return calls, state
+
+
+def test_gratitude_payload_addressed_only_to_employee():
+    payload = gm.build_gratitude_payload(36523, "T", "M", "cup")
+    assert payload["DEST"] == ["U36523"]           # не "UA" — Лента чистая
+    assert payload["GRATITUDE_EMPLOYEES"] == [36523]
+    assert payload["GRATITUDE_MEDAL"] == "cup"
+    assert "UF_GRATITUDE" not in payload           # внутри UF_ Битрикс игнорирует
+
+
+def test_gratitude_created(grat_http):
+    calls, _ = grat_http
+    assert gm._post_gratitude("36523", "T", "M") is True
+    assert [m for m, _ in calls] == ["log.blogpost.add", "log.blogpost.get"]
+    assert calls[0][1]["DEST"] == ["U36523"]
+
+
+def test_gratitude_not_created_post_deleted(grat_http):
+    calls, state = grat_http
+    state["value"] = False                          # неверный код медали
+    assert gm._post_gratitude("36523", "T", "M") is False
+    assert calls[-1] == ("log.blogpost.delete", {"POST_ID": 6888})
+
+
+def test_gratitude_disabled_by_default(grat_http, monkeypatch):
+    calls, _ = grat_http
+    monkeypatch.delenv("GRATITUDE_ENABLED")
+    assert gm._post_gratitude("36523", "T", "M") is False
+    assert calls == []
+
+
+def test_gratitude_non_numeric_uid_skipped(grat_http):
+    calls, _ = grat_http
+    assert gm._post_gratitude("chk_u1", "T", "M") is False
+    assert calls == []
