@@ -1009,6 +1009,26 @@ async def _resolve_invite_tokens(tokens: list[str]) -> dict:
             seen.add(uid)
             out["targets"].append(user)
 
+    async def _dept_by_name(query: str) -> bool:
+        """Превью отдела по подстроке названия. False — отдел не найден."""
+        deps = await _bitrix_departments()
+        if deps is None:
+            out["no_scope"] = True
+            return True
+        found = [d for d in deps
+                 if query.casefold() in (d.get("NAME") or "").casefold()]
+        if not found:
+            return False
+        dep = found[0]
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            users = await _department_users(client, str(dep["ID"]))
+        out["dept_preview"] = {
+            "dep": dep,
+            "users": [u for u in users if not _is_service_account(u)],
+            "others": [d["NAME"] for d in found[1:]],
+        }
+        return True
+
     for token in tokens:
         low = token.casefold()
         if low.startswith("отдел"):
@@ -1024,23 +1044,8 @@ async def _resolve_invite_tokens(tokens: list[str]) -> dict:
                         continue
                     _add(u)
                 continue
-            deps = await _bitrix_departments()
-            if deps is None:
-                out["no_scope"] = True
-                continue
-            found = [d for d in deps
-                     if query.casefold() in (d.get("NAME") or "").casefold()]
-            if not found:
+            if not await _dept_by_name(query):
                 out["missing"].append(token)
-                continue
-            dep = found[0]
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                users = await _department_users(client, str(dep["ID"]))
-            out["dept_preview"] = {
-                "dep": dep,
-                "users": [u for u in users if not _is_service_account(u)],
-                "others": [d["NAME"] for d in found[1:]],
-            }
             continue
         email = _extract_email(token)
         if email:
@@ -1056,7 +1061,9 @@ async def _resolve_invite_tokens(tokens: list[str]) -> dict:
             _add(users[0])
         elif users:
             out["ambiguous"].append((token, users))
-        else:
+        elif not await _dept_by_name(token):
+            # 18.09: HR копирует название отдела из Битрикса без слова
+            # «отдел» — не по фамилии, так по отделу
             out["missing"].append(token)
     return out
 
@@ -1067,9 +1074,9 @@ async def _invite_resolved(hr_user_id: str, found: dict) -> tuple[str, list | No
     notes: list[str] = []
     kb: list | None = None
     if found["no_scope"]:
-        notes.append("⚠️ Поиск по отделам недоступен: у вебхука бота нет "
-                     "права «department» — добавь его в настройках вебхука "
-                     "на портале.")
+        notes.append("⚠️ По фамилии никого не нашёл, а поиск по отделам "
+                     "недоступен: у вебхука бота нет права «department» — "
+                     "добавь его в настройках вебхука на портале.")
     for token in found["missing"]:
         notes.append(f"⚠️ «{token}» — не найден в Битриксе.")
     preview = found["dept_preview"]

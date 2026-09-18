@@ -620,6 +620,16 @@ def test_invite_department_preview_then_confirm(env, lookup):
     assert db.get_session("500") is None                # был в доступе, не трогали
 
 
+def test_invite_department_name_without_word_otdel(env, lookup):
+    """HR копирует название отдела из Битрикса как есть."""
+    client, sent, _ = env
+    _post_hr(client, "Пригласить")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    _post_hr(client, "Ресепшн")
+    assert _wait_for(lambda: any("Отдел «Ресепшн»" in t for t in _reply(sent)))
+    assert not any("не найден" in t for t in _reply(sent))
+
+
 def test_invite_department_no_scope(env, lookup, monkeypatch):
     client, sent, _ = env
 
@@ -628,6 +638,9 @@ def test_invite_department_no_scope(env, lookup, monkeypatch):
 
     monkeypatch.setattr(bot, "_bitrix_departments", no_scope)
     _post_hr(client, "Пригласить отдел Ресепшн")
+    assert _wait_for(lambda: any("права «department»" in t for t in _reply(sent)))
+    sent.clear()
+    _post_hr(client, "Пригласить Сидоров")             # ни фамилия, ни отдел
     assert _wait_for(lambda: any("права «department»" in t for t in _reply(sent)))
 
 
