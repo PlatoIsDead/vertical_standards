@@ -197,6 +197,22 @@ def courses_menu(items: list, reading: bool = False,
     return rows or None
 
 
+def test_pick(items: list) -> list:
+    """18.09: «Готов» при нескольких курсах → выбор теста. items =
+    [(course_id, name, current)]; payload «Тест {course_id}» — по id курса,
+    а не по позиции: старая кнопка под прошлым сообщением не запустит чужой
+    тест. Текущий курс — primary (≤1)."""
+    rows: list = []
+    for course_id, name, current in items:
+        label = ("▶ " if current else "") + _trim(name, 34)
+        rows += [_btn(label, f"Тест {course_id}", display="BLOCK",
+                      role="primary" if current else "secondary"),
+                 dict(_NEWLINE)]
+    rows += [_btn("📚 Мои курсы", "Мои курсы", width=130),
+             _btn("❓ Помощь", "Помощь", width=130, role="service")]
+    return rows
+
+
 def start_button(label: str, payload: str = "Начать",
                  role: str = "primary") -> list:
     """Проактивные одиночные BLOCK-кнопки: «Начать…» — primary (смысл

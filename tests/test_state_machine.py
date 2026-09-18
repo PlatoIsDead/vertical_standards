@@ -59,6 +59,16 @@ def env(tmp_path, monkeypatch):
     return captured
 
 
+def _ready(uid, dialog):
+    """«Готов»; при нескольких курсах (18.09) бот сначала спрашивает, какой
+    тест — легаси-тесты явно выбирают текущий курс."""
+    reply = sm.process_message(uid, "Готов", dialog, [], None)
+    if reply.startswith("❓ Какой тест начинаем"):
+        cid = db.get_session(uid)["course_id"]
+        reply = sm.process_message(uid, f"Тест {cid}", dialog, [], None)
+    return reply
+
+
 def test_new_session_starts_with_role_select(env):
     reply = sm.process_message("u1", "привет", "d1", [], None)
     assert "1. Горничная" in reply
@@ -237,7 +247,7 @@ def test_exam_pause_says_exam(env, monkeypatch):
                                json.dumps(_EXAM2, ensure_ascii=False))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     sm.process_message("u1", "A", "d1", [], None)           # базовый сдан
     sm.process_message("u1", "Начать", "d1", [], None)      # EXAM
     assert db.get_session("u1")["state"] == "EXAM"
@@ -286,7 +296,7 @@ def test_finish_phase_notify_has_name(env, monkeypatch):
     db.add_employee("u1", full_name="Иван Иванов", work_position="Администратор")
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)      # BASIC_TEST, 1 вопрос
+    _ready("u1", "d1")      # BASIC_TEST, 1 вопрос
     sm.process_message("u1", "A", "d1", [], None)          # финиш базового
     assert notes and "Иван Иванов, Администратор (ID: u1)" in notes[0]
     # 31.08: авто-допуск — FYI вместо «Допустить»; экзамена в фикстуре нет
@@ -303,7 +313,7 @@ def test_exam_ready_menu(env, monkeypatch):
                                json.dumps(_EXAM2, ensure_ascii=False))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     reply = sm.process_message("u1", "A", "d1", [], None)  # базовый 1/1 сдан
     assert "допущен к экзамену" in reply
     assert db.get_session("u1")["state"] == "EXAM_READY"
@@ -331,14 +341,14 @@ def test_basic_fail_retake(env, monkeypatch):
                                json.dumps(two_q, ensure_ascii=False))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     sm.process_message("u1", "B", "d1", [], None)          # 0/…
     reply = sm.process_message("u1", "B", "d1", [], None)  # 0/2 < порога 1
     assert "не сдан" in reply and "Готов" in reply
     session = db.get_session("u1")
     assert session["state"] == "READING"
     assert db.get_session_answers(session["id"], "basic") == []  # чисто
-    sm.process_message("u1", "Готов", "d1", [], None)      # вторая попытка
+    _ready("u1", "d1")      # вторая попытка
     sm.process_message("u1", "A", "d1", [], None)
     reply = sm.process_message("u1", "A", "d1", [], None)  # 2/2 — сдан
     assert "Базовый тест сдан" in reply and "*2/2*" in reply
@@ -366,7 +376,7 @@ def test_waiting_park_switch_admit_exam(env, monkeypatch):
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)          # роль → первый курс
     first_course = db.get_session("u1")["course_id"]       # порядок не важен
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     sm.process_message("u1", "A", "d1", [], None)          # базовый → EXAM_READY
     a_row = db.get_session("u1")
     assert a_row["course_id"] == first_course and a_row["state"] == "EXAM_READY"
@@ -464,7 +474,7 @@ def test_switch_from_test_parks_progress(env):
     _add_course("Правила2.docx", "d2")
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)       # BASIC_TEST
+    _ready("u1", "d1")       # BASIC_TEST
     reply = sm.process_message("u1", "Выбрать 1", "d1", [], None)
     assert "Переключил курс" in reply
     parked = [s for s in db.get_sessions_by_user("u1")
@@ -492,7 +502,7 @@ def test_test_pause_and_resume(env, monkeypatch):
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
     first_course = db.get_session("u1")["course_id"]
-    sm.process_message("u1", "Готов", "d1", [], None)      # вопрос 1
+    _ready("u1", "d1")      # вопрос 1
     sm.process_message("u1", "A", "d1", [], None)          # → вопрос 2
     assert db.get_session("u1")["current_q_idx"] == 1
 
@@ -590,7 +600,7 @@ def test_continue_returns_to_question(env, monkeypatch):
                                json.dumps(_EXAM2, ensure_ascii=False))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)        # вопрос Б?
+    _ready("u1", "d1")        # вопрос Б?
     reply = sm.process_message("u1", "выйти", "d1", [], None)
     assert "Что дальше" in reply and "Продолжить" in reply
     reply = sm.process_message("u1", "Продолжить", "d1", [], None)
@@ -627,7 +637,7 @@ def test_hint_follows_state(env):
     sm.process_message("u1", "1", "d1", [], None)
     rag = sm.process_message("u1", "как дела?", "d1", [], None)
     assert "Что дальше: *Готов*" in rag            # READING-хвост на RAG-ответе
-    q = sm.process_message("u1", "Готов", "d1", [], None)
+    q = _ready("u1", "d1")
     assert "ответь буквой A–D" in q                # хвост по НОВОМУ состоянию
     pause = sm.process_message("u1", "выйти", "d1", [], None)
     assert pause.count("Что дальше") == 1          # свой текст, без дубля хвоста
@@ -692,7 +702,7 @@ def test_question_during_basic_test_gets_rag_answer(env):
     теперь отвечает по стандартам и возвращает к тому же вопросу."""
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     before = db.get_session("u1")["current_q_idx"]
 
     reply = sm.process_message("u1", "В каком случае номер ставят Out of Order?",
@@ -714,7 +724,7 @@ def test_question_during_exam_answers_excluding_course_doc(env, monkeypatch):
                                json.dumps(_EXAM2, ensure_ascii=False))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     sm.process_message("u1", "A", "d1", [], None)            # базовый сдан
     sm.process_message("u1", "Начать", "d1", [], None)       # EXAM
 
@@ -731,7 +741,7 @@ def _to_pause(env_unused=None):
     """u1 → базовый тест на вопросе 1 → пауза."""
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     sm.process_message("u1", "выйти", "d1", [], None)
     return db.get_session("u1")
 
@@ -772,13 +782,13 @@ def test_ready_in_pause_does_not_restart_test(env):
     _two_question_course()
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     sm.process_message("u1", "A", "d1", [], None)       # ответ на вопрос 1
     sm.process_message("u1", "выйти", "d1", [], None)
     before = db.get_session("u1")
     assert before["current_q_idx"] == 1
 
-    reply = sm.process_message("u1", "Готов", "d1", [], None)
+    reply = _ready("u1", "d1")
     after = db.get_session("u1")
     assert after["current_q_idx"] == 1 and after["state"] == "BASIC_TEST"
     assert after["attempt"] == before["attempt"]        # попытка не менялась
@@ -815,7 +825,7 @@ def test_switch_from_pause_keeps_progress(env):
     _two_question_course(_add_course("HSKP Уборка.docx", "d-h"))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     sm.process_message("u1", "A", "d1", [], None)
     paused_row = db.get_session("u1")
     sm.process_message("u1", "выйти", "d1", [], None)
@@ -835,7 +845,7 @@ def test_return_to_paused_course_resumes_question(env):
     _two_question_course(_add_course("HSKP Уборка.docx", "d-h"))
     sm.process_message("u1", "привет", "d1", [], None)
     sm.process_message("u1", "1", "d1", [], None)
-    sm.process_message("u1", "Готов", "d1", [], None)
+    _ready("u1", "d1")
     first = db.get_session("u1")["course_id"]
     sm.process_message("u1", "выйти", "d1", [], None)
     _, sel = sm.my_courses("u1", "housekeeper")
@@ -848,3 +858,110 @@ def test_return_to_paused_course_resumes_question(env):
     row = db.get_session("u1")
     assert row["course_id"] == first
     assert row["state"] == "BASIC_TEST"                # пауза снята
+
+
+# ── 18.09: выбор теста при нескольких курсах («Готов» ≠ последний тронутый) ──
+
+def _to_reading(uid="u1", dialog="d1"):
+    sm.process_message(uid, "привет", dialog, [], None)
+    sm.process_message(uid, "2", dialog, [], None)          # admin_reception
+    return db.get_session(uid)
+
+
+def test_ready_single_course_starts_test(env):
+    _to_reading()
+    reply = sm.process_message("u1", "Готов", "d1", [], None)
+    assert "Начинаем базовый тест" in reply
+    assert db.get_session("u1")["state"] == "BASIC_TEST"
+
+
+def test_ready_with_other_courses_asks(env):
+    other = _add_course("ALL Второй.docx", "d-2")
+    current = _to_reading()["course_id"]
+    reply = sm.process_message("u1", "Готов", "d1", [], None)
+    assert reply.startswith("❓ Какой тест начинаем")
+    assert f"Тест {current}" in reply and f"Тест {other}" in reply
+    assert "текущий курс" in reply
+    assert "Что дальше" not in reply                    # хинт не дублируется
+    assert db.get_session("u1")["state"] == "READING"   # ничего не стартовало
+
+
+def test_test_pick_current_starts_basic(env):
+    _add_course("ALL Второй.docx", "d-2")
+    current = _to_reading()["course_id"]
+    reply = sm.process_message("u1", f"Тест {current}", "d1", [], None)
+    assert "Начинаем базовый тест" in reply
+    session = db.get_session("u1")
+    assert session["course_id"] == current and session["state"] == "BASIC_TEST"
+
+
+def _two_courses():
+    """Второй ALL-курс + сотрудник в чтении; возвращает (текущий, другой) —
+    порядок назначения = порядок активации, поэтому вычисляем, не угадываем."""
+    second = _add_course("ALL Второй.docx", "d-2")
+    first = db.get_course_by_doc_name("Стандарты.docx")["id"]
+    current = _to_reading()["course_id"]
+    return current, (second if current == first else first)
+
+
+def test_test_pick_other_switches_and_starts(env):
+    current, other = _two_courses()
+    reply = sm.process_message("u1", f"Тест {other}", "d1", [], None)
+    assert reply.startswith("🔄 Курс") and "Начинаем базовый тест" in reply
+    session = db.get_session("u1")
+    assert session["course_id"] == other and session["state"] == "BASIC_TEST"
+
+
+def test_test_pick_paused_course_resumes(env):
+    current, other = _two_courses()
+    sm.process_message("u1", f"Тест {current}", "d1", [], None)   # BASIC_TEST
+    sm.process_message("u1", "Выйти", "d1", [], None)              # пауза
+    assert db.get_session("u1")["state"] == "PAUSED_BASIC"
+    sm.process_message("u1", f"Тест {other}", "d1", [], None)     # другой курс
+    assert db.get_session("u1")["course_id"] == other
+    # обратно к запаркованному: продолжаем с того же вопроса, не с нуля
+    reply = sm.process_message("u1", f"Тест {current}", "d1", [], None)
+    assert "Продолжаем базовый тест" in reply
+    session = db.get_session("u1")
+    assert session["course_id"] == current and session["state"] == "BASIC_TEST"
+    # текущий курс на паузе + «Тест текущий» = продолжить
+    sm.process_message("u1", "Выйти", "d1", [], None)
+    reply = sm.process_message("u1", f"Тест {current}", "d1", [], None)
+    assert "Продолжаем" in reply
+    assert db.get_session("u1")["state"] == "BASIC_TEST"
+
+
+def test_test_pick_unknown_id(env):
+    _to_reading()
+    reply = sm.process_message("u1", "Тест 999", "d1", [], None)
+    assert "нет в твоём списке" in reply
+    assert db.get_session("u1")["state"] == "READING"
+
+
+def test_ready_substring_no_longer_starts(env):
+    _to_reading()
+    reply = sm.process_message("u1", "я пока не готов", "d1", [], None)
+    assert "MOCK_ANSWER" in reply
+    assert db.get_session("u1")["state"] == "READING"
+
+
+def test_pick_without_session_opens_chosen_course(env):
+    """Кнопка «Выбрать 2»/«Тест N» под старым сообщением при закрытой
+    сессии раньше молча назначала первый курс."""
+    second = _add_course("ALL Второй.docx", "d-2")
+    _, selectable = sm.my_courses("u2", None)
+    n = next(c["n"] for c in selectable if c["id"] == second)
+    reply = sm.process_message("u2", f"Выбрать {n}", "d2", [], None)
+    assert "Второй" in reply
+    session = db.get_session("u2")
+    assert session["course_id"] == second and session["state"] == "READING"
+
+    db.update_session(session["id"], state="DONE")
+    first = db.get_course_by_doc_name("Стандарты.docx")["id"]
+    reply = sm.process_message("u2", f"Тест {first}", "d2", [], None)
+    assert "Начинаем базовый тест" in reply
+    session = db.get_session("u2")
+    assert session["course_id"] == first and session["state"] == "BASIC_TEST"
+    # пройденный курс кнопкой не открывается
+    reply = sm.process_message("u2", f"Тест {second}", "d2", [], None)
+    assert "нет в твоём списке" in reply

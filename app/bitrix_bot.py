@@ -103,6 +103,7 @@ from app.state_machine import (
     my_courses,
     process_message,
     start_onboarding,
+    test_choices,
 )
 
 load_dotenv()
@@ -1076,6 +1077,7 @@ async def _send(dialog_id: str, text: str, bot_id: str = None,
 # 01.09: маркер «в сообщении есть вопрос теста» (format_question:
 # «📝 {label} — Вопрос {i+1}/{total}») — гейт для A–D-клавиатуры
 _QUESTION_RE = re.compile(r"— Вопрос \d+/\d+")
+_TEST_PICK_RE = re.compile(r"^❓ Какой тест начинаем")
 
 
 async def _test_options(session: dict | None) -> list | None:
@@ -1197,6 +1199,12 @@ async def _handle_employee_message(user_id: str, question: str,
                 show_courses_button=non_question and not is_menu)
             if menu_kb:
                 keyboard = menu_kb
+        # 18.09: «Готов» при нескольких курсах → кнопки выбора теста
+        if _TEST_PICK_RE.match(text):
+            choices = await asyncio.to_thread(test_choices, user_id, after)
+            if choices:
+                keyboard = keyboards.test_pick(
+                    [(c["id"], c["name"], c["current"]) for c in choices])
 
     asyncio.create_task(_send(dialog_id, text, bot_id or BOT_ID, client_id,
                               keyboard=keyboard))

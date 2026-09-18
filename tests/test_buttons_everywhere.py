@@ -596,6 +596,26 @@ def test_my_courses_switch_buttons(send_trap, monkeypatch):
                      "❓ Помощь"]
 
 
+def test_test_pick_keyboard(send_trap, monkeypatch):
+    """18.09: «Готов» при нескольких курсах → кнопки выбора теста по course_id."""
+    monkeypatch.setattr(bot, "BUTTONS_ENABLED", True)
+    monkeypatch.setattr(bot, "get_session",
+                        lambda uid: {"course_id": 11, "state": "READING",
+                                     "role": "fo"})
+    monkeypatch.setattr(bot, "process_message",
+                        lambda *a, **kw: "❓ Какой тест начинаем?\n\n…")
+    monkeypatch.setattr(bot, "test_choices", lambda uid, s: [
+        {"id": 11, "name": "Негарантированные бронирования", "current": True},
+        {"id": 9, "name": "Алгоритм бронирования", "current": False}])
+    bot._recent_msgs.clear()
+    _run_employee("Готов")
+    btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
+    assert [b["COMMAND_PARAMS"] for b in btns] == \
+        ["Тест 11", "Тест 9", "Мои курсы", "Помощь"]
+    assert btns[0]["TEXT"].startswith("▶ ") and btns[0]["BG_COLOR"] == "#BEDC3C"
+    assert btns[1]["BG_COLOR"] != "#BEDC3C"                  # ≤1 primary
+
+
 # ── 21.08: фиксы встречи ─────────────────────────────────────────────────────
 
 def test_canonical_url(monkeypatch):

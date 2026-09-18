@@ -102,7 +102,7 @@ _STATE_HINTS = {
 
 # Тексты, которые уже сами всё объясняют — хвост не дублируем
 _HINT_SKIP_MARKERS = ("Что дальше", "Команды:", "Что я умею",
-                      "ответь одной буквой")
+                      "ответь одной буквой", "Какой тест начинаем")
 
 
 def _with_hint(text: str, user_id: str) -> str:
@@ -167,6 +167,12 @@ def _dispatch(user_id: str, message: str, dialog_id: str,
                 "Добро пожаловать! Активных курсов обучения пока нет.\n"
                 "Обратитесь к HR-менеджеру для назначения обучения."
             )
+        # 18.09: кнопки «Выбрать N»/«Тест N» под старым сообщением при
+        # закрытой сессии раньше молча назначали ПЕРВЫЙ курс — теперь
+        # открываем именно выбранный
+        picked = _pick_without_session(user_id, dialog_id, cmd)
+        if picked is not None:
+            return picked
         # №11/№8/01.09: курс — после роли. Приоритет resolve_role: выбор HR
         # → отдел Битрикса → память прошлой сессии → меню (легаси);
         # до выбора сессия с сентинелом course_id=0.
@@ -710,6 +716,131 @@ def _handle_course_switch(session: dict, n: int) -> str:
     return "🔄 Переключил курс.\n\n" + _start_reading(session, course)
 
 
+_TEST_RE = re.compile(r"^тест\s+(\d+)$")   # payload по course_id (18.09)
+
+
+def _start_basic_test(session: dict) -> str:
+    """«Готов» из READING: базовый тест с первого вопроса (пересдача базового
+    после провала — прошлые ответы фазы стереть, иначе _finish_phase
+    сосчитает обе попытки — ловушка _handle_retake)."""
+    questions = get_course_questions(session["course_id"])
+    basic_q = questions.get("basic_questions", [])
+    if not basic_q:
+        return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
+    delete_session_answers(session["id"], "basic")
+    bump_attempt(session["id"])   # пересдача базового — тоже новый порядок
+    update_session(session["id"], state="BASIC_TEST", q_idx=0,
+                   score_basic=0)
+    fresh = get_session_by_id(session["id"])   # см. bump_attempt
+    return (f"✅ Отлично! Начинаем базовый тест — "
+            f"{len(basic_q)} вопрос(ов).\n\n"
+            + format_question(basic_q[0], 0, len(basic_q), "basic", fresh))
+
+
+def test_choices(user_id: str, session: dict | None) -> list[dict]:
+    """Курсы, по которым сотрудник может начать/продолжить тест: текущий
+    (первым) + выбираемые из «Мои курсы». Для текста и кнопок «Тест {id}»."""
+    role = session.get("role") if session else resolve_role_cached(user_id)
+    _, selectable = my_courses(user_id, role)
+    choices: list[dict] = []
+    if session and session.get("course_id"):
+        course = get_course_by_id(session["course_id"])
+        if course:
+            choices.append({"id": course["id"],
+                            "name": display_name(course["doc_name"]),
+                            "current": True, "status": "current"})
+    for c in selectable:
+        choices.append({"id": c["id"], "name": display_name(c["doc_name"]),
+                        "current": False, "status": c.get("status", "todo")})
+    return choices
+
+
+_CHOICE_EMOJI = {"current": "▶️", "paused": "⏸", "admitted": "🎓",
+                 "waiting": "⏳", "todo": "⏳"}
+
+
+def _test_pick_text(choices: list[dict]) -> str:
+    """18.09 (фидбек Дмитрия: «Готов» запускал не тот тест): при нескольких
+    курсах спрашиваем, какой тест начинать. Кнопки несут course_id."""
+    lines = ["❓ Какой тест начинаем?", ""]
+    for c in choices:
+        tail = " — текущий курс" if c["current"] else ""
+        lines.append(f"{_CHOICE_EMOJI.get(c['status'], '⏳')} {c['name']}{tail}"
+                     f" · *Тест {c['id']}*")
+    lines += ["", "Нажми кнопку или напиши *Тест {номер}*."]
+    return "\n".join(lines)
+
+
+def _handle_test_pick(session: dict, course_id: int) -> str:
+    """«Тест {course_id}»: стартовать/продолжить тест КОНКРЕТНОГО курса.
+    Чужой курс — через механику «Выбрать» (возврат к висящей строке,
+    парковка прогресса), затем базовый тест, если курс в чтении."""
+    user_id = session["user_id"]
+    if course_id == session["course_id"]:
+        state = session["state"]
+        if state == "READING":
+            return _start_basic_test(session)
+        phase = quiz.phase_of(state)
+        if phase:
+            questions = get_course_questions(course_id)
+            q_list = questions.get(f"{phase}_questions", [])
+            idx = session["current_q_idx"]
+            if not q_list or idx >= len(q_list):
+                return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
+            if quiz.is_paused(state):
+                update_session(session["id"], state=quiz.active_state(phase))
+            fresh = get_session_by_id(session["id"])
+            return ("▶ Продолжаем!\n\n"
+                    + format_question(q_list[idx], idx, len(q_list), phase, fresh))
+        if state == "EXAM_READY":
+            return ("🎓 Ты допущен к экзамену по этому курсу — нажми кнопку "
+                    "или напиши *Начать*.")
+        if state == "WAITING_HR":
+            return ("⏳ Экзамен по этому курсу откроется после допуска HR — "
+                    "придёт уведомление.")
+        return _my_courses_text(user_id, session.get("role"))
+
+    text, selectable = my_courses(user_id, session.get("role"))
+    idx = next((i for i, c in enumerate(selectable) if c["id"] == course_id),
+               None)
+    if idx is None:
+        return f"Этого курса нет в твоём списке.\n\n{text}"
+    switched = _handle_course_switch(session, idx + 1)
+    fresh = get_session(user_id)
+    if fresh and fresh["course_id"] == course_id and fresh["state"] == "READING":
+        name = display_name(selectable[idx]["doc_name"])
+        return f"🔄 Курс *{name}*.\n\n" + _start_basic_test(fresh)
+    return switched   # пауза/допуск/ожидание — переключение уже всё сказало
+
+
+def _pick_without_session(user_id: str, dialog_id: str, cmd: str) -> str | None:
+    """«Выбрать N» / «Тест {id}» без открытой сессии: открыть выбранный курс
+    (не первый по списку). None — сообщение не про выбор курса."""
+    m_switch, m_test = _SWITCH_RE.match(cmd), _TEST_RE.match(cmd)
+    if not (m_switch or m_test):
+        return None
+    role = resolve_role_cached(user_id)
+    text, selectable = my_courses(user_id, role)
+    course = None
+    if m_switch:
+        n = int(m_switch.group(1))
+        if 1 <= n <= len(selectable):
+            course = selectable[n - 1]
+    else:
+        cid = int(m_test.group(1))
+        course = next((c for c in selectable if c["id"] == cid), None)
+    if course is None:
+        return f"Этого курса нет в твоём списке.\n\n{text}"
+    session = create_session(user_id, dialog_id, course["id"])
+    if role:
+        update_session(session["id"], role=role)
+        session = get_session_by_id(session["id"])
+    reply = _start_reading(session, course)
+    if m_test:
+        return reply + "\n\n" + _start_basic_test(session)
+    return reply
+
+
 def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> str:
     cmd = message.strip().lower()
     if cmd in _MENU_COMMANDS:
@@ -719,6 +850,9 @@ def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> st
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    m_test = _TEST_RE.match(cmd)
+    if m_test:
+        return _handle_test_pick(session, int(m_test.group(1)))
     if cmd in ("выйти", "выход"):
         # 01.09: раньше уходило в RAG — бот отвечал «по стандартам» на
         # служебную команду; хинт состояния допишет _with_hint
@@ -732,22 +866,13 @@ def _handle_reading(session: dict, message: str, chunks: list, embeddings) -> st
         # Сотрудник не меняет организационную роль сам.
         return "🔒 Роль сотрудника назначает и меняет HR."
 
-    if "готов" in message.lower():
-        questions = get_course_questions(session["course_id"])
-        basic_q = questions.get("basic_questions", [])
-        if not basic_q:
-            return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
-
-        # 31.08: пересдача базового после провала — прошлые ответы фазы стереть
-        # (иначе _finish_phase сосчитает обе попытки — ловушка _handle_retake)
-        delete_session_answers(session["id"], "basic")
-        bump_attempt(session["id"])   # пересдача базового — тоже новый порядок
-        update_session(session["id"], state="BASIC_TEST", q_idx=0,
-                       score_basic=0)
-        fresh = get_session_by_id(session["id"])   # см. bump_attempt
-        return (f"✅ Отлично! Начинаем базовый тест — "
-                f"{len(basic_q)} вопрос(ов).\n\n"
-                + format_question(basic_q[0], 0, len(basic_q), "basic", fresh))
+    if cmd in ("готов", "готова"):
+        # 18.09: точное сравнение — «я пока не готов» шло в тест; при
+        # нескольких курсах спрашиваем, какой тест (а не «последний тронутый»)
+        choices = test_choices(session["user_id"], session)
+        if len(choices) > 1:
+            return _test_pick_text(choices)
+        return _start_basic_test(session)
 
     return _rag_reply(session, message, chunks, embeddings)
 
@@ -898,6 +1023,9 @@ def _handle_test(session: dict, message: str, phase: str,
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    m_test = _TEST_RE.match(cmd)
+    if m_test:
+        return _handle_test_pick(session, int(m_test.group(1)))
 
     letter = parse_answer(message)
     view = quiz.question_view(session, current_q, phase, q_idx)
@@ -982,6 +1110,9 @@ def _handle_paused(session: dict, message: str, phase: str,
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    m_test = _TEST_RE.match(cmd)
+    if m_test:
+        return _handle_test_pick(session, int(m_test.group(1)))
     if cmd in ("выйти", "выход"):
         return _pause_text(session, phase, q_idx, total)     # идемпотентно
     if cmd in ("пересдать", "пересдача"):
@@ -1114,6 +1245,9 @@ def _handle_waiting_hr(session: dict, message: str,
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    m_test = _TEST_RE.match(cmd)
+    if m_test:
+        return _handle_test_pick(session, int(m_test.group(1)))
     if cmd in ("выйти", "выход"):
         return "Сейчас нет активного теста — откладывать нечего."
     if cmd in ("пересдать", "пересдача"):
@@ -1138,6 +1272,9 @@ def _handle_exam_ready(session: dict, message: str,
     m_switch = _SWITCH_RE.match(cmd)
     if m_switch:
         return _handle_course_switch(session, int(m_switch.group(1)))
+    m_test = _TEST_RE.match(cmd)
+    if m_test:
+        return _handle_test_pick(session, int(m_test.group(1)))
     if cmd in ("выйти", "выход"):
         return ("Сейчас нет активного теста — откладывать нечего. "
                 "Экзамен ещё не начат.")
