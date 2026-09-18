@@ -10,7 +10,6 @@ import time
 
 import numpy as np
 import pytest
-from fastapi.testclient import TestClient
 
 import app.bitrix_bot as bot
 import app.course_generator as cg
@@ -378,32 +377,6 @@ def test_send_converts_markdown_to_bb(monkeypatch):
     monkeypatch.setattr(bot.httpx, "AsyncClient", FakeAsyncClient)
     asyncio.run(bot._send("u1", "Напиши *Готов* и жди.", "42", "cid"))
     assert captured["MESSAGE"] == "Напиши [b]Готов[/b] и жди."
-
-
-# ── Хук: файл документа при старте курса через "/" ───────────────────────────
-
-def test_new_session_triggers_course_file(env, monkeypatch):
-    sessions = iter([None, {"course_id": 7}])
-    monkeypatch.setattr(bot, "get_session", lambda uid: next(sessions, None))
-    monkeypatch.setattr(bot, "process_message",
-                        lambda *a, **kw: "ответ")
-    sent_files = []
-
-    async def fake_course_file(dialog_id, course_id):
-        sent_files.append((dialog_id, course_id))
-
-    monkeypatch.setattr(bot, "_send_course_file", fake_course_file)
-
-    client = TestClient(bot.app)
-    client.post("/", data={
-        "data[PARAMS][MESSAGE]": "привет",
-        "data[PARAMS][DIALOG_ID]": "d1",
-        "data[PARAMS][FROM_USER_ID]": "u9",
-    })
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline and not sent_files:
-        time.sleep(0.01)
-    assert sent_files == [("d1", 7)]
 
 
 # ── 17.08: дедуп курсов — гонка копий и content-hash ─────────────────────────

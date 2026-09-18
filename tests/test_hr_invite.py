@@ -62,13 +62,6 @@ def env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bot, "_send", fake_send)
 
-    # 01.09: курс назначается сразу после выбора роли HR-ом — реальный
-    # _send_course_file полез бы в сеть; тестам, проверяющим файл, — свой стаб
-    async def noop_course_file(dialog_id, course_id):
-        pass
-
-    monkeypatch.setattr(bot, "_send_course_file", noop_course_file)
-
     async def fake_lookup(email):
         if email == "ivan@x.ru":
             return {"ID": "500", "NAME": "Иван", "LAST_NAME": "Иванов",
@@ -150,25 +143,19 @@ def test_invite_already_learning(env):
     assert "уже проходит обучение" in next(m for m in sent if m[0] == "d9b")[1]
 
 
-def test_invite_role_pick_sends_course_file(env, monkeypatch):
+def test_invite_role_pick_starts_course_without_file(env):
     """01.09: роль выбрал HR → курс назначен сразу (без ROLE_SELECT у
-    сотрудника), файл документа уходит вместе с первым сообщением."""
+    сотрудника). 18.09: файл документа больше не вкладывается — только
+    сообщение от employee-бота со ссылкой на документ."""
     client, sent, _ = env
-    called = []
-
-    async def fake_course_file(dialog_id, course_id):
-        called.append((dialog_id, course_id))
-
-    monkeypatch.setattr(bot, "_send_course_file", fake_course_file)
     _post_hr(client, "Пригласить ivan@x.ru")
     assert _wait_for(lambda: bot._get_pending("9") is not None)
-    time.sleep(0.05)
-    assert not called                        # до выбора роли файла нет
     _post_hr(client, "1")
-    assert _wait_for(lambda: bool(called))
+    assert _wait_for(lambda: any(m[0] == "u500" for m in sent))
     session = db.get_session("500")
     assert session["state"] == "READING" and session["role"] == "housekeeper"
-    assert called[0] == ("u500", session["course_id"])
+    first = next(m for m in sent if m[0] == "u500")
+    assert first[2] == bot.BOT_ID and "Документ" in first[1]
     assert bot._get_pending("9") is None
 
 

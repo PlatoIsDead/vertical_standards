@@ -91,32 +91,54 @@ def env(tmp_path, monkeypatch):
     return TestClient(bot.app), sent
 
 
-def test_report_uploads_and_commits(env, monkeypatch):
+def test_report_uploads_and_sends_link(env, monkeypatch):
     """Корутина напрямую (asyncio.run): фоновая задача с to_thread не
-    доживает в пер-запросном лупе TestClient — прод-путь тот же."""
+    доживает в пер-запросном лупе TestClient — прод-путь тот же.
+    18.09: вместо вложения (im.disk.file.commit от владельца вебхука) —
+    ссылка на файл и папку от HR-бота; старые отчёты не удаляются."""
     import asyncio
 
-    _client, _sent = env
+    _client, sent = env
     monkeypatch.setattr(bot, "REPORTS_FOLDER_ID", "777")
-    db.set_meta("last_report_file_id", "111")
+    monkeypatch.setattr(bot, "BITRIX_WEBHOOK_URL", "https://portal.test/rest/1/x/")
+    bot._REPORT_FOLDER.clear()
+    db.set_meta("department_names", json.dumps(
+        {"ts": time.time(), "names": {"2439": "Ресепшн"}}))
+    db.mark_user_seen("600", "[2439]")
 
-    deleted, uploaded, committed = [], {}, []
+    uploaded = {}
     FakeAsyncClient.routes = {
-        "disk.file.markdeleted": lambda p: deleted.append(p["id"]) or {"result": True},
-        "disk.folder.uploadfile": lambda p: uploaded.update(p) or {"result": {"ID": 555}},
-        "im.dialog.get": {"result": {"chat_id": 5}},
-        "im.disk.file.commit": lambda p: committed.append(p) or {"result": True},
+        "disk.folder.uploadfile": lambda p: uploaded.update(p) or {"result": {
+            "ID": 555, "NAME": "Отчёт по обучению 2026-09-18.xlsx",
+            "DETAIL_URL": "https://old.host/company/personal/user/1/disk/"
+                          "file/Отчёты/Отчёт по обучению 2026-09-18.xlsx"}},
+        "disk.folder.get": {"result": {
+            "ID": 777, "NAME": "Отчёты",
+            "DETAIL_URL": "https://old.host/company/personal/user/1/disk/path/Отчёты"}},
     }
 
-    asyncio.run(bot._build_and_send_report("d9"))
+    asyncio.run(bot._build_and_send_report("d9", "cid"))
 
-    assert deleted == ["111"]                              # старый файл убран
     assert uploaded["id"] == "777"                         # приватная папка
     name, b64 = uploaded["fileContent"]
-    assert name == "Отчёт по обучению.xlsx"
+    assert name.startswith("Отчёт по обучению 20") and name.endswith(".xlsx")
     assert base64.b64decode(b64)[:2] == b"PK"              # валидный xlsx (zip)
-    assert db.get_meta("last_report_file_id") == "555"
-    assert committed and committed[0]["CHAT_ID"] == 5
+    assert len(sent) == 1 and sent[0][0] == "d9"
+    text = sent[0][1]
+    assert "Отчёт сохранён" in text
+    # хост подменён на домен портала, пробелы percent-кодированы
+    assert ("[URL=https://portal.test/company/personal/user/1/disk/file/"
+            "%D0%9E%D1%82%D1%87%D1%91%D1%82%D1%8B/") in text
+    assert "]Отчёт по обучению 2026-09-18.xlsx[/URL]" in text
+    assert "]Отчёты[/URL]" in text
+    # в файле — имя отдела из кэша department_names
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+    ws = load_workbook(BytesIO(base64.b64decode(b64)))["Матрица"]
+    rows_by_name = {ws.cell(i, 1).value: [ws.cell(i, j).value for j in (2, 3)]
+                    for i in range(2, ws.max_row + 1)}
+    assert rows_by_name["Ева"] == [None, "Ресепшн"]
 
 
 def test_report_reply_promises_file(env, monkeypatch):
@@ -124,12 +146,13 @@ def test_report_reply_promises_file(env, monkeypatch):
     monkeypatch.setattr(bot, "REPORTS_FOLDER_ID", "777")
     # Фоновая задача упрётся в пустой uploadfile-ответ → лог, не падение
     FakeAsyncClient.routes = {
-        "disk.file.markdeleted": {"result": True},
+        "department.get": {"error": "insufficient_scope"},
+        "user.get": {"result": []},
         "disk.folder.uploadfile": {"result": {}},
     }
     _post_hr(client, "Отчёт")
     assert _wait_for(lambda: any(m[0] == "d9" for m in sent))
-    assert "пришлю файлом" in next(m[1] for m in sent if m[0] == "d9")
+    assert "пришлю ссылку на Excel" in next(m[1] for m in sent if m[0] == "d9")
 
 
 def test_report_without_folder_only_text(env, monkeypatch):
