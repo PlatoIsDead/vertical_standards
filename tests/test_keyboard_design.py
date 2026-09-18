@@ -60,6 +60,10 @@ SAMPLES = {
     "menu_resume_exam": kb.courses_menu([(1, "Курс", "todo")],
                                         resume_test=True, resume_exam=True),
     "exam_letters": kb.for_session({"state": "EXAM"}),
+    "hr_manager_actions": kb.hr_manager_actions(),
+    "hr_candidates": kb.hr_candidates([("1", "Иван Иванов (Техник)"),
+                                       ("2", "Игорь Иванов")]),
+    "hr_invite_department": kb.hr_invite_department("2439", 12),
     # 18.09: выбор теста при нескольких курсах
     "test_pick": kb.test_pick([(11, "Негарантированные бронирования", True),
                                (9, "Алгоритм бронирования по телефону", False)]),
@@ -82,6 +86,8 @@ ALLOWED_PAYLOADS = [
     r"^Изменить \d+\.\d+$",
     r"^Перегенерировать \d+(\.\d+)?$",
     r"^Пригласить \S+@\S+$",
+    r"^Пригласить (отдел )?\d+$",         # 18.09: по ID / отдел целиком
+    r"^Руководитель (добавить|удалить)$",   # 18.09: кнопка → ввод email
     r"^Допустить \S+$",
 ]
 

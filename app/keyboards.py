@@ -352,6 +352,13 @@ def hr_cancel_edit() -> list:
     return [_hr_btn("Отмена", width=120, role="service")]
 
 
+def hr_manager_actions() -> list:
+    """18.09: «⚙️ Править руководителей» → действие кнопкой, email следующим
+    сообщением (режим await_arg)."""
+    return [_hr_btn("➕ Добавить", "Руководитель добавить", width=140),
+            _hr_btn("➖ Удалить", "Руководитель удалить", width=140)]
+
+
 def hr_role_select(options: list) -> list:
     """01.09: выбор роли приглашаемого — HR-зеркало employee-ROLE_SELECT
     (payload — цифра, её ловит pending «Пригласить» в _handle_hr_message).
@@ -376,6 +383,25 @@ def hr_invite(email: str) -> list:
     payload — полный адрес."""
     return [_hr_btn(_trim(f"Пригласить {email}", 34), f"Пригласить {email}",
                     display="BLOCK", role="primary")]
+
+
+def hr_candidates(items: list) -> list:
+    """18.09: несколько совпадений по фамилии — BLOCK на кандидата,
+    payload «Пригласить {ID}» (обычный путь приглашения по ID)."""
+    rows: list = []
+    for uid, label in items:
+        rows += [_hr_btn(_trim(label, 38), f"Пригласить {uid}", display="BLOCK"),
+                 dict(_NEWLINE)]
+    rows.append(_hr_btn("Отмена", width=120, role="service"))
+    return rows
+
+
+def hr_invite_department(dep_id: str, count: int) -> list:
+    """18.09: подтверждение приглашения отдела; payload «Пригласить отдел {ID}»."""
+    return [_hr_btn(f"Пригласить всех ({count})", f"Пригласить отдел {dep_id}",
+                    display="BLOCK", role="primary"),
+            dict(_NEWLINE),
+            _hr_btn("Отмена", width=120, role="service")]
 
 
 def hr_admit(user_id: str, label: str = None) -> list:

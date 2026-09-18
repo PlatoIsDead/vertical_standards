@@ -420,3 +420,218 @@ def test_allow_by_unknown_email(env):
     _post_hr(client, "Допустить nobody@x.ru")
     assert _wait_for(lambda: any(m[0] == "d9" for m in sent))
     assert "не найден среди приглашённых" in next(m for m in sent if m[0] == "d9")[1]
+
+
+# ── 18.09: кнопка → ввод (режим await_arg) ───────────────────────────────────
+
+def _reply(sent, dialog="d9"):
+    return [m[1] for m in sent if m[0] == dialog]
+
+
+def test_invite_button_then_email(env):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    assert bot._get_pending("9")["kind"] == "await_arg"
+    assert "Напиши email" in _reply(sent)[-1]
+    _post_hr(client, "ivan@x.ru")                      # без слова «Пригласить»
+    assert _wait_for(lambda: (bot._get_pending("9") or {}).get("kind") == "invite")
+    assert "Иван Иванов" in _reply(sent)[-1]
+
+
+def test_await_arg_cancel(env):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    _post_hr(client, "Отмена")
+    assert _wait_for(lambda: any("Ввод отменён" in t for t in _reply(sent)))
+    assert bot._get_pending("9") is None
+
+
+def test_await_arg_menu_resets(env):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    _post_hr(client, "Меню")
+    assert _wait_for(lambda: any("Доступные команды" in t for t in _reply(sent)))
+    assert bot._get_pending("9") is None
+
+
+def test_await_arg_command_is_command_not_argument(env):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    _post_hr(client, "Руководители")
+    assert _wait_for(lambda: any("уководител" in t for t in _reply(sent)[1:]))
+    assert bot._get_pending("9") is None
+    assert not any("не найден" in t for t in _reply(sent))
+
+
+def test_await_arg_ttl(env):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    bot._pending_edits["9"]["expires"] = time.monotonic() - 1
+    _post_hr(client, "ivan@x.ru")
+    assert _wait_for(lambda: any("Доступные команды" in t for t in _reply(sent)))
+
+
+def test_surname_with_command_prefix_not_hijacked(env):
+    """«Курсанов» начинается с «курс» — раньше startswith сбросил бы режим."""
+    client, sent, _ = env
+    _post_hr(client, "Пригласить")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    _post_hr(client, "Курсанов")
+    assert _wait_for(lambda: len(_reply(sent)) >= 2)
+    assert "Нет курсов" not in _reply(sent)[-1]      # не ушло в «Курсы»
+
+
+def test_old_form_still_works(env):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить ivan@x.ru")
+    assert _wait_for(lambda: (bot._get_pending("9") or {}).get("kind") == "invite")
+
+
+# ── 18.09: приглашение по ID / фамилии / списком / отделом ──────────────────
+
+USERS = {
+    "500": {"ID": "500", "NAME": "Иван", "LAST_NAME": "Иванов",
+            "EMAIL": "ivan@x.ru", "WORK_POSITION": "Техник"},
+    "600": {"ID": "600", "NAME": "Пётр", "LAST_NAME": "Петров",
+            "EMAIL": "petr@x.ru"},
+    "700": {"ID": "700", "NAME": "Игорь", "LAST_NAME": "Иванов",
+            "EMAIL": "", "WORK_POSITION": "Администратор"},   # без почты
+    "701": {"ID": "701", "NAME": "", "LAST_NAME": "БС 74", "EMAIL": ""},
+}
+
+
+@pytest.fixture
+def lookup(monkeypatch):
+    calls = {"departments": 0}
+
+    async def by_id(uid):
+        return USERS.get(uid)
+
+    async def by_name(name):
+        n = name.casefold()
+        return [u for u in USERS.values()
+                if n in f"{u['NAME']} {u['LAST_NAME']}".casefold()]
+
+    async def departments():
+        calls["departments"] += 1
+        return [{"ID": 2439, "NAME": "Ресепшн"}, {"ID": 7, "NAME": "Ресепшн Дубай"}]
+
+    async def dept_users(client, dep_id):
+        return list(USERS.values()) if dep_id == "2439" else []
+
+    monkeypatch.setattr(bot, "_bitrix_user_by_id", by_id)
+    monkeypatch.setattr(bot, "_bitrix_users_by_name", by_name)
+    monkeypatch.setattr(bot, "_bitrix_departments", departments)
+    monkeypatch.setattr(bot, "_department_users", dept_users)
+    return calls
+
+
+def test_invite_by_id(env, lookup):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить 600")
+    assert _wait_for(lambda: (bot._get_pending("9") or {}).get("kind") == "invite")
+    assert "Пётр Петров (petr@x.ru) найден" in _reply(sent)[-1]
+    _post_hr(client, "1")
+    assert _wait_for(lambda: db.get_session("600") is not None)
+
+
+def test_invite_by_surname_unique_without_email(env, lookup):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить Петров")
+    assert _wait_for(lambda: (bot._get_pending("9") or {}).get("kind") == "invite")
+    _post_hr(client, "1")
+    assert _wait_for(lambda: db.get_session("600") is not None)
+    # сотрудник без почты: контакт = ID
+    _post_hr(client, "Пригласить Игорь")
+    assert _wait_for(lambda: "ID 700" in _reply(sent)[-1])
+    _post_hr(client, "1")
+    assert _wait_for(lambda: db.get_session("700") is not None)
+    assert _wait_for(lambda: any("(ID 700) приглашён" in t for t in _reply(sent)))
+
+
+def test_invite_by_surname_ambiguous_shows_candidates(env, lookup):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить Иванов")
+    assert _wait_for(lambda: any("несколько сотрудников" in t for t in _reply(sent)))
+    assert bot._get_pending("9") is None
+    text = _reply(sent)[-1]
+    assert "Иван Иванов (Техник)" in text and "Игорь Иванов" in text
+
+
+def test_invite_list_one_role_for_all(env, lookup):
+    client, sent, _ = env
+    _post_hr(client, "Пригласить ivan@x.ru, 600\nСидоров")
+    assert _wait_for(lambda: (bot._get_pending("9") or {}).get("kind") == "invite")
+    text = _reply(sent)[-1]
+    assert "Найдено 2" in text and "«Сидоров» — не найден" in text
+    assert "Выбери роль для всех" in text
+    _post_hr(client, "1")
+    assert _wait_for(lambda: db.get_session("500") and db.get_session("600"))
+    summary = _reply(sent)[-1]
+    assert "Иван Иванов" in summary and "Пётр Петров" in summary
+    assert "не найден" in summary                    # заметка дожила до итога
+    assert db.get_employee_by_email("petr@x.ru")["role"] == "housekeeper"
+    assert bot._get_pending("9") is None
+
+
+def test_invite_list_partial_failure_retries_only_rest(env, lookup, monkeypatch):
+    client, sent, _ = env
+    calls = []
+    real = bot.start_onboarding
+
+    def flaky(uid, dialog):
+        calls.append(uid)
+        if uid == "600" and calls.count("600") == 1:
+            raise RuntimeError("boom")
+        return real(uid, dialog)
+
+    monkeypatch.setattr(bot, "start_onboarding", flaky)
+    _post_hr(client, "Пригласить 500, 600")
+    assert _wait_for(lambda: bot._get_pending("9") is not None)
+    _post_hr(client, "1")
+    assert _wait_for(lambda: any("Не получилось завершить" in t for t in _reply(sent)))
+    assert db.get_session("500") is not None          # первый уже приглашён
+    _post_hr(client, "1")
+    assert _wait_for(lambda: db.get_session("600") is not None)
+    assert calls == ["500", "600", "600"]              # 500 повторно не трогали
+    assert "Иван Иванов" in _reply(sent)[-1] and "Пётр Петров" in _reply(sent)[-1]
+
+
+def test_invite_department_preview_then_confirm(env, lookup):
+    client, sent, _ = env
+    db.add_employee("500", "ivan@x.ru", "Иван Иванов", "9")   # уже в доступе
+    _post_hr(client, "Пригласить отдел ресепшн")
+    assert _wait_for(lambda: any("Отдел «Ресепшн»" in t for t in _reply(sent)))
+    text = _reply(sent)[-1]
+    assert "ещё не приглашены — 2" in text            # 600 и 700; 500 и БС 74 нет
+    assert "Пётр Петров" in text and "Игорь Иванов" in text
+    assert "БС 74" not in text and "Похожие отделы: Ресепшн Дубай" in text
+    assert bot._get_pending("9") is None
+    _post_hr(client, "Пригласить отдел 2439")           # кнопка подтверждения
+    assert _wait_for(lambda: (bot._get_pending("9") or {}).get("kind") == "invite")
+    assert "Найдено 2" in _reply(sent)[-1]
+    _post_hr(client, "1")
+    assert _wait_for(lambda: db.get_session("600") and db.get_session("700"))
+    assert db.get_session("500") is None                # был в доступе, не трогали
+
+
+def test_invite_department_no_scope(env, lookup, monkeypatch):
+    client, sent, _ = env
+
+    async def no_scope():
+        return None
+
+    monkeypatch.setattr(bot, "_bitrix_departments", no_scope)
+    _post_hr(client, "Пригласить отдел Ресепшн")
+    assert _wait_for(lambda: any("права «department»" in t for t in _reply(sent)))
+
+
+def test_split_invite_tokens():
+    assert bot._split_invite_tokens("a@x.ru, 600\nИванов Иван; отдел Ресепшн") == \
+        ["a@x.ru", "600", "Иванов Иван", "отдел Ресепшн"]
+    assert bot._split_invite_tokens("a@x.ru 600 b@x.ru") == ["a@x.ru", "600", "b@x.ru"]

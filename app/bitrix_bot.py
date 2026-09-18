@@ -175,12 +175,28 @@ def _get_pending(user_id: str) -> dict | None:
     return pending
 
 
+_HR_COMMAND_RE = re.compile(
+    r"^(?:" + "|".join(_HR_COMMAND_PREFIXES) + r")(?:\s|$)")
+
+
 def _is_pending_escape(msg_lower: str) -> bool:
     """Сообщения, которые НЕ потребляются живым pending'ом: отмена, «Меню»
     (универсальная кнопка — иначе цикл на клавиатуре промпта роли) и любая
-    HR-команда (важнее забытого pending)."""
+    HR-команда (важнее забытого pending). 18.09: команда = целое слово, а не
+    префикс — фамилия «Курсанов» в режиме ввода не должна сбрасывать его."""
     return (msg_lower in ("отмена", "cancel", "меню")
-            or msg_lower.startswith(_HR_COMMAND_PREFIXES))
+            or bool(_HR_COMMAND_RE.match(msg_lower)))
+
+
+def _await_arg(user_id: str, command: str, prompt: str) -> tuple[str, list]:
+    """18.09 (фидбек Дмитрия): после кнопки без аргумента HR просто пишет
+    email/ID/фамилию — следующее сообщение склеивается с командой. Старая
+    форма «Пригласить email» работает как раньше."""
+    _pending_edits[user_id] = {
+        "kind": "await_arg", "command": command,
+        "expires": time.monotonic() + PENDING_EDIT_TTL,
+    }
+    return prompt + "\n\n«Отмена» — выйти.", keyboards.hr_cancel_edit()
 
 
 def _pending_dedup_key(key: str, pending: dict) -> str:
@@ -194,6 +210,8 @@ def _pending_dedup_key(key: str, pending: dict) -> str:
     if kind in ("invite", "role_change"):
         tag = "inv" if kind == "invite" else "rc"
         return f"{key}#{tag}{pending['uid']}a{pending.get('attempt', 0)}"
+    if kind == "await_arg":
+        return f"{key}#arg{pending['command']}"
     return f"{key}#step{pending.get('step', '')}"
 
 
@@ -203,12 +221,17 @@ def _pending_cancel_text(pending: dict) -> str:
     что он «не приглашён»."""
     kind = pending.get("kind")
     if kind == "invite":
+        if len(pending.get("targets") or []) > 1:
+            return (f"Приглашение {len(pending['targets'])} сотрудников "
+                    "отменено — доступ не выдан.")
         if is_employee_allowed(pending["uid"]):
             return (f"Приглашение {pending['fio']} отменено; ранее выданный "
                     "доступ и роль сохраняются.")
         return f"Приглашение {pending['fio']} отменено — доступ не выдан."
     if kind == "role_change":
         return f"Смена роли {pending['fio']} отменена."
+    if kind == "await_arg":
+        return "Ввод отменён."
     return "Правка отменена."
 
 
@@ -786,7 +809,7 @@ async def _finish_invite(uid: str, email: str, fio: str,
         # как no-op, не должен менять состояние (ревью 01.09)
         current = await asyncio.to_thread(_employee_role_name, uid)
         return (f"ℹ️ {fio} уже проходит обучение (роль: {current}). "
-                f"Сменить роль: Роль {email}")
+                f"Сменить роль: Роль {email or uid}")
     if role_id:
         await asyncio.to_thread(set_employee_role, uid, role_id)
     first_msg = await asyncio.to_thread(start_onboarding, uid, f"u{uid}")
@@ -804,13 +827,14 @@ async def _finish_invite(uid: str, email: str, fio: str,
     # 18.09: файл документа больше не вкладываем (шёл от владельца вебхука
     # отдельным личным чатом) — ссылка есть в первом сообщении курса
     role_suffix = f" Роль: {role_name(role_id)}." if role_id else ""
+    contact = email or f"ID {uid}"          # 18.09: у админов почты нет
     if new_session is None:
         # Открытой сессии нет = маркер «курсов для роли нет» (course_id=0,
         # DONE) — не врать HR про «отправил первое сообщение» (ревью 01.09)
-        return (f"✅ {fio} ({email}) добавлен в доступ.{role_suffix} "
+        return (f"✅ {fio} ({contact}) добавлен в доступ.{role_suffix} "
                 "Курсов для этой роли пока нет — сотрудник получит анонс "
                 "при активации подходящего курса.")
-    return (f"✅ {fio} ({email}) приглашён — отправил ему первое сообщение."
+    return (f"✅ {fio} ({contact}) приглашён — отправил ему первое сообщение."
             + role_suffix)
 
 
@@ -853,6 +877,8 @@ async def _role_pick_input(user_id: str, pending: dict,
     try:
         if pending.get("kind") == "role_change":
             text = await _finish_role_change(pending, role_id)
+        elif pending.get("targets"):
+            text = await _finish_invite_batch(pending, role_id, user_id)
         else:
             text = await _finish_invite(pending["uid"], pending["email"],
                                         pending["fio"],
@@ -868,6 +894,260 @@ async def _role_pick_input(user_id: str, pending: dict,
                 keyboards.hr_role_select(options))
     _pending_edits.pop(user_id, None)
     return text, None
+
+
+async def _finish_invite_batch(pending: dict, role_id: str | None,
+                               hr_user_id: str) -> str:
+    """18.09: одна роль на всех целей pending. Сбой одной цели не роняет
+    остальных: успешные вычёркиваются из pending и их строки копятся —
+    повтор цифры доделывает только оставшихся."""
+    done_lines = pending.setdefault("done_lines", [])
+    for target in list(pending["targets"]):
+        line = await _finish_invite(target["uid"], target["email"],
+                                    target["fio"], target["work_position"],
+                                    hr_user_id, role_id)
+        done_lines.append(line)
+        pending["targets"].remove(target)
+    lines = done_lines + pending.get("note_lines", [])
+    return "\n".join(lines)
+
+
+_INVITE_ID_RE = re.compile(r"^\d{1,10}$")
+
+
+def _split_invite_tokens(text: str) -> list[str]:
+    """Аргументы «Пригласить»: через перенос, запятую, точку с запятой;
+    по пробелам — только если КАЖДЫЙ кусок email или ID («Иванов Иван» —
+    один поиск по имени, «отдел Ресепшн» — один запрос отдела)."""
+    tokens: list[str] = []
+    for chunk in re.split(r"[\n,;]+", text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split()
+        if len(parts) > 1 and all(_extract_email(p) or _INVITE_ID_RE.match(p)
+                                  for p in parts):
+            tokens += parts
+        else:
+            tokens.append(chunk)
+    return tokens
+
+
+def _user_fio(user: dict) -> str:
+    return (f"{user.get('NAME', '')} {user.get('LAST_NAME', '')}".strip()
+            or (user.get("EMAIL") or f"ID {user.get('ID')}"))
+
+
+def _user_label(user: dict) -> str:
+    position = (user.get("WORK_POSITION") or "").strip()
+    return _user_fio(user) + (f" ({position})" if position else "")
+
+
+def _is_service_account(user: dict) -> bool:
+    """Служебные учётки отделов («БС 74», «.»): без имени или фамилия без
+    букв — в приглашение отдела не включаем."""
+    name = (user.get("NAME") or "").strip()
+    last = (user.get("LAST_NAME") or "").strip()
+    return not name or not any(ch.isalpha() for ch in last)
+
+
+async def _bitrix_user_by_id(uid: str) -> dict | None:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(BITRIX_WEBHOOK_URL + "user.get",
+                              json={"ID": uid})
+        r.raise_for_status()
+        result = r.json().get("result") or []
+    return result[0] if result else None
+
+
+async def _bitrix_users_by_name(name: str) -> list[dict]:
+    """user.get по подстроке ФИО (NAME_SEARCH, проверено живьём 18.09:
+    «Саркис» → Саркисов, Саркисьян, Саркисян). Страховка на нашей стороне:
+    подстрока должна входить в имя или фамилию (NAME_SEARCH ищет и по
+    другим полям)."""
+    needle = name.casefold()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(BITRIX_WEBHOOK_URL + "user.get",
+                              json={"FILTER": {"NAME_SEARCH": name},
+                                    "ACTIVE": True})
+        r.raise_for_status()
+        result = r.json().get("result") or []
+    return [u for u in result
+            if needle in f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".casefold()]
+
+
+async def _bitrix_departments() -> list[dict] | None:
+    """department.get постранично. None — у вебхука нет скоупа department."""
+    deps: list[dict] = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        start = 0
+        while True:
+            r = await client.post(BITRIX_WEBHOOK_URL + "department.get",
+                                  json={"start": start})
+            body = r.json()
+            if body.get("error"):
+                print(f"[invite] department.get: {body.get('error')}")
+                return None
+            deps += body.get("result") or []
+            if body.get("next") is None:
+                return deps
+            start = body["next"]
+
+
+async def _resolve_invite_tokens(tokens: list[str]) -> dict:
+    """Каждый токен → пользователи Битрикса. Возвращает targets (найдены
+    однозначно), ambiguous [(токен, кандидаты)], missing [токен],
+    dept_preview {dep, users} (отдел по названию — ждёт подтверждения),
+    no_scope (просили отдел, а скоупа нет)."""
+    out: dict = {"targets": [], "ambiguous": [], "missing": [],
+                 "dept_preview": None, "no_scope": False}
+    seen: set[str] = set()
+
+    def _add(user: dict) -> None:
+        uid = str(user.get("ID"))
+        if uid not in seen:
+            seen.add(uid)
+            out["targets"].append(user)
+
+    for token in tokens:
+        low = token.casefold()
+        if low.startswith("отдел"):
+            query = token[5:].strip(" :–-")
+            if _INVITE_ID_RE.match(query):          # «отдел 2439» = подтверждено
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    users = await _department_users(client, query)
+                for u in users:
+                    # тот же отбор, что в превью: служебные и уже допущенные
+                    # (в whitelist) в приглашение отдела не идут
+                    if _is_service_account(u) or await asyncio.to_thread(
+                            is_employee_allowed, str(u.get("ID"))):
+                        continue
+                    _add(u)
+                continue
+            deps = await _bitrix_departments()
+            if deps is None:
+                out["no_scope"] = True
+                continue
+            found = [d for d in deps
+                     if query.casefold() in (d.get("NAME") or "").casefold()]
+            if not found:
+                out["missing"].append(token)
+                continue
+            dep = found[0]
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                users = await _department_users(client, str(dep["ID"]))
+            out["dept_preview"] = {
+                "dep": dep,
+                "users": [u for u in users if not _is_service_account(u)],
+                "others": [d["NAME"] for d in found[1:]],
+            }
+            continue
+        email = _extract_email(token)
+        if email:
+            user = await _bitrix_user_by_email(email)
+            (_add(user) if user else out["missing"].append(token))
+            continue
+        if _INVITE_ID_RE.match(token):
+            user = await _bitrix_user_by_id(token)
+            (_add(user) if user else out["missing"].append(token))
+            continue
+        users = await _bitrix_users_by_name(token)
+        if len(users) == 1:
+            _add(users[0])
+        elif users:
+            out["ambiguous"].append((token, users))
+        else:
+            out["missing"].append(token)
+    return out
+
+
+async def _invite_resolved(hr_user_id: str, found: dict) -> tuple[str, list | None]:
+    """Ответ HR по результату резолва: превью отдела / уточнение / выбор
+    роли для всех найденных / итог, если приглашать некого."""
+    notes: list[str] = []
+    kb: list | None = None
+    if found["no_scope"]:
+        notes.append("⚠️ Поиск по отделам недоступен: у вебхука бота нет "
+                     "права «department» — добавь его в настройках вебхука "
+                     "на портале.")
+    for token in found["missing"]:
+        notes.append(f"⚠️ «{token}» — не найден в Битриксе.")
+    preview = found["dept_preview"]
+    if preview is not None:
+        dep, users = preview["dep"], preview["users"]
+        new_users = [u for u in users
+                     if not await asyncio.to_thread(is_employee_allowed,
+                                                    str(u.get("ID")))]
+        lines = [f"🏢 Отдел «{dep['NAME']}»: {len(users)} чел., "
+                 f"ещё не приглашены — {len(new_users)}:"]
+        lines += [f"• {_user_label(u)}" for u in new_users[:40]]
+        if len(new_users) > 40:
+            lines.append(f"… и ещё {len(new_users) - 40}")
+        if preview["others"]:
+            lines.append("Похожие отделы: " + ", ".join(preview["others"]))
+        if new_users:
+            lines.append("\nНажми кнопку — спрошу роль для всех и приглашу.")
+            kb = keyboards.hr_invite_department(str(dep["ID"]), len(new_users))
+        return "\n".join(lines + notes), kb
+    if found["ambiguous"]:
+        lines, items = [], []
+        for token, users in found["ambiguous"]:
+            lines.append(f"🔎 По «{token}» несколько сотрудников — выбери:")
+            lines += [f"• {_user_label(u)} · Пригласить {u.get('ID')}"
+                      for u in users[:8]]
+            items += [(str(u.get("ID")), _user_label(u)) for u in users[:8]]
+        return "\n".join(lines + notes), keyboards.hr_candidates(items)
+
+    targets, already = [], []
+    for u in found["targets"]:
+        uid = str(u.get("ID"))
+        fio = _user_fio(u)
+        email = (u.get("EMAIL") or "").strip().lower()
+        position = (u.get("WORK_POSITION") or "").strip() or None
+        if await asyncio.to_thread(get_session, uid):
+            # Повторное приглашение освежает email/ФИО; роль НЕ трогаем —
+            # для смены есть «Роль {email}»
+            await asyncio.to_thread(add_employee, uid, email, fio,
+                                    hr_user_id, position)
+            current = await asyncio.to_thread(_employee_role_name, uid)
+            already.append(f"ℹ️ {fio} уже проходит обучение (роль: {current}). "
+                           f"Сменить роль: Роль {email or uid}")
+            continue
+        targets.append({"uid": uid, "email": email, "fio": fio,
+                        "work_position": position, "label": _user_label(u)})
+    if not targets:
+        return "\n".join(already + notes) or "⚠️ Приглашать некого.", None
+    options = selectable_roles()
+    if not options:
+        # Легаси-фолбэк только для пустого реестра ролей
+        lines = [await _finish_invite(t["uid"], t["email"], t["fio"],
+                                      t["work_position"], hr_user_id)
+                 for t in targets]
+        return "\n".join(lines + already + notes), None
+    first = targets[0]
+    # 01.09: роль выбирает HR — цифрой/кнопкой; в whitelist пишем ПОСЛЕ
+    # выбора («Отмена» = не приглашён); options — СНАПШОТ списка, который
+    # HR видел. uid/email/fio первой цели — для дедупа и текста отмены.
+    _pending_edits[hr_user_id] = {
+        "kind": "invite", "uid": first["uid"], "email": first["email"],
+        "fio": first["fio"], "work_position": first["work_position"],
+        "targets": targets, "note_lines": already + notes,
+        "options": options,
+        "expires": time.monotonic() + PENDING_EDIT_TTL,
+    }
+    if len(targets) == 1:
+        contact = first["email"] or f"ID {first['uid']}"
+        head = (f"🧑‍💼 {first['fio']} ({contact}) найден. "
+                "Выбери роль сотрудника:")
+    else:
+        head = (f"🧑‍💼 Найдено {len(targets)}:\n"
+                + "\n".join(f"• {t['label']}" for t in targets)
+                + "\n\nВыбери роль для всех:")
+    text = (head + "\n\n" + _format_role_list(options)
+            + "\n\nОтветь цифрой (например: 1). «Отмена» — не приглашать.")
+    if already or notes:
+        text = "\n".join(already + notes) + "\n\n" + text
+    return text, keyboards.hr_role_select(options)
 
 
 async def _bitrix_user_by_email(email: str) -> dict | None:
@@ -1419,6 +1699,19 @@ async def _handle_hr_message(user_id: str, question: str,
     # ── Живой pending перехватывает сообщение: визард правки вопроса или
     # выбор роли (приглашение / «Роль {email}») ──────────────────────────────
     pending = _get_pending(user_id)
+    if pending and pending.get("kind") == "await_arg":
+        # 18.09: режим «кнопка → ввод»: аргумент склеиваем с командой и
+        # проваливаемся в обычную цепочку; отмена/команда/«Меню» — сброс
+        if msg_lower in ("отмена", "cancel"):
+            _pending_edits.pop(user_id, None)
+            asyncio.create_task(_send(dialog_id, _pending_cancel_text(pending),
+                                      HR_BOT_ID, client_id))
+            return
+        _pending_edits.pop(user_id, None)
+        if not _is_pending_escape(msg_lower):
+            question = f"{pending['command']} {question.strip()}"
+            msg_lower = question.lower()
+        pending = None
     if pending:
         role_pick = pending.get("kind") in ("invite", "role_change")
         if msg_lower in ("отмена", "cancel"):
@@ -1497,57 +1790,21 @@ async def _handle_hr_message(user_id: str, question: str,
                 text = "❌ Укажи числовой номер курса: Подтвердить {N}"
 
     elif msg_lower.startswith("пригласить"):
-        email = _extract_email(question)
-        if not email:
-            text = ("✉️ Напиши email сотрудника. Например: "
-                    "Пригласить n.sharapov@proptech.digital")
+        arg = question.strip()[len("пригласить"):].strip()
+        if not arg:
+            text, kb = _await_arg(
+                user_id, "пригласить",
+                "✉️ Напиши email, ID или фамилию сотрудника — можно "
+                "несколько (через запятую или с новой строки) или "
+                "«отдел {название}».")
         else:
             try:
-                user = await _bitrix_user_by_email(email)
+                found = await _resolve_invite_tokens(_split_invite_tokens(arg))
             except httpx.HTTPError as exc:
                 print(f"[invite] user.get ERROR: {exc!r}")
                 text = "⚠️ Битрикс не ответил. Попробуй ещё раз через минуту."
             else:
-                if user is None:
-                    text = f"⚠️ Сотрудник с email {email} не найден в Битриксе."
-                else:
-                    uid = str(user.get("ID"))
-                    fio = (f"{user.get('NAME', '')} {user.get('LAST_NAME', '')}".strip()
-                           or email)
-                    position = (user.get("WORK_POSITION") or "").strip() or None
-                    options = selectable_roles()
-                    if await asyncio.to_thread(get_session, uid):
-                        # Повторное приглашение освежает email/ФИО (как раньше);
-                        # роль НЕ трогаем — для смены есть «Роль {email}»
-                        await asyncio.to_thread(add_employee, uid, email, fio,
-                                                user_id, position)
-                        current = await asyncio.to_thread(_employee_role_name,
-                                                          uid)
-                        text = (f"ℹ️ {fio} уже проходит обучение "
-                                f"(роль: {current}). "
-                                f"Сменить роль: Роль {email}")
-                    elif options:
-                        # 01.09: роль выбирает HR — цифрой/кнопкой, не сотрудник.
-                        # В whitelist пишем ПОСЛЕ выбора («Отмена» = не приглашён);
-                        # options — СНАПШОТ: цифра резолвится по списку,
-                        # который HR видел, даже если roles.json поправят
-                        _pending_edits[user_id] = {
-                            "kind": "invite", "uid": uid, "email": email,
-                            "fio": fio, "work_position": position,
-                            "options": options,
-                            "expires": time.monotonic() + PENDING_EDIT_TTL,
-                        }
-                        text = (f"🧑‍💼 {fio} ({email}) найден. "
-                                "Выбери роль сотрудника:\n\n"
-                                + _format_role_list(options)
-                                + "\n\nОтветь цифрой (например: 1). "
-                                  "«Отмена» — не приглашать.")
-                        kb = keyboards.hr_role_select(options)
-                    else:
-                        # Легаси-фолбэк только для пустого реестра ролей:
-                        # кнопки выбора построить не из чего
-                        text = await _finish_invite(uid, email, fio,
-                                                    position, user_id)
+                text, kb = await _invite_resolved(user_id, found)
 
     elif msg_lower.startswith("допустить"):
         parts = question.split()
@@ -1561,8 +1818,8 @@ async def _handle_hr_message(user_id: str, question: str,
             else:
                 target_uid = emp["bitrix_uid"]
         if len(parts) < 2:
-            text = ("🎓 Напиши ID или email сотрудника. Например: "
-                    "Допустить n.sharapov@proptech.digital")
+            text, kb = _await_arg(user_id, "допустить",
+                                  "🎓 Напиши ID или email сотрудника.")
         elif target_uid:
             # 17.08: допуск целится в WAITING_HR-строку (свойство курса), а не
             # в активную сессию — сотрудник мог уйти проходить другой курс.
@@ -1722,8 +1979,8 @@ async def _handle_hr_message(user_id: str, question: str,
     elif msg_lower.startswith("история"):
         parts = question.split()
         if len(parts) < 2:
-            text = ("📋 Напиши ID или email сотрудника. Например: "
-                    "История n.sharapov@proptech.digital")
+            text, kb = _await_arg(user_id, "история",
+                                  "📋 Напиши ID или email сотрудника.")
         else:
             target = parts[-1]
             uid, label = None, target
@@ -1798,12 +2055,18 @@ async def _handle_hr_message(user_id: str, question: str,
             removed = await asyncio.to_thread(remove_manager, email)
             text = (f"✅ {email} удалён." if removed
                     else f"⚠️ {email} не найден в списке.")
+        elif sub in ("добавить", "удалить"):
+            # кнопка «➕ Добавить»/«➖ Удалить» → следующим сообщением email
+            text, kb = _await_arg(
+                user_id, f"руководитель {sub}",
+                f"⚙️ Напиши email руководителя, которого {sub}"
+                + (" (добавь слово «старший» для старшего)."
+                   if sub == "добавить" else "."))
         else:
-            text = ("⚙️ Напиши действие и email. Например: Руководитель "
-                    "добавить n.sharapov@proptech.digital\n"
-                    "Или: Руководитель удалить n.sharapov@proptech.digital\n\n"
-                    "Формат: Руководители | Руководитель добавить {email} "
-                    "[старший] | Руководитель удалить {email}")
+            text = ("⚙️ Реестр получателей эскалаций: нажми действие или "
+                    "напиши «Руководитель добавить {email} [старший]» / "
+                    "«Руководитель удалить {email}».")
+            kb = keyboards.hr_manager_actions()
 
     elif msg_lower.startswith(("аббревиатура", "аббревиатуры")):
         # 19.08: реестр аббревиатур департаментов правится из HR-бота
@@ -1842,6 +2105,13 @@ async def _handle_hr_message(user_id: str, question: str,
                     await asyncio.to_thread(save_roles_config, cfg)
                     text = (f"✅ {abbr} → {roles_map[slug]}.\n\n"
                             + _abbr_list_text(cfg))
+        elif re.match(r"^аббревиатур[аы]\s+(добавить|удалить)$", msg_lower):
+            sub = msg_lower.split()[1]
+            text, kb = _await_arg(
+                user_id, f"аббревиатура {sub}",
+                f"🔤 Напиши аббревиатуру, которую {sub}"
+                + (", и название роли (например: FIN Финансовая служба)."
+                   if sub == "добавить" else " (например: FIN)."))
         else:
             text = (_abbr_list_text(cfg) + "\n\n"
                     "Правка: Аббревиатура добавить {ABBR} {Название роли} · "
@@ -1852,8 +2122,9 @@ async def _handle_hr_message(user_id: str, question: str,
                 "Напиши: Роль {email или ID}.")
 
     elif msg_lower == "роль":
-        text = ("⚙️ Напиши: Роль {email или ID} — сменю роль "
-                "сотрудника (спрошу цифрой из списка).")
+        text, kb = _await_arg(user_id, "роль",
+                              "⚙️ Напиши email или ID сотрудника — сменю роль "
+                              "(спрошу цифрой из списка).")
 
     elif re.match(r"^роль\s+\S+$", msg_lower):
         # 01.09: смена роли сотрудника HR-ом в любой момент — повторное
@@ -1898,8 +2169,8 @@ async def _handle_hr_message(user_id: str, question: str,
             "  Например: *Подтвердить 44* — активирует курс №44 и разошлёт его сотрудникам.\n"
             "• *Изменить {курс} {вопрос 1–15}* — править вопрос курса\n"
             "  Например: *Изменить 44 6* — откроет правку шестого вопроса курса №44.\n"
-            "• *Пригласить {email}* — дать доступ и начать обучение\n"
-            "  Например: *Пригласить n.sharapov@proptech.digital* — бот спросит роль сотрудника (цифрой), затем сотрудник получит доступ и первое сообщение.\n"
+            "• *Пригласить {email, ID или фамилия}* — дать доступ и начать обучение\n"
+            "  Например: *Пригласить n.sharapov@proptech.digital* или *Пригласить 54824* — бот спросит роль (цифрой), затем сотрудник получит доступ и первое сообщение. Можно несколько через запятую или *Пригласить отдел Ресепшн*.\n"
             "• *Допустить {email или ID}* — допустить сотрудника к экзамену\n"
             "  Например: *Допустить n.sharapov@proptech.digital* — откроет экзамен после базового теста.\n"
             "• *Роль {email или ID}* — сменить роль сотрудника\n"
