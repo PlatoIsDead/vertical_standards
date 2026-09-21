@@ -2537,19 +2537,32 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
         # версии — второй курс не нужен, правки вопросов HR (№3) сохраняются.
         duplicate = await asyncio.to_thread(get_course_by_doc_name, file_name)
         if duplicate:
-            if duplicate.get("archived_at"):
+            was_archived = bool(duplicate.get("archived_at"))
+            if was_archived:
                 await asyncio.to_thread(set_course_archived, duplicate["id"], False)
                 print(f"[process_new_document] course {duplicate['id']} unarchived")
             await asyncio.to_thread(
                 mark_file_processed, file_id, file_name, folder_id, update_time,
                 content_hash,
             )
+            # 21.09 (фидбек юзера: «почему не пришло уведомление, что курс
+            # добавлен») — раньше HR узнавал только про is_replacement
+            # (та же папка, версия обновилась). Если документ пришёл в
+            # ДРУГУЮ папку (копия под другую роль) или курс разархивирован,
+            # уходил тем же путём — но молча. Теперь HR узнаёт всегда, и обе
+            # причины (замена/копия × разархивирован) могут звучать вместе.
             if is_replacement:
                 notify = (f"🔄 Документ «{file_name}» обновлён: "
                           f"{len(normalised)} фрагментов (было {removed}). "
                           "Вопросы курса сохранены.")
-                for hr_id in _hr_ids():
-                    await _send(str(hr_id), notify, HR_BOT_ID)
+            else:
+                notify = (f"📄 «{file_name}» — копия для роли {list(roles)} к "
+                          f"курсу №{duplicate['id']} ({len(normalised)} "
+                          "фрагментов). Новый курс не создан, тест общий.")
+            if was_archived:
+                notify += f" Курс №{duplicate['id']} восстановлен из архива."
+            for hr_id in _hr_ids():
+                await _send(str(hr_id), notify, HR_BOT_ID)
             print(
                 f"[process_new_document] duplicate doc_name={file_name!r} "
                 f"(course_id={duplicate['id']}) — chunks ingested for roles={roles}, "
