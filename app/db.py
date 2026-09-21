@@ -218,6 +218,21 @@ def save_draft_course(doc_name: str, doc_id: str, questions_json: str,
         return cur.lastrowid
 
 
+def update_course_doc_id(course_id: int, doc_id: str, doc_detail_url: str = None) -> None:
+    """21.09: при замене версии (is_replacement) документ получает новый
+    file_id, а courses.doc_id оставался старым навсегда. init_db() сидирует
+    processed_files из courses.doc_id при каждом рестарте (:145) — стухший
+    doc_id воскресал ФАНТОМНУЮ строку под старым file_id (folder_id=NULL),
+    из-за которой count_processed_by_doc_name никогда не доходил до нуля и
+    курс не мог заново заархивироваться при реальном удалении файла."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE courses SET doc_id = ?, doc_detail_url = COALESCE(?, doc_detail_url) "
+            "WHERE id = ?",
+            (doc_id, doc_detail_url, course_id),
+        )
+
+
 def activate_course(doc_id: str, hr_user_id: str) -> bool:
     """Mark course as approved by Bitrix file ID. Returns True if found."""
     now = datetime.utcnow().isoformat()

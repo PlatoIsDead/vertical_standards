@@ -58,6 +58,7 @@ from app.db import (
     set_course_archived,
     set_meta,
     update_course_questions,
+    update_course_doc_id,
     update_session_by_user,
     update_user_departments,
 )
@@ -2551,6 +2552,13 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
                 content_hash,
             )
             if is_replacement:
+                # 21.09: courses.doc_id держим АКТУАЛЬНЫМ file_id — иначе
+                # init_db() при каждом рестарте сидирует фантомную строку
+                # processed_files под старым (уже неживым) file_id, и курс
+                # больше никогда не сможет заархивироваться по-настоящему
+                # (count_processed_by_doc_name не доходит до нуля).
+                await asyncio.to_thread(
+                    update_course_doc_id, duplicate["id"], file_id, detail_url)
                 notify = (f"🔄 Документ «{file_name}» обновлён: "
                           f"{len(normalised)} фрагментов (было {removed}). "
                           "Вопросы курса сохранены.")

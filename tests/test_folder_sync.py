@@ -148,6 +148,7 @@ def test_ingest_tags_chunks_and_stores_update_time(env):
 
 def test_replacement_same_folder(env):
     _ingest("101", "Правила.txt", "111", V1_TEXT, update_time="T1")
+    course_id = db.get_course_by_doc_name("Правила.txt")["id"]
     _ingest("102", "Правила.txt", "111", V2_TEXT, update_time="T2")
 
     chunks, emb = store.load()
@@ -156,6 +157,23 @@ def test_replacement_same_folder(env):
     assert len(db.get_pending_courses()) == 1          # курс один
     assert db.get_processed_file("101") is None        # строка старого file_id снята
     assert db.get_processed_file("102")["update_time"] == "T2"
+    # 21.09: courses.doc_id идёт за живым файлом — иначе рестарт сервера
+    # (init_db ресидирует processed_files из courses.doc_id) воскрешает
+    # фантомную строку под старым (102 → тут уже неживым 101) file_id.
+    assert db.get_course_by_id(course_id)["doc_id"] == "102"
+
+
+def test_replacement_doc_id_survives_restart_reseed(env):
+    """21.09 (живой инцидент): без синка doc_id init_db() на каждом
+    рестарте воскрешал строку под старым file_id (folder_id=NULL) — курс
+    из-за неё никогда не мог доархивироваться по-настоящему, потому что
+    count_processed_by_doc_name не доходил до нуля."""
+    _ingest("101", "Правила.txt", "111", V1_TEXT, update_time="T1")
+    _ingest("102", "Правила.txt", "111", V2_TEXT, update_time="T2")
+
+    db.init_db()                                       # симулируем рестарт
+    assert db.get_processed_file("101") is None         # фантом не воскрес
+    assert db.count_processed_by_doc_name("Правила.txt") == 1
 
 
 def test_copy_other_folder_keeps_both(env, monkeypatch):
@@ -262,6 +280,22 @@ def _listing(tree):
             raise result
         return result or []
     return fake_list
+
+
+def test_replaced_document_can_still_be_deleted_for_real(env, monkeypatch):
+    """21.09 (живой инцидент): без синка doc_id фантом старого file_id
+    держал count_processed_by_doc_name > 0 навсегда — реальное удаление
+    ПОСЛЕ хотя бы одной замены версии никогда не архивировало курс."""
+    _ingest("101", "Правила.txt", "111", V1_TEXT, update_time="T1")
+    _ingest("102", "Правила.txt", "111", V2_TEXT, update_time="T2")   # замена
+    db.init_db()                                        # рестарт между событиями
+
+    monkeypatch.setattr(bot, "_list_children", _listing({}))         # файла нет
+    asyncio.run(bot._sync_folder("111", ["housekeeper"]))             # strike 1
+    asyncio.run(bot._sync_folder("111", ["housekeeper"]))             # strike 2
+
+    assert db.get_active_courses() == []                 # курс архивирован
+    assert db.get_processed_file("102") is None
 
 
 def test_deletion_two_strike(env, monkeypatch):
