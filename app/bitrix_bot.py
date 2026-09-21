@@ -2533,24 +2533,23 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
                 if old["doc_name"] == file_name and str(old["file_id"]) != str(file_id):
                     await asyncio.to_thread(remove_processed_file, str(old["file_id"]))
 
-        # 6.5. Уже есть курс с этим doc_name: копия из другой папки ИЛИ замена
-        # версии — второй курс не нужен, правки вопросов HR (№3) сохраняются.
+        # 6.5. Уже есть АКТИВНЫЙ (не в архиве) курс с этим doc_name: копия из
+        # другой папки ИЛИ замена версии — второй курс не нужен, правки
+        # вопросов HR (№3) сохраняются.
+        #
+        # 21.09 (фидбек юзера, живой прогон — удалил файл из папки специально,
+        # чтобы показать HR-уведомление о новом курсе; вместо этого бот тихо
+        # разархивировал старый): если курс в архиве, эта ветка НЕ СРАБАТЫВАЕТ
+        # вовсе — документ идёт как самостоятельный НОВЫЙ курс ниже (генерация
+        # вопросов, «Курсы на проверке», обычное «📄 Новый документ»). Удаление
+        # из папки — это удаление: старый курс остаётся в архиве, повторная
+        # загрузка не тянет его назад молча.
         duplicate = await asyncio.to_thread(get_course_by_doc_name, file_name)
-        if duplicate:
-            was_archived = bool(duplicate.get("archived_at"))
-            if was_archived:
-                await asyncio.to_thread(set_course_archived, duplicate["id"], False)
-                print(f"[process_new_document] course {duplicate['id']} unarchived")
+        if duplicate and not duplicate.get("archived_at"):
             await asyncio.to_thread(
                 mark_file_processed, file_id, file_name, folder_id, update_time,
                 content_hash,
             )
-            # 21.09 (фидбек юзера: «почему не пришло уведомление, что курс
-            # добавлен») — раньше HR узнавал только про is_replacement
-            # (та же папка, версия обновилась). Если документ пришёл в
-            # ДРУГУЮ папку (копия под другую роль) или курс разархивирован,
-            # уходил тем же путём — но молча. Теперь HR узнаёт всегда, и обе
-            # причины (замена/копия × разархивирован) могут звучать вместе.
             if is_replacement:
                 notify = (f"🔄 Документ «{file_name}» обновлён: "
                           f"{len(normalised)} фрагментов (было {removed}). "
@@ -2559,8 +2558,6 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
                 notify = (f"📄 «{file_name}» — копия для роли {list(roles)} к "
                           f"курсу №{duplicate['id']} ({len(normalised)} "
                           "фрагментов). Новый курс не создан, тест общий.")
-            if was_archived:
-                notify += f" Курс №{duplicate['id']} восстановлен из архива."
             for hr_id in _hr_ids():
                 await _send(str(hr_id), notify, HR_BOT_ID)
             print(

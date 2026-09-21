@@ -182,7 +182,13 @@ def test_copy_other_folder_keeps_both(env, monkeypatch):
     assert "копия" in sent[0][1] and "Новый курс не создан" in sent[0][1]
 
 
-def test_reingest_unarchives_course(env, monkeypatch):
+def test_reupload_of_archived_course_creates_new_course(env, monkeypatch):
+    """21.09 (фидбек юзера, живой прогон): удалил файл специально, чтобы
+    показать HR-уведомление о новом курсе — бот вместо этого тихо
+    разархивировал старый. Удаление должно оставаться удалением: повторная
+    загрузка документа, чей курс в архиве, — обычный НОВЫЙ курс (свои
+    вопросы, «Курсы на проверке», стандартное «📄 Новый документ»), старый
+    архивный курс не трогаем и не воскрешаем."""
     sent = []
 
     async def fake_send(dialog_id, text, bot_id=None, *a, **kw):
@@ -192,21 +198,26 @@ def test_reingest_unarchives_course(env, monkeypatch):
     monkeypatch.setattr(bot, "_hr_ids", lambda: ["9"])
 
     _ingest("101", "Правила.txt", "111", V1_TEXT)
-    course = db.get_course_by_doc_name("Правила.txt")
-    db.set_course_archived(course["id"], True)
+    old = db.get_course_by_doc_name("Правила.txt")
+    db.set_course_archived(old["id"], True)
     sent.clear()
 
     _ingest("102", "Правила.txt", "111", V2_TEXT, update_time="T2")
-    assert db.get_course_by_doc_name("Правила.txt")["archived_at"] is None
-    # 21.09: разархивирование теперь тоже видно HR — и звучит вместе с
-    # причиной (тут — замена версии в той же папке)
-    assert len(sent) == 1
-    assert "обновлён" in sent[0][1] and "восстановлен из архива" in sent[0][1]
+
+    new = db.get_course_by_doc_name("Правила.txt")     # ORDER BY id DESC — свежий
+    assert new["id"] != old["id"]
+    assert db.get_course_by_id(old["id"])["archived_at"] is not None  # старый не трогали
+    assert new["archived_at"] is None
+    assert env["generate"] == 2                        # вопросы сгенерированы заново
+    hr_msgs = [t for d, t in sent if d == "9"]
+    assert any("Новый документ" in t and f"Подтвердить {new['id']}" in t
+              for t in hr_msgs)
+    assert not any("восстановлен из архива" in t or "копия" in t for t in hr_msgs)
 
 
-def test_copy_other_folder_of_archived_course_mentions_both(env, monkeypatch):
-    """21.09: реальный кейс — копия в ДРУГОЙ папке курса, который был в
-    архиве. Обе причины должны прозвучать в одном сообщении."""
+def test_copy_other_folder_of_archived_course_also_creates_new(env, monkeypatch):
+    """Та же ситуация, но копия документа приходит в ДРУГУЮ папку (не
+    замена версии) — результат тот же: новый самостоятельный курс."""
     sent = []
 
     async def fake_send(dialog_id, text, bot_id=None, *a, **kw):
@@ -216,14 +227,17 @@ def test_copy_other_folder_of_archived_course_mentions_both(env, monkeypatch):
     monkeypatch.setattr(bot, "_hr_ids", lambda: ["9"])
 
     _ingest("101", "Правила.txt", "111", V1_TEXT)
-    course = db.get_course_by_doc_name("Правила.txt")
-    db.set_course_archived(course["id"], True)
+    old = db.get_course_by_doc_name("Правила.txt")
+    db.set_course_archived(old["id"], True)
     sent.clear()
 
-    _ingest("103", "Правила.txt", "222", V1_TEXT)     # другая папка, не T2
-    assert db.get_course_by_doc_name("Правила.txt")["archived_at"] is None
-    assert len(sent) == 1
-    assert "копия" in sent[0][1] and "восстановлен из архива" in sent[0][1]
+    _ingest("103", "Правила.txt", "222", V1_TEXT)      # другая папка
+
+    new = db.get_course_by_doc_name("Правила.txt")
+    assert new["id"] != old["id"] and new["archived_at"] is None
+    assert db.get_course_by_id(old["id"])["archived_at"] is not None
+    hr_msgs = [t for d, t in sent if d == "9"]
+    assert any("Новый документ" in t for t in hr_msgs)
 
 
 # ── Синк удалений (two-strike) ───────────────────────────────────────────────
