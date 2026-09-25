@@ -41,6 +41,7 @@ from app.db import (
     update_session,
 )
 from app import kb_tracker, keyboards, quiz
+from app.links import doc_url
 from app.gamification import post_exam_congratulation
 from app.rag import answer as rag_answer
 from app.roles import (
@@ -524,7 +525,7 @@ def doc_link(course: dict) -> str:
     """Ссылка на документ курса BB-кодом. Один хелпер на все сообщения —
     02.09: анонс нового курса тоже обязан нести ссылку, а не только первое
     сообщение об обучении (фидбек юзера)."""
-    detail_url = course.get("doc_detail_url")
+    detail_url = doc_url(course.get("doc_detail_url"))
     name = display_name(course["doc_name"])
     return (f"[URL={detail_url}]{name}[/URL]" if detail_url
             else "(ссылка не найдена — спросите HR)")
@@ -932,7 +933,7 @@ def _rag_reply_ex(session: dict, message: str, chunks: list, embeddings,
     if relevant:
         doc = relevant[0].get("doc_name")
         if doc:
-            url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
+            url = doc_url((get_course_by_doc_name(doc) or {}).get("doc_detail_url"))
             name = display_name(doc)
             text += ("\n\n📄 Источник: " +
                      (f"[URL={url}]{name}[/URL]" if url else name))
@@ -971,7 +972,7 @@ def _my_documents_text(role_id: str | None, chunks: list) -> str:
     def _section(docs: list[str]) -> list[str]:
         out = []
         for doc in docs:
-            url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
+            url = doc_url((get_course_by_doc_name(doc) or {}).get("doc_detail_url"))
             name = display_name(doc)
             out.append("• " + (f"[URL={url}]{name}[/URL]" if url else name))
         return out
