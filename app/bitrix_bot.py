@@ -13,7 +13,6 @@ from fastapi import FastAPI, Request
 
 import app.index_store as index_store
 from app import deadlines, gamification
-from app.links import doc_url
 from app.db import (
     activate_course_by_id,
     add_employee,
@@ -1647,8 +1646,7 @@ async def _broadcast_new_standard(file_name: str, detail_url: str | None,
     после «Подтвердить» (флоу 19.08). Fire-and-forget, _send сам ретраит."""
     uids = await asyncio.to_thread(_standard_recipients, doc_roles)
     name = display_name(file_name)
-    link = (f"[URL={doc_url(detail_url)}]{name}[/URL]" if detail_url
-            else f"*{name}*")
+    link = f"[URL={detail_url}]{name}[/URL]" if detail_url else f"*{name}*"
     text = (f"📄 Новый стандарт доступен: {link}\n"
             "Уже можешь читать его и задавать мне вопросы по нему. "
             "Тест будет назначен позже.")
