@@ -301,3 +301,12 @@ Untracked до создания этого файла:
 Этот handoff добавляет только `HANDOFF.md`; остальной код при его подготовке
 не изменялся. Ни одного успешного полного прогона pytest/ruff в этой работе
 не зафиксировано. Сервер, commit, push и deploy не выполнялись.
+
+## Unified release migration — 13 November 2026
+
+User explicitly requested one test for all current employees, including existing
+attempts. `migrate_active_quizzes_to_unified()` archives unfinished legacy session
+rows and answers in `legacy_quiz_archive`, pins the current question snapshot,
+and resets the attempt to READING with quiz_version=2 and a bumped attempt counter.
+Completed history remains unchanged. Execute once during stopped-container maintenance;
+repeating the migration is a no-op. No employee messages are sent by the migration.

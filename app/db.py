@@ -889,3 +889,35 @@ def log_course_event(course_id: int, event: str, detail: str = "") -> None:
     with _conn() as conn:
         conn.execute("INSERT INTO course_events(course_id,event,detail) VALUES(?,?,?)",
                      (course_id, event, detail))
+
+
+def migrate_active_quizzes_to_unified() -> int:
+    """Archive legacy progress and restart unfinished real courses as unified tests.
+
+    Explicit release migration; completed results are never rewritten.
+    All archive and reset operations commit atomically and can be rerun safely.
+    """
+    with _conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS legacy_quiz_archive (
+            session_id INTEGER PRIMARY KEY, session_json TEXT NOT NULL,
+            answers_json TEXT NOT NULL, archived_at TEXT DEFAULT (datetime('now'))
+        )""")
+        rows = conn.execute("SELECT s.*, c.questions_json FROM sessions s "
+                            "JOIN courses c ON c.id=s.course_id "
+                            "WHERE s.quiz_version=1 AND s.state != 'DONE'").fetchall()
+        for row in rows:
+            old = dict(row)
+            snapshot = old.pop("questions_json")
+            # Validate before modifying any progress; malformed courses abort rollout.
+            json.loads(snapshot)
+            answers = [dict(a) for a in conn.execute(
+                "SELECT * FROM answers WHERE session_id=? ORDER BY id", (row["id"],))]
+            conn.execute("INSERT INTO legacy_quiz_archive "
+                         "(session_id,session_json,answers_json) VALUES(?,?,?)",
+                         (row["id"], json.dumps(old), json.dumps(answers)))
+            conn.execute("DELETE FROM answers WHERE session_id=?", (row["id"],))
+            conn.execute("UPDATE sessions SET quiz_version=2, quiz_questions_json=?, "
+                         "state='READING',current_q_idx=0,score_basic=0,score_exam=0, "
+                         "attempt=COALESCE(attempt,0)+1,updated_at=? WHERE id=?",
+                         (snapshot, datetime.utcnow().isoformat(), row["id"]))
+        return len(rows)
