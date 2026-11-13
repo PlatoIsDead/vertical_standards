@@ -80,8 +80,8 @@ def test_not_started_empty_and_details_sheet():
         emps, courses))
     det = wb2["Детали"]
     header = [c.value for c in det[1]]
-    assert header == ["Сотрудник", "Отдел", "Курс", "Статус", "Базовый",
-                      "Экзамен", "Дата"]
+    assert header == ["Сотрудник", "Отдел", "Курс", "Статус", "Базовый (старые сессии)",
+                      "Тест / экзамен", "Дата"]
     lines = {tuple(c.value for c in det[i]) for i in (2, 3)}
     statuses = {ln[3] for ln in lines}
     assert statuses == {"Сдан 9/10", "проходит базовый тест"}

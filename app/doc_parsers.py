@@ -56,7 +56,8 @@ def parse_md(filepath: str) -> list[dict]:
             continue
         m = re.match(r"^#{1,3}\s+(.+)", lines[0])
         heading = m.group(1).strip() if m else "Общее"
-        body = " ".join(lines[1:]).strip()
+        # без заголовка первая строка — это текст, а не заголовок: не терять
+        body = " ".join(lines[1:] if m else lines).strip()
         if len(body) > 50:
             chunks_out.append({"text": body, "heading": heading, "section": "Общее"})
     return chunks_out
@@ -93,9 +94,12 @@ def parse_pptx(path: str, file_name: str) -> list[dict]:
     prs = Presentation(path)
     out = []
     for n, slide in enumerate(prs.slides, 1):
-        texts = [sh.text_frame.text.strip() for sh in slide.shapes
-                 if sh.has_text_frame and sh.text_frame.text.strip()]
-        body = re.sub(r"\s+", " ", " ".join(texts)).strip()
+        # Текст — итерацией a:t по XML слайда (как в parse_pptx_lean):
+        # shape.text_frame не видит таблицы и сгруппированные фигуры,
+        # и мелкие презентации теряли текст, который тяжёлые сохраняли.
+        body = re.sub(r"\s+", " ", " ".join(
+            t.text for t in slide.element.iter(f"{_NS_A}t")
+            if t.text)).strip()
         if len(body) < 30:  # пустые/мусорные слайды
             continue
         title = ""
@@ -194,6 +198,9 @@ def parse_pdf(path: str, file_name: str) -> list[dict]:
     for n, page in enumerate(reader.pages, 1):
         body = re.sub(r"\s+", " ", (page.extract_text() or "")).strip()
         if len(body) < 30:
+            if body:  # короткая, но осмысленная страница — не молчать о потере
+                print(f"[doc_parsers] {file_name}: стр. {n} пропущена "
+                      f"(текст {len(body)} симв. < 30)")
             continue
         out.append({"text": body, "heading": f"Стр. {n}", "section": file_name})
     return out

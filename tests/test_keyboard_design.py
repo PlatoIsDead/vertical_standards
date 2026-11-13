@@ -74,7 +74,7 @@ ALLOWED_PAYLOADS = [
     r"^(Готов|Мои курсы|Роль|Пересдать|Далее|Начать|Отмена|Сохранить|Заново|\.)$",
     r"^(Документы|Выйти|Продолжить|Помощь|Меню)$",   # 19.08–26.08: навигация
     r"^По шагам$",                      # 02.09: пошаговая правка вопроса
-    r"^[A-D]$",
+    r"^answer:\d+:\d+:(basic|exam):\d+:[A-D]$",
     r"^\d{1,2}$",                       # выбор роли
     r"^Выбрать \d+$",
     r"^Тест \d+$",                     # 18.09: выбор теста по course_id
@@ -162,7 +162,7 @@ def test_role_select_layouts():
 def test_test_options_block_vs_letters():
     block = _buttons(SAMPLES["test_block"])
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in block][0] == \
-        ("A · До заезда гостя", "A")
+        ("A · До заезда гостя", "answer:0:0:exam:0:A")
     answers = [b for b in block
                if b["COMMAND_PARAMS"] not in ("Выйти", "Помощь")]
     assert all(b["DISPLAY"] == "BLOCK" for b in answers)
@@ -173,7 +173,7 @@ def test_test_options_block_vs_letters():
                           test_options=["х" * 30, "а", "б", "в"])
     letters = [b for b in _buttons(long)
                if b["COMMAND_PARAMS"] not in ("Выйти", "Помощь")]
-    assert [b["COMMAND_PARAMS"] for b in letters] == ["A", "B", "C", "D"]
+    assert [b["COMMAND_PARAMS"] for b in letters] == [f"answer:0:0:exam:0:{x}" for x in "ABCD"]
     assert all(b["DISPLAY"] == "LINE" and b["WIDTH"] == 70 for b in letters)
 
 

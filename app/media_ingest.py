@@ -10,7 +10,7 @@ app/media_ingest.py — визуальный контент docx в текст �
    транскрибировать аннотации и задаваемый ими ПОРЯДОК ДЕЙСТВИЙ.
 
 Кэш описаний по sha256 байтов (data/vision_cache.json): реингест и копии
-не платят повторно. Смена промпта = ручной сброс кэша (см.
+не платят повторно. Ключ включает версию распознавания и локальный контекст (см.
 PRPs/vision-ingest-sprints.md).
 """
 import base64
@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import posixpath
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -30,6 +31,7 @@ load_dotenv()
 
 CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "data",
                           "vision_cache.json")
+VISION_CACHE_VERSION = "source-context-v2"
 MAX_IMAGE_BYTES = 3_000_000
 _IMG_RE = re.compile(r"word/media/[^/]+\.(png|jpe?g)$", re.IGNORECASE)
 _DGM_RE = re.compile(r"word/diagrams/data\d+\.xml$")
@@ -54,7 +56,9 @@ DESCRIBE_PROMPT = """Ты расшифровываешь изображение 
 4) ПОРЯДОК ДЕЙСТВИЙ: что аннотации предписывают сделать — нумерованные шаги.
 
 Не пропускай элементы: если текст не читается — пиши «неразборчиво».
-НИЧЕГО не выдумывай и не додумывай. Язык: русский."""
+Контекст документа помогает найти подпись, но не доказывает содержимое картинки.
+Не переноси детали других изображений. Если шаг или направление не видны,
+пиши «не установлено». НИЧЕГО не выдумывай и не додумывай. Язык: русский."""
 
 SMARTART_PROMPT = """Ниже — структура схемы-алгоритма из стандарта «{ctx}»: отступы «— » = вложенность,
 порядок строк = порядок шагов (восстановлен из стрелок схемы). Перепиши её связным
@@ -63,6 +67,11 @@ SMARTART_PROMPT = """Ниже — структура схемы-алгоритм
 
 
 # ── Кэш ──────────────────────────────────────────────────────────────────────
+
+def vision_cache_key(data: bytes, context: str, kind: str) -> str:
+    payload = VISION_CACHE_VERSION.encode() + kind.encode() + context.encode() + b"\0" + data
+    return VISION_CACHE_VERSION + ":" + hashlib.sha256(payload).hexdigest()
+
 
 def _load_cache() -> dict:
     try:
@@ -88,11 +97,15 @@ def smartart_outline(xml_bytes: bytes) -> str:
     root = ET.fromstring(xml_bytes)
     texts: dict[str, str] = {}
     node_ids: set[str] = set()
+    doc_order: list[str] = []  # порядок pt в ptLst — детерминированный обход
     for pt in root.findall(".//dgm:ptLst/dgm:pt", _NS):
         mid = pt.get("modelId")
         if pt.get("type") not in (None, "doc", "asst"):
             continue  # pres/parTrans/sibTrans — не содержание
+        if mid in node_ids:
+            continue  # дубликат modelId в битых файлах — берём первый
         node_ids.add(mid)
+        doc_order.append(mid)
         t = " ".join(x.text.strip() for x in pt.findall(".//a:t", _NS)
                      if x.text and x.text.strip())
         if t:
@@ -106,13 +119,21 @@ def smartart_outline(xml_bytes: bytes) -> str:
         src, dest = cxn.get("srcId"), cxn.get("destId")
         if src not in node_ids or dest not in node_ids:
             continue
-        children.setdefault(src, []).append(
-            (int(cxn.get("srcOrd", "0")), dest))
+        try:
+            order = int(cxn.get("srcOrd", "0"))
+        except ValueError:
+            order = 0  # битый srcOrd: stable sort сохранит порядок cxnLst
+        children.setdefault(src, []).append((order, dest))
         has_parent.add(dest)
 
     lines: list[str] = []
+    visited: set[str] = set()  # цикл/несколько родителей в битой схеме —
+    # без защиты walk уходил в RecursionError и схема терялась целиком
 
     def walk(mid: str, depth: int) -> None:
+        if mid in visited:
+            return
+        visited.add(mid)
         has_text = mid in texts
         if has_text:
             lines.append("— " * depth + texts[mid])
@@ -120,9 +141,12 @@ def smartart_outline(xml_bytes: bytes) -> str:
                                     key=lambda x: x[0]):
             walk(child, depth + (1 if has_text else 0))
 
-    roots = [m for m in node_ids if m not in has_parent]
-    for r in roots:
-        walk(r, 0)
+    # Корней может быть несколько (битый/чужой файл): порядок множества
+    # node_ids зависит от PYTHONHASHSEED — обходим в порядке документа.
+    # Это НЕ «истинный порядок шагов»: parOf — иерархия, а не стрелки.
+    for r in doc_order:
+        if r not in has_parent:
+            walk(r, 0)
     return "\n".join(lines)
 
 
@@ -158,7 +182,7 @@ def smartart_to_text(xml_bytes: bytes, doc_context: str) -> str:
     if not outline.strip():
         return ""
     cache = _load_cache()
-    key = hashlib.sha256(xml_bytes).hexdigest()
+    key = vision_cache_key(xml_bytes, doc_context, "smartart")
     if key in cache:
         return cache[key]
     try:
@@ -170,13 +194,13 @@ def smartart_to_text(xml_bytes: bytes, doc_context: str) -> str:
         return outline
     cache[key] = text
     _save_cache(cache)
-    return text
+    return outline + "\n\nОписание: " + text
 
 
 def describe_image(image_bytes: bytes, doc_context: str) -> str:
     """Скриншот → текст-фрагмент инструкции (vision, кэш по sha256)."""
     cache = _load_cache()
-    key = hashlib.sha256(image_bytes).hexdigest()
+    key = vision_cache_key(image_bytes, doc_context, "image")
     if key in cache:
         return cache[key]
     b64 = base64.b64encode(image_bytes).decode()
@@ -226,6 +250,34 @@ def extract_media(path: str) -> tuple[list[bytes], list[bytes]]:
     return diagrams, images
 
 
+def media_occurrences(path: str) -> list[dict]:
+    """Document order and nearby paragraphs, resolved through OOXML relationships."""
+    with zipfile.ZipFile(path) as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+        rels = ET.fromstring(archive.read("word/_rels/document.xml.rels"))
+        targets = {r.get("Id"): posixpath.normpath(posixpath.join("word", r.get("Target", "")))
+                   for r in rels if r.get("TargetMode") != "External"}
+        paragraphs = list(root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"))
+        texts = [" ".join(t.text or "" for t in p.iter()
+                          if t.tag.endswith("}t")) for p in paragraphs]
+        result = []
+        for position, paragraph in enumerate(paragraphs):
+            for node in paragraph.iter():
+                for attr, rid in node.attrib.items():
+                    if not attr.endswith(("}embed", "}dm")) or rid not in targets:
+                        continue
+                    target = targets[rid]
+                    if not (_IMG_RE.match(target) or _DGM_RE.match(target)):
+                        continue
+                    data = archive.read(target)
+                    if len(data) > MAX_IMAGE_BYTES:
+                        continue
+                    result.append({"data": data, "kind": "image" if _IMG_RE.match(target) else "smartart",
+                                   "part": target, "position": position,
+                                   "nearby_text": "\n".join(texts[max(0, position-1):position+2])})
+        return result
+
+
 def docx_media_chunks(path: str, file_name: str) -> list[dict]:
     """Медиа-чанки docx для parse_file. Сбой на элементе — лог и дальше
     (частичный результат лучше пустого); системный сбой → []."""
@@ -236,26 +288,35 @@ def docx_media_chunks(path: str, file_name: str) -> list[dict]:
         return []
     ctx = display_name(file_name)
     chunks: list[dict] = []
-    for d in diagrams:
+    try:
+        occurrences = media_occurrences(path)
+    except (KeyError, OSError, ET.ParseError, zipfile.BadZipFile):
+        occurrences = []
+    # Compatibility for older packages with no document relationships.
+    if not occurrences:
+        occurrences = [{"data": d, "kind": kind, "part": f"{kind}/{i}",
+                        "position": None, "nearby_text": ""}
+                       for kind, values in (("smartart", diagrams), ("image", images))
+                       for i, d in enumerate(values, 1)]
+    image_number = 0
+    for item in occurrences:
+        kind = item["kind"]
+        if kind == "image":
+            image_number += 1
+        label = f"Скриншот {image_number}" if kind == "image" else "Схема"
+        source_id = hashlib.sha256((file_name + ":" + item["part"] + ":" +
+                                    str(item["position"])).encode() + item["data"]).hexdigest()[:24]
+        context = ctx + ("\nБлижайший текст: " + item["nearby_text"] if item["nearby_text"] else "")
         try:
-            text = smartart_to_text(d, ctx)
+            text = (describe_image if kind == "image" else smartart_to_text)(item["data"], context)
         except Exception as exc:
-            print(f"[media] {file_name}: schema failed {exc!r}")
+            print(f"[media] {file_name}: {source_id} failed {exc!r}")
             continue
         if text.strip():
-            chunks.append({"text": "[Схема] " + text,
-                           "heading": f"Схема: {ctx}",
-                           "section": file_name})
-    for i, img in enumerate(images, 1):
-        try:
-            text = describe_image(img, ctx)
-        except Exception as exc:
-            print(f"[media] {file_name}: image {i} failed {exc!r}")
-            continue
-        if text.strip():
-            chunks.append({"text": f"[Скриншот {i}] " + text,
-                           "heading": f"Скриншот {i}: {ctx}",
-                           "section": file_name})
+            chunks.append({"text": f"[{label}] " + text,
+                           "heading": f"{label}: {ctx}", "section": file_name,
+                           "source_id": source_id, "media_part": item["part"],
+                           "position": item["position"], "nearby_text": item["nearby_text"]})
     if chunks:
         print(f"[media] {file_name}: +{len(chunks)} медиа-чанков")
     return chunks

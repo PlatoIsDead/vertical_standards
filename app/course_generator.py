@@ -18,6 +18,8 @@ import re
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from app import quiz
+
 load_dotenv()
 
 MAX_CONTEXT_CHARS = 120_000  # весь документ; кап — защита от гигантов
@@ -52,6 +54,8 @@ FACTS_PROMPT = """Ты методист учебных курсов для со�
 
 QUESTIONS_FROM_FACTS_PROMPT = """Ты составляешь тест для сотрудников апарт-отелей «Вертикаль».
 Для КАЖДОГО переданного положения составь один вопрос с 4 вариантами ответа.
+Это ОДИН тест: basic_questions и exam_questions — группы сложности для хранения,
+а не отдельные этапы. Не повторяй вопросы или проверяемые положения между группами.
 Ответь строго в JSON формате:
 {
   "basic_questions": [
@@ -223,6 +227,7 @@ def generate_questions(doc_name: str, chunks: list[dict]) -> dict:
 
     _run_critic(client, doc_name, context, facts, result)
 
+    result["quiz_version"] = 2
     result["doc_name"] = doc_name
     result["course_summary"] = facts.get("course_summary", "")
     result["facts_basic"] = facts["facts_basic"]
@@ -329,6 +334,8 @@ def validate_question(q: dict) -> None:
         raise ValueError(f"У вопроса нет полей {missing}")
     if not str(q["text"]).strip():
         raise ValueError("Пустой текст вопроса")
+    if not isinstance(q["options"], list):
+        raise ValueError("Варианты ответа должны быть списком")
     if len(q["options"]) != 4:
         raise ValueError(f"Нужно 4 варианта ответа, получено {len(q['options'])}")
     bodies = []
@@ -339,6 +346,8 @@ def validate_question(q: dict) -> None:
         bodies.append(body.casefold())
     if len(set(bodies)) != 4:
         raise ValueError("Варианты ответа повторяются")
+    if not quiz.question_view(None, q, "exam", 0).valid:
+        raise ValueError("Некорректные буквы, варианты или правильный ответ")
     if q["correct"] not in ("A", "B", "C", "D"):
         raise ValueError(f"Правильный ответ должен быть A/B/C/D, "
                          f"получено {q['correct']!r}")
@@ -357,6 +366,8 @@ def _validate_questions(result: dict, n_basic: int = 5,
 
     for q in basic + exam:
         validate_question(q)
+    if len(quiz.all_questions(result)) != len(basic) + len(exam):
+        raise ValueError("Вопросы теста повторяются")
 
 
 def _validate_verdicts(result: dict) -> None:

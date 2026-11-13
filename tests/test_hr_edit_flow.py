@@ -210,7 +210,7 @@ def test_edit_bad_refs(env):
 def test_history_by_email(env):
     client, sent, course_id = env
     db.add_employee("500", "ivan@x.ru", "Иван Иванов", "9")
-    session = db.create_session("500", "u500", course_id)
+    session = db.create_session("500", "u500", course_id, quiz_version=1)
     db.log_answer(session["id"], 0, "basic", "A", 1)
     db.log_answer(session["id"], 1, "exam", "C", 0)
 
@@ -236,9 +236,9 @@ def test_history_by_uid_without_sessions(env):
 def test_report(env):
     client, sent, course_id = env
     db.add_employee("500", "ivan@x.ru", "Иван Иванов", "9")
-    s1 = db.create_session("500", "u500", course_id)
+    s1 = db.create_session("500", "u500", course_id, quiz_version=1)
     db.update_session(s1["id"], state="DONE", score_basic=4, score_exam=8)
-    s2 = db.create_session("600", "u600", course_id)
+    s2 = db.create_session("600", "u600", course_id, quiz_version=1)
     db.update_session(s2["id"], state="WAITING_HR")
 
     reply = _post_and_reply(client, sent, "Отчёт")

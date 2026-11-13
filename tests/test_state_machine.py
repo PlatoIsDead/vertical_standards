@@ -3,6 +3,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("legacy_sessions")
+
 import app.db as db
 import app.roles as roles
 import app.state_machine as sm
@@ -588,7 +590,7 @@ def test_my_courses_honest_statuses(env, monkeypatch):
 
     menu, sel = sm.my_courses("u1", None)
     assert "✅ Правила — пройден" in menu
-    assert "❌ Стандарты — экзамен не сдан (0/2)" in menu
+    assert "❌ Стандарты — тест не сдан (0/2)" in menu
     assert "напиши *Пересдать*" in menu            # A = последний провал
     assert sel == []                               # завершённые не выбираемы
 

@@ -89,8 +89,8 @@ def test_pptx_lean_matches_regular_parser(tmp_path):
     assert lean[0]["heading"] == regular[0]["heading"] == "Заголовок слайда"
     assert lean[0]["text"] == regular[0]["text"]
     assert lean[0]["section"] == "презентация.pptx"
-    # Текст таблицы shape.text_frame не отдаёт — лёгкий парсер его видит
-    assert len(regular) == 1
+    # Оба пути читают XML: таблицы и группы не теряются и в малых файлах.
+    assert regular == lean
     assert len(lean) == 2
     assert "таблицы" in lean[1]["text"]
     assert lean[1]["heading"] == "Слайд 2"

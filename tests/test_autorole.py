@@ -84,7 +84,7 @@ def test_hr_assigned_role_gone_from_registry_ignored(env):
 def test_auto_role_beats_session_memory(env):
     """Перевод в другой отдел должен менять роль: отдел > память сессии."""
     std = db.get_course_by_doc_name("Стандарты.docx")["id"]
-    s = db.create_session("u1", "d1", std, state="DONE")
+    s = db.create_session("u1", "d1", std, state="DONE", quiz_version=1)
     db.update_session(s["id"], role="admin_reception")   # память: СПиР
     cid2 = db.save_draft_course("Правила.docx", "2",
                                 json.dumps(QUESTIONS, ensure_ascii=False))

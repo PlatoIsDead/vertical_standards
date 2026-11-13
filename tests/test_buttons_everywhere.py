@@ -302,7 +302,7 @@ def test_command_say_and_missing_name_route_to_employee(cmd_router):
         "data[PARAMS][DIALOG_ID]": "d2",
         "data[USER][ID]": "u2",
     })
-    assert calls == [("emp", "u1", "A", "d1"), ("emp", "u2", "B", "d2")]
+    assert calls == [("emp", "u1", "answer:legacy", "d1"), ("emp", "u2", "answer:legacy", "d2")]
 
 
 def test_command_dedup_by_source_message(monkeypatch):
@@ -683,7 +683,7 @@ def test_question_reply_keeps_test_keyboard(send_trap, monkeypatch):
     bot._recent_msgs.clear()
     _run_employee("A")
     btns = [b for b in send_trap[0]["keyboard"] if "TEXT" in b]
-    assert [b["COMMAND_PARAMS"] for b in btns][:4] == ["A", "B", "C", "D"]
+    assert [b["COMMAND_PARAMS"] for b in btns][:4] == [f"answer:0:0:basic:1:{x}" for x in "ABCD"]
 
 
 def test_exam_resume_and_pause_labels(send_trap, monkeypatch):

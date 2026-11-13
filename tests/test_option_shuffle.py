@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("legacy_sessions")
+
 import app.db as db
 import app.quiz as quiz
 import app.roles as roles

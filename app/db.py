@@ -35,6 +35,11 @@ def init_db() -> None:
     """Create tables if they don't exist. Safe to call multiple times."""
     with _conn() as conn:
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS course_events (
+                id INTEGER PRIMARY KEY, course_id INTEGER NOT NULL,
+                event TEXT NOT NULL, detail TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS courses (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 doc_name        TEXT NOT NULL,
@@ -123,12 +128,16 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, course_id, stage)
             );
         """)
+        _ensure_column(conn, "courses", "source_key", "TEXT")
         _ensure_column(conn, "sessions", "role", "TEXT")
         # 02.09: номер попытки — сид пер-сессионного порядка вариантов A–D.
         # Пересдача переиспользует ТУ ЖЕ строку сессии: без счётчика порядок
         # повторился бы, и пересдача сдавалась бы по буквам, записанным в
         # прошлый заход («Правильный ответ: B» показывается после провала).
         _ensure_column(conn, "sessions", "attempt", "INTEGER DEFAULT 0")
+        # Existing rows retain legacy question indices and historical scoring.
+        _ensure_column(conn, "sessions", "quiz_version", "INTEGER DEFAULT 1")
+        _ensure_column(conn, "sessions", "quiz_questions_json", "TEXT")
         # №4: архив курса при удалении файла; детект новой версии при том же file_id
         _ensure_column(conn, "courses", "archived_at", "TEXT")
         _ensure_column(conn, "processed_files", "update_time", "TEXT")
@@ -215,6 +224,8 @@ def save_draft_course(doc_name: str, doc_id: str, questions_json: str,
                VALUES (?, ?, ?, ?, ?)""",
             (doc_name, doc_id, doc_detail_url, questions_json, now),
         )
+        conn.execute("INSERT INTO course_events(course_id,event) VALUES(?,?)",
+                     (cur.lastrowid, "version_created"))
         return cur.lastrowid
 
 
@@ -235,13 +246,8 @@ def update_course_doc_id(course_id: int, doc_id: str, doc_detail_url: str = None
 
 def activate_course(doc_id: str, hr_user_id: str) -> bool:
     """Mark course as approved by Bitrix file ID. Returns True if found."""
-    now = datetime.utcnow().isoformat()
-    with _conn() as conn:
-        result = conn.execute(
-            "UPDATE courses SET approved_at = ?, approved_by = ? WHERE doc_id = ?",
-            (now, hr_user_id, doc_id),
-        )
-        return result.rowcount > 0
+    course = get_course_by_doc_id(doc_id)
+    return activate_course_by_id(course["id"], hr_user_id) if course else False
 
 
 def activate_course_by_id(course_id: int, hr_user_id: str) -> bool:
@@ -249,9 +255,21 @@ def activate_course_by_id(course_id: int, hr_user_id: str) -> bool:
     now = datetime.utcnow().isoformat()
     with _conn() as conn:
         result = conn.execute(
-            "UPDATE courses SET approved_at = ?, approved_by = ? WHERE id = ?",
+            "UPDATE courses SET approved_at = ?, approved_by = ? "
+            "WHERE id = ? AND approved_at IS NULL AND archived_at IS NULL",
             (now, hr_user_id, course_id),
         )
+        if result.rowcount:
+            conn.execute(
+                "UPDATE courses SET archived_at = ? WHERE id != ? AND id IN "
+                "(SELECT old.id FROM courses old JOIN courses new ON "
+                "old.source_key = new.source_key WHERE new.id = ? "
+                "AND new.source_key IS NOT NULL AND old.approved_at IS NOT NULL)",
+                (now, course_id, course_id),
+            )
+            for event in ("approved", "announcement_queued"):
+                conn.execute("INSERT INTO course_events(course_id,event,detail) VALUES(?,?,?)",
+                             (course_id, event, hr_user_id))
         return result.rowcount > 0
 
 
@@ -398,19 +416,31 @@ def get_session_by_id(session_id: int) -> dict | None:
 
 
 def create_session(user_id: str, dialog_id: str, course_id: int,
-                   state: str = "READING") -> dict:
+                   state: str = "READING", quiz_version: int = 2,
+                   quiz_questions_json: str | None = None, attempt: int = 0) -> dict:
     """Create a new session (READING, либо ROLE_SELECT до выбора роли)."""
     now = datetime.utcnow().isoformat()
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO sessions
                (user_id, dialog_id, course_id, state, current_q_idx,
-                score_basic, score_exam, started_at, updated_at)
-               VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?)""",
-            (user_id, dialog_id, course_id, state, now, now),
+                score_basic, score_exam, started_at, updated_at,
+                quiz_version, quiz_questions_json, attempt)
+               VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?)""",
+            (user_id, dialog_id, course_id, state, now, now,
+             quiz_version, quiz_questions_json, attempt),
         )
         session_id = cur.lastrowid
     # with block has committed — safe to query in new connection
+    return get_session_by_id(session_id)
+
+
+def pin_session_questions(session_id: int, questions: dict) -> dict:
+    """Pin a question version once, before the first displayed question."""
+    with _conn() as conn:
+        conn.execute("UPDATE sessions SET quiz_questions_json = ? "
+                     "WHERE id = ? AND quiz_questions_json IS NULL",
+                     (json.dumps(questions, ensure_ascii=False), session_id))
     return get_session_by_id(session_id)
 
 
@@ -427,6 +457,7 @@ def update_session(session_id: int, state: str = None, q_idx: int = None,
         parts.append("role = ?"); vals.append(role)
     if course_id is not None:
         parts.append("course_id = ?"); vals.append(course_id)
+        parts.append("quiz_questions_json = NULL")
     if score_basic is not None:
         parts.append("score_basic = ?"); vals.append(score_basic)
     if score_exam is not None:
@@ -847,3 +878,14 @@ def get_session_answers(session_id: int, phase: str = None) -> list[dict]:
                 (session_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+def set_course_source(course_id: int, source_key: str) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE courses SET source_key=? WHERE id=?", (source_key, course_id))
+
+
+def log_course_event(course_id: int, event: str, detail: str = "") -> None:
+    with _conn() as conn:
+        conn.execute("INSERT INTO course_events(course_id,event,detail) VALUES(?,?,?)",
+                     (course_id, event, detail))

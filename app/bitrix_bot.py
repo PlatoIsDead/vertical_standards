@@ -33,7 +33,6 @@ from app.db import (
     get_meta,
     get_pending_courses,
     get_processed_by_folders,
-    get_processed_by_hash,
     get_processed_file,
     get_report_rows,
     get_session,
@@ -58,7 +57,6 @@ from app.db import (
     set_course_archived,
     set_meta,
     update_course_questions,
-    update_course_doc_id,
     update_session_by_user,
     update_user_departments,
 )
@@ -75,7 +73,6 @@ from app.hr_tools import (
     merge_replacement,
     phase_lens,
     parse_partial_replacement,
-    resolve_question_ref,
     parse_replacement,
     question_by_ref,
 )
@@ -723,9 +720,7 @@ async def _wizard_input(user_id: str, pending: dict,
                             if k in patch)
         # Эхо — вопрос ГЛАЗАМИ СОТРУДНИКА (фидбек юзера 02.09), чтобы HR видел
         # ровно то, что получит человек; правильный ответ подписан отдельно
-        phase, idx = resolve_question_ref(q_num, b, e)
-        total = b if phase == "basic" else e
-        preview = format_question(saved, idx, total, phase)
+        preview = format_question(saved, q_num - 1, b + e, "test")
         return (f"✅ Вопрос {q_num} сохранён (обновил: {changed}).\n\n"
                 "Так его увидит сотрудник:\n\n" + preview
                 + f"\n\n✅ Правильный: {correct_option(saved)}"
@@ -795,7 +790,32 @@ def _employee_role_name(uid: str) -> str:
     return role_name(role) if role else "не назначена"
 
 
-async def _finish_invite(uid: str, email: str, fio: str,
+_invite_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _finish_invite(uid, email, fio, work_position, hr_user_id, role_id=None):
+    async with _invite_locks.setdefault(uid, asyncio.Lock()):
+        if await asyncio.to_thread(is_employee_allowed, uid):
+            return f"ℹ️ {fio} — уже добавлен."
+        return await _finish_invite_unlocked(uid, email, fio, work_position, hr_user_id, role_id)
+
+
+async def _candidate_input(user_id, pending, raw):
+    found = pending["found"]
+    token, users = found["ambiguous"][0]
+    if not raw.strip().isdigit() or not 0 <= int(raw.strip()) <= len(users):
+        return "Ответь номером кандидата или 0 — пропустить.", None
+    choice = int(raw.strip())
+    found["ambiguous"].pop(0)
+    if choice:
+        found["targets"].append(users[choice - 1])
+    else:
+        found.setdefault("notes", []).append(f"«{token}» — пропущен.")
+    _pending_edits.pop(user_id, None)
+    return await _invite_resolved(user_id, found)
+
+
+async def _finish_invite_unlocked(uid: str, email: str, fio: str,
                          work_position: str | None, hr_user_id: str,
                          role_id: str | None = None) -> str:
     """Завершение «Пригласить»: whitelist + автостарт обучения.
@@ -903,13 +923,20 @@ async def _finish_invite_batch(pending: dict, role_id: str | None,
     остальных: успешные вычёркиваются из pending и их строки копятся —
     повтор цифры доделывает только оставшихся."""
     done_lines = pending.setdefault("done_lines", [])
+    errors = []
     for target in list(pending["targets"]):
-        line = await _finish_invite(target["uid"], target["email"],
-                                    target["fio"], target["work_position"],
-                                    hr_user_id, role_id)
+        try:
+            line = await _finish_invite(target["uid"], target["email"],
+                                        target["fio"], target["work_position"],
+                                        hr_user_id, role_id)
+        except Exception as exc:
+            errors.append(f"⚠️ {target['fio']} — ошибка: {exc}")
+            continue
         done_lines.append(line)
         pending["targets"].remove(target)
     lines = done_lines + pending.get("note_lines", [])
+    if errors:
+        raise RuntimeError("\n".join(lines + errors))
     return "\n".join(lines)
 
 
@@ -941,7 +968,9 @@ def _user_fio(user: dict) -> str:
 
 def _user_label(user: dict) -> str:
     position = (user.get("WORK_POSITION") or "").strip()
-    return _user_fio(user) + (f" ({position})" if position else "")
+    department = user.get("DEPARTMENT_NAME") or user.get("UF_DEPARTMENT") or "—"
+    return (f"{_user_fio(user)} · {user.get('EMAIL') or '—'} · "
+            f"{position or '—'} · отдел {department} · ID {user.get('ID')}")
 
 
 def _is_service_account(user: dict) -> bool:
@@ -966,15 +995,25 @@ async def _bitrix_users_by_name(name: str) -> list[dict]:
     «Саркис» → Саркисов, Саркисьян, Саркисян). Страховка на нашей стороне:
     подстрока должна входить в имя или фамилию (NAME_SEARCH ищет и по
     другим полям)."""
-    needle = name.casefold()
+    words = name.casefold().split()
+    result = []
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(BITRIX_WEBHOOK_URL + "user.get",
-                              json={"FILTER": {"NAME_SEARCH": name},
-                                    "ACTIVE": True})
-        r.raise_for_status()
-        result = r.json().get("result") or []
-    return [u for u in result
-            if needle in f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".casefold()]
+        start = 0
+        visited = set()
+        while start not in visited:
+            visited.add(start)
+            r = await client.post(BITRIX_WEBHOOK_URL + "user.get",
+                                  json={"FILTER": {"ACTIVE": True}, "start": start})
+            r.raise_for_status()
+            body = r.json()
+            if body.get("error"):
+                raise RuntimeError(body["error"])
+            result.extend(body.get("result") or [])
+            if body.get("next") is None:
+                break
+            start = body["next"]
+    return [u for u in result if u.get("ACTIVE", True) not in (False, "N", "false", 0)
+            and all(w in " ".join(_user_fio(u).casefold().split()) for w in words)]
 
 
 async def _bitrix_departments() -> list[dict] | None:
@@ -1031,41 +1070,44 @@ async def _resolve_invite_tokens(tokens: list[str]) -> dict:
         return True
 
     for token in tokens:
-        low = token.casefold()
-        if low.startswith("отдел"):
-            query = token[5:].strip(" :–-")
-            if _INVITE_ID_RE.match(query):          # «отдел 2439» = подтверждено
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    users = await _department_users(client, query)
-                for u in users:
-                    # тот же отбор, что в превью: служебные и уже допущенные
-                    # (в whitelist) в приглашение отдела не идут
-                    if _is_service_account(u) or await asyncio.to_thread(
-                            is_employee_allowed, str(u.get("ID"))):
-                        continue
-                    _add(u)
+        try:
+            low = token.casefold()
+            if low.startswith("отдел"):
+                query = token[5:].strip(" :–-")
+                if _INVITE_ID_RE.match(query):          # «отдел 2439» = подтверждено
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        users = await _department_users(client, query)
+                    for u in users:
+                        # тот же отбор, что в превью: служебные и уже допущенные
+                        # (в whitelist) в приглашение отдела не идут
+                        if _is_service_account(u) or await asyncio.to_thread(
+                                is_employee_allowed, str(u.get("ID"))):
+                            continue
+                        _add(u)
+                    continue
+                if not await _dept_by_name(query):
+                    out["missing"].append(token)
                 continue
-            if not await _dept_by_name(query):
+            email = _extract_email(token)
+            if email:
+                user = await _bitrix_user_by_email(email)
+                (_add(user) if user else out["missing"].append(token))
+                continue
+            if _INVITE_ID_RE.match(token):
+                user = await _bitrix_user_by_id(token)
+                (_add(user) if user else out["missing"].append(token))
+                continue
+            users = await _bitrix_users_by_name(token)
+            if len(users) == 1:
+                _add(users[0])
+            elif users:
+                out["ambiguous"].append((token, users))
+            elif not await _dept_by_name(token):
+                # 18.09: HR копирует название отдела из Битрикса без слова
+                # «отдел» — не по фамилии, так по отделу
                 out["missing"].append(token)
-            continue
-        email = _extract_email(token)
-        if email:
-            user = await _bitrix_user_by_email(email)
-            (_add(user) if user else out["missing"].append(token))
-            continue
-        if _INVITE_ID_RE.match(token):
-            user = await _bitrix_user_by_id(token)
-            (_add(user) if user else out["missing"].append(token))
-            continue
-        users = await _bitrix_users_by_name(token)
-        if len(users) == 1:
-            _add(users[0])
-        elif users:
-            out["ambiguous"].append((token, users))
-        elif not await _dept_by_name(token):
-            # 18.09: HR копирует название отдела из Битрикса без слова
-            # «отдел» — не по фамилии, так по отделу
-            out["missing"].append(token)
+        except Exception as exc:
+            out.setdefault("errors", []).append((token, str(exc)))
     return out
 
 
@@ -1078,6 +1120,8 @@ async def _invite_resolved(hr_user_id: str, found: dict) -> tuple[str, list | No
         notes.append("⚠️ По фамилии никого не нашёл, а поиск по отделам "
                      "недоступен: у вебхука бота нет права «department» — "
                      "добавь его в настройках вебхука на портале.")
+    notes.extend(found.get("notes", []))
+    notes.extend(f"⚠️ «{token}» — ошибка: {error}" for token, error in found.get("errors", []))
     for token in found["missing"]:
         notes.append(f"⚠️ «{token}» — не найден в Битриксе.")
     preview = found["dept_preview"]
@@ -1098,21 +1142,27 @@ async def _invite_resolved(hr_user_id: str, found: dict) -> tuple[str, list | No
             kb = keyboards.hr_invite_department(str(dep["ID"]), len(new_users))
         return "\n".join(lines + notes), kb
     if found["ambiguous"]:
-        lines, items = [], []
-        for token, users in found["ambiguous"]:
-            lines.append(f"🔎 По «{token}» несколько сотрудников — выбери:")
-            lines += [f"• {_user_label(u)} · Пригласить {u.get('ID')}"
-                      for u in users[:8]]
-            items += [(str(u.get("ID")), _user_label(u)) for u in users[:8]]
-        return "\n".join(lines + notes), keyboards.hr_candidates(items)
+        token, users = found["ambiguous"][0]
+        _pending_edits[hr_user_id] = {
+            "kind": "invite_candidates", "found": found,
+            "expires": time.monotonic() + PENDING_EDIT_TTL,
+        }
+        lines = [f"🔎 По «{token}» несколько сотрудников — выбери номер:"]
+        lines.extend(f"{i}. {_user_label(u)}" for i, u in enumerate(users, 1))
+        lines.append("0 — пропустить этот элемент")
+        return "\n".join(lines + notes), None
 
     targets, already = [], []
+    seen = set()
     for u in found["targets"]:
         uid = str(u.get("ID"))
+        if uid in seen:
+            continue
+        seen.add(uid)
         fio = _user_fio(u)
         email = (u.get("EMAIL") or "").strip().lower()
         position = (u.get("WORK_POSITION") or "").strip() or None
-        if await asyncio.to_thread(get_session, uid):
+        if await asyncio.to_thread(is_employee_allowed, uid):
             # Повторное приглашение освежает email/ФИО; роль НЕ трогаем —
             # для смены есть «Роль {email}»
             await asyncio.to_thread(add_employee, uid, email, fio,
@@ -1381,11 +1431,14 @@ async def _test_options(session: dict | None) -> list | None:
     questions = await asyncio.to_thread(get_course_questions,
                                         session["course_id"])
     phase = quiz.phase_of(session["state"])
-    q_list = questions.get(f"{phase}_questions", [])
+    q_list = quiz.phase_questions(session, questions, phase)
     idx = session.get("current_q_idx", 0)
     if not (0 <= idx < len(q_list)):
         return None
-    return quiz.question_view(session, q_list[idx], phase, idx).bodies
+    view = quiz.question_view(session, q_list[idx], phase, idx)
+    if not view.valid:
+        return None
+    return view.bodies or [o.partition(". ")[2] for o in view.options]
 
 
 async def _session_keyboard(user_id: str) -> list | None:
@@ -1410,7 +1463,7 @@ async def _reminder_keyboard(uid: str) -> list | None:
     session = await asyncio.to_thread(get_session, uid)
     if session and session["state"] in quiz.QUIZ_STATES:
         label = ("▶ Продолжить экзамен"
-                 if quiz.phase_of(session["state"]) == "exam"
+                 if quiz.phase_of(session["state"]) == "exam" and not quiz.unified(session)
                  else "▶ Продолжить тест")
         return keyboards.start_button(label, "Продолжить")
     return await _session_keyboard(uid)
@@ -1483,7 +1536,7 @@ async def _handle_employee_message(user_id: str, question: str,
                  for c in selectable],
                 reading=bool(after and after["state"] == "READING"),
                 resume_test=in_quiz, retake=retake,
-                resume_exam=bool(after and quiz.phase_of(after["state"]) == "exam"),
+                resume_exam=bool(after and quiz.phase_of(after["state"]) == "exam" and not quiz.unified(after)),
                 show_courses_button=non_question and not is_menu)
             if menu_kb:
                 keyboard = menu_kb
@@ -1569,6 +1622,8 @@ async def command_handler(request: Request):
         await _handle_hr_message(user_id, params, dialog_id, client_id,
                                  dedup_key=dedup_key)
     else:
+        if params.upper().strip(". )") in quiz.LETTERS:
+            params = "answer:legacy"
         await _handle_employee_message(user_id, params, dialog_id, client_id,
                                        dedup_key=dedup_key)
     return {"status": "ok"}
@@ -1622,8 +1677,15 @@ async def _broadcast_course(course: dict, recipients: list) -> None:
                                       role="secondary")
                if BUTTONS_ENABLED else None)
     for uid, busy in recipients:
-        await _send(f"u{uid}", busy_text if busy else free_text, BOT_ID,
-                    **_kb_kwargs(busy_kb if busy else free_kb))
+        from app.db import log_course_event
+        try:
+            result = await _send(f"u{uid}", busy_text if busy else free_text, BOT_ID,
+                                **_kb_kwargs(busy_kb if busy else free_kb))
+            await asyncio.to_thread(log_course_event, course["id"],
+                                    "announcement_result", f"{uid}: {result!r}")
+        except Exception as exc:
+            await asyncio.to_thread(log_course_event, course["id"],
+                                    "announcement_error", f"{uid}: {exc!r}")
 
 
 def _standard_recipients(doc_roles: list[str]) -> list[str]:
@@ -1730,7 +1792,8 @@ async def _handle_hr_message(user_id: str, question: str,
                                       HR_BOT_ID, client_id))
             return
         if not _is_pending_escape(msg_lower):
-            handler = _role_pick_input if role_pick else _wizard_input
+            handler = (_candidate_input if pending.get("kind") == "invite_candidates"
+                       else _role_pick_input if role_pick else _wizard_input)
             text, kb = await handler(user_id, pending, question)
             asyncio.create_task(_send(
                 dialog_id, text, HR_BOT_ID, client_id,
@@ -1793,7 +1856,7 @@ async def _handle_hr_message(user_id: str, question: str,
                                "Подходящих сотрудников для уведомления нет.")
                         )
                     else:
-                        text = f"❌ Не удалось активировать курс №{course_id}."
+                        text = f"ℹ️ Курс №{course_id} уже подтверждён или недоступен."
             except ValueError:
                 text = "❌ Укажи числовой номер курса: Подтвердить {N}"
 
@@ -1802,7 +1865,8 @@ async def _handle_hr_message(user_id: str, question: str,
         if not arg:
             text, kb = _await_arg(
                 user_id, "пригласить",
-                "✉️ Напиши email, ID или фамилию сотрудника — можно "
+                "✉️ Например: Иван Иванов, Софья Степанова, user@example.com. "
+                "Напиши email, ID или ФИО сотрудника — можно "
                 "несколько (через запятую или с новой строки) или "
                 "«отдел {название}».")
         else:
@@ -1898,10 +1962,9 @@ async def _handle_hr_message(user_id: str, question: str,
                 # (та же, что в команде «Изменить»); длины адаптивные (31.08)
                 b, e = len(basic), len(exam)
                 lines = [f"📋 *{course['doc_name']}*\n"]
-                lines.append(f"*Базовые вопросы (1–{b}):*")
+                lines.append(f"*Тест — вопросы 1–{b + e}:*")
                 for i, q in enumerate(basic, 1):
                     lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
-                lines.append(f"\n*Экзаменационные вопросы ({b + 1}–{b + e}):*")
                 for i, q in enumerate(exam, b + 1):
                     lines.append(f"{i}. {q['text']}\n   → {correct_option(q)}")
                 lines.append(f"\nДля активации: Подтвердить {course_id}")
@@ -2501,6 +2564,7 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
         folder_key = str(folder_id or "")
         normalised = [
             {
+                **c,
                 "text": c.get("text", ""),
                 "heading": c.get("heading", file_name),
                 "section": c.get("section", file_name),
@@ -2511,90 +2575,6 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
             }
             for c in new_chunks
         ]
-        # Замена версии: то же имя в ТОЙ ЖЕ папке → старые чанки долой.
-        # (То же имя в ДРУГОЙ папке — копия для другой роли, оба набора живут.)
-        is_replacement = await asyncio.to_thread(
-            index_store.has_document, file_name, folder_key
-        )
-        removed = 0
-        if is_replacement:
-            removed = await asyncio.to_thread(
-                index_store.remove_document, file_name, folder_key
-            )
-            print(f"[process_new_document] replacing old version: -{removed} chunks")
-        total = await asyncio.to_thread(index_store.append_document, normalised, new_emb)
-
-        chunks, embeddings = load_index()
-        print(f"[process_new_document] RAG reloaded — {total} chunks total")
-
-        # Замена «удалил+залил» (новый file_id): подчистить строку старого file_id
-        # этого документа в этой папке, чтобы синк удалений не сработал по нему.
-        if is_replacement and folder_key:
-            for old in await asyncio.to_thread(get_processed_by_folders, [folder_key]):
-                if old["doc_name"] == file_name and str(old["file_id"]) != str(file_id):
-                    await asyncio.to_thread(remove_processed_file, str(old["file_id"]))
-
-        # 6.5. Уже есть АКТИВНЫЙ (не в архиве) курс с этим doc_name: копия из
-        # другой папки ИЛИ замена версии — второй курс не нужен, правки
-        # вопросов HR (№3) сохраняются.
-        #
-        # 21.09 (фидбек юзера, живой прогон — удалил файл из папки специально,
-        # чтобы показать HR-уведомление о новом курсе; вместо этого бот тихо
-        # разархивировал старый): если курс в архиве, эта ветка НЕ СРАБАТЫВАЕТ
-        # вовсе — документ идёт как самостоятельный НОВЫЙ курс ниже (генерация
-        # вопросов, «Курсы на проверке», обычное «📄 Новый документ»). Удаление
-        # из папки — это удаление: старый курс остаётся в архиве, повторная
-        # загрузка не тянет его назад молча.
-        duplicate = await asyncio.to_thread(get_course_by_doc_name, file_name)
-        if duplicate and not duplicate.get("archived_at"):
-            await asyncio.to_thread(
-                mark_file_processed, file_id, file_name, folder_id, update_time,
-                content_hash,
-            )
-            if is_replacement:
-                # 21.09: courses.doc_id держим АКТУАЛЬНЫМ file_id — иначе
-                # init_db() при каждом рестарте сидирует фантомную строку
-                # processed_files под старым (уже неживым) file_id, и курс
-                # больше никогда не сможет заархивироваться по-настоящему
-                # (count_processed_by_doc_name не доходит до нуля).
-                await asyncio.to_thread(
-                    update_course_doc_id, duplicate["id"], file_id, detail_url)
-                notify = (f"🔄 Документ «{file_name}» обновлён: "
-                          f"{len(normalised)} фрагментов (было {removed}). "
-                          "Вопросы курса сохранены.")
-            else:
-                notify = (f"📄 «{file_name}» — копия для роли {list(roles)} к "
-                          f"курсу №{duplicate['id']} ({len(normalised)} "
-                          "фрагментов). Новый курс не создан, тест общий.")
-            for hr_id in _hr_ids():
-                await _send(str(hr_id), notify, HR_BOT_ID)
-            print(
-                f"[process_new_document] duplicate doc_name={file_name!r} "
-                f"(course_id={duplicate['id']}) — chunks ingested for roles={roles}, "
-                "course skipped"
-            )
-            return
-
-        # 6.6. То же СОДЕРЖИМОЕ под другим именем (17.08): курс не плодим —
-        # авто-привязка к существующему (решение юзера), HR в курсе.
-        same = await asyncio.to_thread(get_processed_by_hash, content_hash)
-        if same and same["doc_name"] != file_name:
-            twin = await asyncio.to_thread(get_course_by_doc_name,
-                                           same["doc_name"])
-            if twin:
-                await asyncio.to_thread(
-                    mark_file_processed, file_id, file_name, folder_id,
-                    update_time, content_hash,
-                )
-                notify = (f"📄 «{file_name}» — то же содержимое, что у курса "
-                          f"«{twin['doc_name']}» (№{twin['id']}): вопросы "
-                          "общие, новый курс не создан.")
-                for hr_id in _hr_ids():
-                    await _send(str(hr_id), notify, HR_BOT_ID)
-                print(f"[process_new_document] content twin of "
-                      f"{same['doc_name']!r} — course skipped")
-                return
-
         # 7. Generate questions
         from app.course_generator import generate_questions  # noqa: PLC0415
 
@@ -2610,11 +2590,12 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
             content_hash,
         )
 
-        # 8.5. 19.08: стандарт доступен для вопросов СРАЗУ (чанки уже в
-        # индексе) — сотрудники ролей документа узнают, не дожидаясь
-        # «Подтвердить» (тест придёт позже отдельным анонсом)
-        asyncio.create_task(_broadcast_new_standard(
-            file_name, detail_url, list(roles)))
+        from app.db import set_course_source
+        await asyncio.to_thread(set_course_source, course_id, f"{folder_key}/{file_name}")
+        for chunk in normalised:
+            chunk.update(course_id=course_id, file_id=str(file_id))
+        await asyncio.to_thread(index_store.append_document, normalised, new_emb)
+        chunks, embeddings = load_index()
 
         # 9. Save draft JSON
         courses_dir = os.path.join(data_dir, "courses")
@@ -2635,8 +2616,7 @@ async def _ingest_document(file_id: str, file_name: str, roles: list[str],
         n_basic, n_exam = phase_lens(questions)
         notify_text = (
             f"📄 Новый документ: *{file_name}*\n"
-            f"{n_basic + n_exam} вопросов ({n_basic} базовых + "
-            f"{n_exam} экзаменационных) · "
+            f"Единый тест: {len(quiz.all_questions(questions))} вопросов · "
             f"{n_recipients} подходящих получателей рассылки.\n"
             "После подтверждения курс активируется и рассылка уйдёт сразу.\n\n"
             f"Посмотреть вопросы: Вопросы {course_id}\n"

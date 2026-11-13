@@ -16,6 +16,8 @@ import json
 import os
 import re
 import time
+import threading
+from functools import wraps
 
 import httpx
 from dotenv import load_dotenv
@@ -38,6 +40,7 @@ from app.db import (
     get_user_departments,
     is_employee_allowed,
     log_answer,
+    pin_session_questions,
     update_session,
 )
 from app import kb_tracker, keyboards, quiz
@@ -111,9 +114,24 @@ def _with_hint(text: str, user_id: str) -> str:
     session = get_session(user_id)          # СВЕЖЕЕ состояние (после команды)
     state = session["state"] if session else None
     hint = _STATE_HINTS.get(state)
+    if hint and quiz.unified(session):
+        hint = hint.replace("экзамену", "тесту").replace("экзамен", "тест")
     return f"{text}\n\n{hint}" if hint else text
 
 
+# A bounded set of locks serializes duplicate button deliveries per employee.
+_MESSAGE_LOCKS = [threading.RLock() for _ in range(64)]
+
+
+def _serialized(fn):
+    @wraps(fn)
+    def wrapped(user_id, *args, **kwargs):
+        with _MESSAGE_LOCKS[hash(user_id) % len(_MESSAGE_LOCKS)]:
+            return fn(user_id, *args, **kwargs)
+    return wrapped
+
+
+@_serialized
 def process_message(user_id: str, message: str, dialog_id: str,
                     chunks: list, embeddings) -> str:
     """
@@ -135,6 +153,11 @@ def process_message(user_id: str, message: str, dialog_id: str,
 def _dispatch(user_id: str, message: str, dialog_id: str,
               chunks: list, embeddings) -> str:
     session = get_session(user_id)
+    if message.startswith("answer:"):
+        letter = quiz.payload_letter(message, session)
+        if letter is None:
+            return "Эта кнопка относится к прошлому вопросу — ответ не засчитан. Нажми *Продолжить*."
+        message = letter
 
     if session is None:
         # Whitelist: доступ к обучению только у приглашённых HR (таблица employees;
@@ -274,6 +297,12 @@ def _retake_fork_text(user_id: str) -> str | None:
         return None
     questions = get_course_questions(last["course_id"])
     exam_q = questions.get("exam_questions", [])
+    if quiz.unified(last):
+        score, total, passed = quiz.result(last, questions)
+        if passed or not total:
+            return None
+        return (f"📝 Тест не сдан ({score}/{total}). Напиши *Пересдать* — "
+                "пройти тест ещё раз, или *Далее* — перейти к следующему курсу.")
     if not exam_q or last["score_exam"] >= _exam_pass_threshold(questions):
         return None
     course = get_course_by_id(last["course_id"])
@@ -291,6 +320,22 @@ def _handle_retake(user_id: str) -> str:
                 "чтобы начать обучение.")
     questions = get_course_questions(last["course_id"])
     exam_q = questions.get("exam_questions", [])
+    if quiz.unified(last):
+        score, total, passed = quiz.result(last, questions)
+        if passed:
+            return f"🎉 Тест уже сдан ({score}/{total}). Пересдача не нужна."
+        if not total:
+            return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
+        # Preserve the completed attempt and all its answers.
+        fresh = create_session(user_id, last["dialog_id"], last["course_id"],
+                               state="EXAM", quiz_questions_json=(last.get("quiz_questions_json")
+                                                                  or json.dumps(questions, ensure_ascii=False)),
+                               attempt=(last.get("attempt") or 0) + 1)
+        if last.get("role"):
+            update_session(fresh["id"], role=last["role"])
+        q_list = quiz.phase_questions(fresh, questions, "exam")
+        return ("🔁 Пересдача теста — вперёд!\n\n"
+                + format_question(q_list[0], 0, len(q_list), "exam", fresh))
     if not exam_q:
         return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
     if last["score_exam"] >= _exam_pass_threshold(questions):
@@ -566,15 +611,17 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
     # «пройден/не сдан» должны быть честными (маркеры course_id=0 не в счёт)
     open_states: dict[int, tuple] = {}
     best_exam: dict[int, int] = {}
+    completed: dict[int, list] = {}
     all_sessions = get_sessions_by_user(user_id)
     for s in all_sessions:
         if s["state"] == "DONE":
+            completed.setdefault(s["course_id"], []).append(s)
             if s["course_id"]:
                 best_exam[s["course_id"]] = max(
                     best_exam.get(s["course_id"], 0), s["score_exam"] or 0)
         elif s["course_id"] not in open_states:
             open_states[s["course_id"]] = (s["state"],
-                                           s.get("current_q_idx", 0))
+                                           s.get("current_q_idx", 0), quiz.unified(s))
     mine = [c for c in courses
             if role_id is None or role_matches(role_id, course_roles(c))]
     if not mine:
@@ -591,7 +638,7 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
                 lines.append(f"▶️ {name} — допущен к экзамену, "
                              "напиши *Начать*")
             elif session and quiz.phase_of(session["state"]):
-                what = ("экзамен" if quiz.phase_of(session["state"]) == "exam"
+                what = "тест" if quiz.unified(session) else ("экзамен" if quiz.phase_of(session["state"]) == "exam"
                         else "базовый тест")
                 pause = " (на паузе)" if quiz.is_paused(session["state"]) else ""
                 lines.append(f"▶️ {name} — {what} на вопросе "
@@ -602,17 +649,19 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
             questions = get_course_questions(c["id"])
             total_exam = len(questions.get("exam_questions", []))
             best = best_exam.get(c["id"], 0)
-            if best >= _exam_pass_threshold(questions):
+            pair = completed.get(c["id"], [])
+            if any(quiz.result(s, questions)[2] for s in pair):
                 lines.append(f"✅ {name} — пройден")
             else:
-                line = f"❌ {name} — экзамен не сдан ({best}/{total_exam})"
+                score, total_exam, _ = quiz.result(pair[0], questions) if pair else (best, total_exam, False)
+                line = f"❌ {name} — тест не сдан ({score}/{total_exam})"
                 last = get_last_done_session(user_id)
                 if last and last["course_id"] == c["id"]:
                     line += " · напиши *Пересдать*"
                 lines.append(line)
         else:
             n = selectable.index(c) + 1
-            state, q_idx = open_states.get(c["id"], (None, 0))
+            state, q_idx, is_unified = open_states.get(c["id"], (None, 0, False))
             # Обогащение для BLOCK-кнопок (дизайн 17.08): номер «Выбрать N»
             # и статус едут вместе с курсом, контракт (text, selectable) прежний
             c["n"] = n
@@ -629,7 +678,7 @@ def my_courses(user_id: str, role_id: str | None) -> tuple[str, list[dict]]:
             if state == "WAITING_HR":
                 lines.append(f"{n}. ⏳ {name} — базовый сдан, ждёт допуска HR")
             elif quiz.phase_of(state):
-                what = ("экзамен" if quiz.phase_of(state) == "exam"
+                what = "тест" if is_unified else ("экзамен" if quiz.phase_of(state) == "exam"
                         else "базовый тест")
                 lines.append(f"{n}. ⏸ {name} — {what} на вопросе {q_idx + 1}")
             elif state == "EXAM_READY":
@@ -676,12 +725,13 @@ def _handle_course_switch(session: dict, n: int) -> str:
             # «показали вопрос → состояние активное», иначе клавиатура придёт
             # без A–D и сотрудник смотрит на вопрос, на который нечем ответить
             questions = get_course_questions(course["id"])
-            q_list = questions.get(f"{phase}_questions", [])
+            q_list = quiz.phase_questions(existing, questions, phase)
             idx = existing["current_q_idx"]
             if q_list and idx < len(q_list):
                 update_session(existing["id"], state=quiz.active_state(phase))
                 fresh = get_session_by_id(existing["id"])
-                head = (f"🎓 Экзамен по курсу *{name}* — поехали!"
+                head = (f"📝 Продолжаем тест курса *{name}*!" if quiz.unified(existing) else
+                        f"🎓 Экзамен по курсу *{name}* — поехали!"
                         if phase == "exam" else
                         f"📝 Продолжаем базовый тест курса *{name}*!")
                 return (head + "\n\n"
@@ -724,6 +774,20 @@ def _start_basic_test(session: dict) -> str:
     после провала — прошлые ответы фазы стереть, иначе _finish_phase
     сосчитает обе попытки — ловушка _handle_retake)."""
     questions = get_course_questions(session["course_id"])
+    if quiz.unified(session):
+        q_list = quiz.phase_questions(session, questions, "exam")
+        if not q_list:
+            return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
+        if any(not quiz.question_view(None, q, "exam", i).valid for i, q in enumerate(q_list)):
+            notify_hr(f"⚠️ Ошибка в вопросах курса {session['course_id']}; тест не начат.")
+            return "⚠️ Вопрос содержит ошибку — тест не начат. HR уведомлён, прогресс сохранён."
+        session = pin_session_questions(session["id"], questions)
+        bump_attempt(session["id"])
+        update_session(session["id"], state="EXAM", q_idx=0, score_basic=0, score_exam=0)
+        fresh = get_session_by_id(session["id"])
+        return (f"✅ Начинаем тест — {len(q_list)} вопрос(ов), "
+                f"для сдачи нужно {quiz.pass_threshold(len(q_list))} (70%).\n\n"
+                + format_question(q_list[0], 0, len(q_list), "exam", fresh))
     basic_q = questions.get("basic_questions", [])
     if not basic_q:
         return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
@@ -783,7 +847,7 @@ def _handle_test_pick(session: dict, course_id: int) -> str:
         phase = quiz.phase_of(state)
         if phase:
             questions = get_course_questions(course_id)
-            q_list = questions.get(f"{phase}_questions", [])
+            q_list = quiz.phase_questions(session, questions, phase)
             idx = session["current_q_idx"]
             if not q_list or idx >= len(q_list):
                 return "Ошибка: вопросы курса не найдены. Обратитесь к HR."
@@ -932,7 +996,7 @@ def _rag_reply_ex(session: dict, message: str, chunks: list, embeddings,
     if relevant:
         doc = relevant[0].get("doc_name")
         if doc:
-            url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
+            url = (get_course_by_id(relevant[0]["course_id"]) if relevant[0].get("course_id") else get_course_by_doc_name(doc) or {}).get("doc_detail_url")
             name = display_name(doc)
             text += ("\n\n📄 Источник: " +
                      (f"[URL={url}]{name}[/URL]" if url else name))
@@ -948,12 +1012,16 @@ def _my_documents_text(role_id: str | None, chunks: list) -> str:
     «Для твоего отдела» и «Общие». Роль неизвестна → только общие."""
     dept_docs: list[str] = []
     common_docs: list[str] = []
-    for c in chunks:
+    from app.document_access import available_chunks
+    sources = {}
+    for c in available_chunks(chunks):
         if c.get("audience") == "guest":
             continue
         doc = c.get("doc_name")
         if not doc:
             continue
+        if c.get("course_id"):
+            sources[doc] = get_course_by_id(c["course_id"])
         c_roles = set(c.get("roles") or [])
         # 02.09: all_access-роль («Менеджер») видит ведомственные стандарты
         # всех отделов — они идут в первую секцию, общие остаются общими
@@ -971,7 +1039,7 @@ def _my_documents_text(role_id: str | None, chunks: list) -> str:
     def _section(docs: list[str]) -> list[str]:
         out = []
         for doc in docs:
-            url = (get_course_by_doc_name(doc) or {}).get("doc_detail_url")
+            url = (sources.get(doc) or get_course_by_doc_name(doc) or {}).get("doc_detail_url")
             name = display_name(doc)
             out.append("• " + (f"[URL={url}]{name}[/URL]" if url else name))
         return out
@@ -993,13 +1061,12 @@ def _my_documents_text(role_id: str | None, chunks: list) -> str:
 def _handle_test(session: dict, message: str, phase: str,
                  chunks: list | None = None, embeddings=None) -> str:
     questions = get_course_questions(session["course_id"])
-    q_list = questions.get(f"{phase}_questions", [])
+    q_list = quiz.phase_questions(session, questions, phase)
     total = len(q_list)
     q_idx = session["current_q_idx"]
 
-    if q_idx >= total:
-        # Guard: shouldn't happen in normal flow
-        return _finish_phase(session, phase, questions)
+    if not 0 <= q_idx < total:
+        return _invalid_question_reply(session, phase, q_idx)
 
     current_q = q_list[q_idx]
 
@@ -1030,6 +1097,13 @@ def _handle_test(session: dict, message: str, phase: str,
     letter = parse_answer(message)
     view = quiz.question_view(session, current_q, phase, q_idx)
 
+    if not view.valid:
+        return _invalid_question_reply(session, phase, q_idx)
+    if letter is not None and letter not in view.letters:
+        return ("Такого варианта нет. Ответ не засчитан. Выбери "
+                + ", ".join(view.letters) + ".\n\n"
+                + format_question(current_q, q_idx, total, phase, session))
+
     if letter is None:
         # 02.09 (живой прогон): вопрос по стандартам во время теста упирался
         # в «ответь одной буквой» — бот замолкал именно там, где сотрудник
@@ -1045,7 +1119,7 @@ def _handle_test(session: dict, message: str, phase: str,
     # Сотрудник прислал букву в СВОИХ координатах; в answers и на сверку идёт
     # каноническая — тогда «История» HR и отчёты остаются корректными.
     canon = quiz.to_canonical(letter, view.perm)
-    is_correct = 1 if canon == current_q["correct"] else 0
+    is_correct = 1 if canon == view.correct_canonical else 0
     log_answer(session["id"], q_idx, phase, canon, is_correct)
 
     # Буква в фидбеке — в координатах сотрудника (канон в чат не утекает);
@@ -1081,7 +1155,7 @@ def _handle_test(session: dict, message: str, phase: str,
 
 
 def _pause_text(session: dict, phase: str, q_idx: int, total: int) -> str:
-    label = quiz.phase_label(phase)
+    label = "Тест" if quiz.unified(session) else quiz.phase_label(phase)
     return (f"⏸ {label} на паузе (вопрос {q_idx + 1} из {total}, прогресс "
             "сохранён).\n\n"
             f"Что дальше — пока {label.lower()} на паузе, можно:\n"
@@ -1099,7 +1173,7 @@ def _handle_paused(session: dict, message: str, phase: str,
     (см. ниже)."""
     cmd = message.strip().lower()
     questions = get_course_questions(session["course_id"])
-    q_list = questions.get(f"{phase}_questions", [])
+    q_list = quiz.phase_questions(session, questions, phase)
     total = len(q_list)
     q_idx = session["current_q_idx"]
 
@@ -1133,7 +1207,7 @@ def _handle_paused(session: dict, message: str, phase: str,
         # перестановкой она размапится чужим порядком и даст тихо неверную
         # оценку. Формулировка «вопрос N из T», а не «— Вопрос N/M»: второе
         # матчит _QUESTION_RE в bitrix_bot и вернуло бы клавиатуру A–D.
-        return (f"⏸ {quiz.phase_label(phase)} на паузе — ответ не засчитан.\n"
+        return (f"⏸ {'Тест' if quiz.unified(session) else quiz.phase_label(phase)} на паузе — ответ не засчитан.\n"
                 f"Нажми *Продолжить*, чтобы вернуться к вопросу "
                 f"{q_idx + 1} из {total}.")
     return _quiz_rag_reply(session, message, chunks, embeddings)
@@ -1157,6 +1231,24 @@ def _finish_phase(session: dict, phase: str, questions: dict,
     correct_count = sum(1 for a in answers if a["is_correct"] == 1)
 
     prefix = (last_feedback + "\n\n") if last_feedback else ""
+
+    if quiz.unified(session):
+        q_list = quiz.phase_questions(session, questions, phase)
+        if (not q_list or len(answers) != len(q_list)
+                or {a["question_id"] for a in answers} != set(range(len(q_list)))):
+            return "Ошибка: тест не завершён, прогресс сохранён. Обратись к HR."
+        update_session(session["id"], state="DONE", q_idx=0, score_exam=correct_count)
+        passed = correct_count >= quiz.pass_threshold(len(q_list))
+        grade = "✅ Сдан" if passed else "❌ Не сдан"
+        notify_hr(f"📋 Сотрудник {_employee_label(session['user_id'])} завершил тест: "
+                  f"{correct_count}/{len(q_list)} — {grade}.")
+        if passed:
+            post_exam_congratulation(session["user_id"],
+                                     dict(quiz.session_questions(session, questions), quiz_version=2),
+                                     correct_count, 0)
+        hint = "" if passed else "\nНапиши *Пересдать*, чтобы пройти тест ещё раз."
+        return prefix + (f"🏁 Тест завершён!\nРезультат: *{correct_count}/{len(q_list)}* — "
+                         f"{grade}\nРезультаты отправлены HR. Спасибо!" + hint)
 
     if phase == "basic":
         # 31.08 (решение юзера): допуск к экзамену АВТОМАТИЧЕСКИЙ по порогу
@@ -1288,20 +1380,31 @@ def _handle_exam_ready(session: dict, message: str,
             return "Ошибка: вопросы экзамена не найдены. Обратись к HR."
         update_session(session["id"], state="EXAM", q_idx=0)
         return ("🎓 Экзамен — поехали!\n\n"
-                + format_question(q_list[0], 0, len(q_list), "exam"))
+                + format_question(q_list[0], 0, len(q_list), "exam", session))
     return _rag_reply(session, message, chunks, embeddings)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _invalid_question_reply(session: dict, phase: str, idx: int) -> str:
+    notify_hr(f"⚠️ Повреждён вопрос {idx + 1} ({phase}) курса "
+              f"{session['course_id']}, сессия {session['id']}. Ответ не записан.")
+    return ("⚠️ Вопрос содержит ошибку — ответ не засчитан, прогресс сохранён. "
+            "HR уведомлён. Можно открыть *Мои курсы* или *Документы*.")
+
 
 def format_question(q: dict, idx: int, total: int, phase: str,
                     session: dict | None = None) -> str:
     """Вопрос глазами сотрудника. session=None — канонический порядок
     (HR-инструменты, легаси-вызовы); с сессией порядок вариантов её
     собственный (quiz.question_view — тот же вызов делает и клавиатура)."""
-    label = "Базовый тест" if phase == "basic" else "Экзамен"
+    label = "Тест" if quiz.unified(session) or phase == "test" else ("Базовый тест" if phase == "basic" else "Экзамен")
     view = quiz.question_view(session, q, phase, idx)
-    lines = [f"📝 {label} — Вопрос {idx + 1}/{total}", "", q["text"], ""]
+    if not view.valid:
+        if session is not None:
+            return _invalid_question_reply(session, phase, idx)
+        return "⚠️ Вопрос содержит ошибку. Обратись к HR; прогресс сохранён."
+    lines = [f"📝 {label} — Вопрос {idx + 1}/{total}", "", str(q.get("text", "")), ""]
     return "\n".join(lines + view.options)
 
 

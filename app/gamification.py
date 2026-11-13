@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from dotenv import load_dotenv
 
+from app import quiz
 from app.db import (
     get_all_employees,
     get_employee,
@@ -89,9 +90,8 @@ def build_weekly_rating(rows: list[dict], employees_by_uid: dict[str, dict],
             questions = json.loads(r.get("questions_json") or "{}")
         except json.JSONDecodeError:
             questions = {}
-        exam_total = len(questions.get("exam_questions", []))
-        # Формула сдачи — та же, что в _finish_phase / hr_tools._session_status
-        if not exam_total or r["score_exam"] < round(exam_total * 0.7):
+        _, exam_total, passed = quiz.result(r, questions)
+        if not passed:
             continue
         candidates.append((r, exam_total))
     if not candidates:
@@ -115,7 +115,7 @@ def build_weekly_rating(rows: list[dict], employees_by_uid: dict[str, dict],
         badge = _MEDALS[len(lines)] if len(lines) < len(_MEDALS) else "•"
         score = r["score_basic"] + r["score_exam"]
         lines.append(f"{badge} {fio} — «{r['doc_name']}»: {score} баллов "
-                     f"(экзамен {r['score_exam']}/{exam_total})")
+                     f"({'тест' if quiz.unified(r) else 'экзамен'} {r['score_exam']}/{exam_total})")
 
     message = ("За последнюю неделю обучение завершили лучше всех:\n\n"
                + "\n".join(lines) + "\n\nПоздравляем! 🎉")
@@ -238,6 +238,12 @@ def post_exam_congratulation(user_id: str, questions: dict,
     try:
         emp = get_employee(str(user_id))
         fio = (emp or {}).get("full_name") or f"Сотрудник (ID {user_id})"
+        if questions.get("quiz_version") == 2:
+            title = "Благодарность за обучение"
+            message = (f"🏆 {fio} успешно сдал(а) тест по курсу «{questions.get('doc_name', 'обучение')}»!\n"
+                       f"Результат: {exam_score}/{len(quiz.all_questions(questions))}. Поздравляем! 🎉")
+            _post_gratitude(str(user_id), title, message)
+            return
         title, message = build_congrats(
             fio,
             questions.get("doc_name") or "обучение",

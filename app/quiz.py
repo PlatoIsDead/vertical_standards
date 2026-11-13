@@ -14,6 +14,9 @@ state_machine нельзя: словарь состояний нужен keyboar
 import hashlib
 import itertools
 import os
+import json
+import re
+import math
 from typing import NamedTuple
 
 # ── Словарь состояний ────────────────────────────────────────────────────────
@@ -67,109 +70,148 @@ PERMS = tuple(itertools.permutations(IDENT))
 
 
 class QuestionView(NamedTuple):
-    """Вопрос в координатах сотрудника.
-
-    options — 4 строки «A. тело» в ЕГО порядке (для текста вопроса);
-    bodies  — те же тела без букв (для BLOCK-кнопок) либо None, если
-              перемешивать нечего (не 4 варианта / кривые префиксы);
-    perm    — perm[i] = канонический индекс варианта, стоящего у сотрудника
-              на позиции i;
-    correct_display — правильная буква в ЕГО координатах;
-    correct_body — тело правильного варианта (для честного фидбека).
-    """
+    """Options, buttons and grading in the employee's display coordinates."""
     options: list
     bodies: list | None
     perm: tuple
     correct_display: str
     correct_body: str
+    valid: bool = True
+    letters: tuple = ()
+    correct_canonical: str = ""
 
 
 def shuffle_enabled() -> bool:
-    """Kill-switch. Читается НА ВЫЗОВЕ: тесты FSM глушат перемешивание
-    через monkeypatch.setenv, прод может выключить его без релиза."""
     return os.getenv("SHUFFLE_OPTIONS", "1") == "1"
 
 
 def option_perm(session_id, attempt: int, phase: str, q_idx: int) -> tuple:
-    """Детерминированная перестановка вариантов для (сессия, попытка, вопрос).
-
-    blake2b, а не встроенный hash(): при PYTHONHASHSEED=random хэш строки
-    меняется между запусками процесса — сотрудник ответил бы по одному
-    порядку, а размапилось бы другим (тихая порча оценки после рестарта).
-
-    attempt входит в ключ, потому что пересдача переиспользует ТУ ЖЕ строку
-    сессии: без него сотрудник, увидевший «Правильный ответ: B» по каждому
-    вопросу, сдал бы пересдачу по записанным буквам, не открывая документ.
-    """
+    # Keep the deployed seed and permutation order for existing sessions.
     key = f"{session_id}:{attempt}|{phase}|{q_idx}".encode()
     digest = hashlib.blake2b(key, digest_size=8).digest()
     return PERMS[int.from_bytes(digest, "big") % len(PERMS)]
 
 
 def to_canonical(letter: str, perm: tuple) -> str:
-    """Буква, которую нажал сотрудник → каноническая (для answers и сверки)."""
     return LETTERS[perm[LETTERS.index(letter)]]
 
 
 def to_display(letter: str, perm: tuple) -> str:
-    """Каноническая буква → та, что видит сотрудник."""
     return LETTERS[perm.index(LETTERS.index(letter))]
 
 
-def _parse_options(q: dict) -> list | None:
-    """[(буква, тело)] по каноническому порядку либо None, если формат не тот
-    (2 варианта в тестовых фикстурах, кривые префиксы, дубли букв)."""
-    opts = [str(o).strip() for o in (q.get("options") or [])]
-    if len(opts) != 4:
+_OPT_RE = re.compile(r"^\s*([A-DАБВГСД])\s*[).:\-–—]\s*(\S.*?)\s*$", re.I)
+_VISUAL = {"А": "A", "В": "B", "С": "C", "Д": "D"}
+_RUSSIAN = dict(zip("АБВГ", LETTERS))
+
+
+def _parse_question(q: dict):
+    if not isinstance(q, dict) or not isinstance(q.get("text", ""), str):
         return None
-    parsed = []
-    for o in opts:
-        head, sep, body = o.partition(".")
-        if not sep:
-            head, sep, body = o.partition(")")
-        head = head.strip().upper()
-        if not sep or head not in LETTERS:
-            return None
-        parsed.append((head, body.strip()))
-    if len({head for head, _ in parsed}) != 4:
+    opts = q.get("options")
+    if not isinstance(opts, list) or len(opts) not in (2, 4):
         return None
-    return parsed
+    matches = [_OPT_RE.fullmatch(o) if isinstance(o, str) else None for o in opts]
+    if not all(matches):
+        return None
+    raw = [m[1].upper() for m in matches]
+    # Б/Г unambiguously select the Russian alphabet, also for correct.
+    mapping = _RUSSIAN if set(raw) & {"Б", "Г"} else _VISUAL
+    heads = [mapping.get(h, h) for h in raw]
+    correct = q.get("correct")
+    if not isinstance(correct, str):
+        return None
+    correct = mapping.get(correct.strip().upper(), correct.strip().upper())
+    letters = LETTERS[:len(opts)]
+    bodies = [m[2].strip() for m in matches]
+    if (set(heads) != set(letters) or len(set(heads)) != len(heads)
+            or len({" ".join(b.casefold().split()) for b in bodies}) != len(bodies)
+            or correct not in letters):
+        return None
+    by_letter = dict(zip(heads, bodies))
+    return [by_letter[letter] for letter in letters], correct
 
 
 def question_view(session: dict | None, q: dict, phase: str,
                   q_idx: int) -> QuestionView:
-    """ЕДИНСТВЕННЫЙ источник правды о порядке вариантов для сотрудника.
-
-    Зовут обе точки рендера — текст вопроса (state_machine.format_question) и
-    тела кнопок (bitrix_bot._test_options). Если звать только из одной, кнопка
-    «B» пошлёт букву не того варианта, который сотрудник прочитал.
-
-    session=None или выключенный шафл → канонический порядок (HR-инструменты,
-    легаси-вызовы). Читаются только session["id"] и session["attempt"] —
-    состояние сессии сознательно НЕ трогаем: словарь у вызывающего может быть
-    устаревшим по state, но id и попытка в нём всегда верны.
-    """
-    parsed = _parse_options(q)
-    correct = q.get("correct", "")
-    if parsed is None or correct not in LETTERS:
-        # Нечего перемешивать — отдаём как есть (поведение до 02.09)
-        opts = [str(o).strip() for o in (q.get("options") or [])]
-        body = ""
-        if parsed is not None:
-            body = dict(parsed).get(correct, "")
-        return QuestionView(opts, None, IDENT, correct, body)
-
-    bodies_canon = [body for _letter, body in parsed]
-    if session is None or not shuffle_enabled():
-        return QuestionView(
-            [f"{LETTERS[i]}. {bodies_canon[i]}" for i in range(4)],
-            bodies_canon, IDENT, correct,
-            bodies_canon[LETTERS.index(correct)])
-
-    perm = option_perm(session["id"], session.get("attempt") or 0,
-                       phase, q_idx)
-    bodies = [bodies_canon[perm[i]] for i in range(4)]
+    parsed = _parse_question(q)
+    if parsed is None:
+        opts = q.get("options", []) if isinstance(q, dict) else []
+        opts = [str(o) for o in opts] if isinstance(opts, list) else []
+        return QuestionView(opts, None, IDENT, "", "", False)
+    bodies_canon, correct = parsed
+    letters = LETTERS[:len(bodies_canon)]
+    perm = IDENT
+    # Two-option legacy questions keep their historical unshuffled layout.
+    if len(letters) == 4 and session is not None and shuffle_enabled():
+        perm = option_perm(session["id"], session.get("attempt") or 0, phase, q_idx)
+    bodies = [bodies_canon[perm[i]] for i in range(len(letters))]
+    display = to_display(correct, perm)
     return QuestionView(
-        [f"{LETTERS[i]}. {bodies[i]}" for i in range(4)],
-        bodies, perm, to_display(correct, perm),
-        bodies_canon[LETTERS.index(correct)])
+        [f"{letter}. {body}" for letter, body in zip(letters, bodies)],
+        bodies if len(letters) == 4 else None, perm, display,
+        bodies_canon[LETTERS.index(correct)], True, letters, correct)
+
+
+def all_questions(course: dict) -> list[dict]:
+    """One deterministic list; keep malformed questions visible to validation.
+
+    The first occurrence of a question text wins. No synthetic duplicates are
+    added to reach a fixed question count. Source arrays remain intact for HR.
+    """
+    seen, out = set(), []
+    for key in ("basic_questions", "exam_questions"):
+        for q in course.get(key) or []:
+            norm = " ".join(str(q.get("text", "")).casefold().split()) if isinstance(q, dict) else ""
+            if norm and norm in seen:
+                continue
+            if norm:
+                seen.add(norm)
+            out.append(q)
+    return out
+
+
+def unified(session: dict | None) -> bool:
+    return bool(session and session.get("quiz_version", 1) == 2)
+
+
+def session_questions(session: dict, course: dict) -> dict:
+    """Resolve a pinned question snapshot, with the live course as fallback."""
+    snapshot = session.get("quiz_questions_json")
+    return json.loads(snapshot) if snapshot else course
+
+
+def phase_questions(session: dict, course: dict, phase: str) -> list:
+    course = session_questions(session, course)
+    return all_questions(course) if unified(session) else course.get(f"{phase}_questions", [])
+
+
+def pass_threshold(total: int) -> int:
+    return math.ceil(total * 7 / 10)
+
+
+def result(session: dict, course: dict) -> tuple[int, int, bool]:
+    course = session_questions(session, course)
+    if unified(session):
+        total = len(all_questions(course))
+    else:
+        total = len(course.get("exam_questions", []))
+    score = session.get("score_exam") or 0
+    # Keep already awarded historical results intact.
+    threshold = pass_threshold(total) if unified(session) else round(total * .7)
+    return score, total, bool(total and score >= threshold)
+
+
+def answer_payload(session: dict, letter: str) -> str:
+    phase = phase_of(session.get("state"))
+    return (f"answer:{session.get('id', 0)}:{session.get('attempt') or 0}:"
+            f"{phase}:{session.get('current_q_idx', 0)}:{letter}")
+
+
+def payload_letter(message: str, session: dict | None) -> str | None:
+    if not session or session.get("state") not in TEST_STATES:
+        return None
+    parts = message.split(":")
+    if len(parts) != 6 or parts[-1] not in LETTERS:
+        return None
+    return parts[-1] if message == answer_payload(session, parts[-1]) else None

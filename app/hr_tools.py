@@ -11,6 +11,8 @@ data/roles.json) — всё тестируется напрямую.
 import json
 import re
 
+from app import quiz
+
 from app.course_generator import validate_question
 from app.roles import role_name
 
@@ -87,15 +89,23 @@ def question_by_ref(questions: dict, q_num: int) -> dict | None:
 def correct_option(q: dict) -> str:
     """«A» → «A. Бежать» из options — HR видит текст правильного ответа
     («буковки», протокол 05.08). Кривой формат варианта → буква как есть."""
-    prefix = q.get("correct", "") + "."
-    return next((o.strip() for o in q.get("options", [])
-                 if o.strip().upper().startswith(prefix)), q.get("correct", "?"))
+    view = quiz.question_view(None, q, "exam", 0)
+    if view.valid:
+        return f"{view.correct_display}. {view.correct_body}"
+    # HR may inspect a damaged legacy question to repair it.
+    correct = str(q.get("correct", "?"))
+    options = q.get("options")
+    if isinstance(options, list):
+        prefix = correct.upper() + "."
+        return next((o.strip() for o in options if isinstance(o, str)
+                     and o.strip().upper().startswith(prefix)), correct)
+    return correct
 
 
 def format_question_full(q: dict, q_num: int, basic_len: int = 5,
                          exam_len: int = 10) -> str:
-    phase, _ = resolve_question_ref(q_num, basic_len, exam_len)
-    label = "базовый тест" if phase == "basic" else "экзамен"
+    resolve_question_ref(q_num, basic_len, exam_len)
+    label = "тест"
     lines = [f"*Вопрос {q_num}* ({label}):", q["text"], ""] + list(q["options"])
     lines.append(f"Ответ: {q['correct']}")
     if q.get("explanation"):
@@ -108,14 +118,12 @@ def format_question_card(doc_name: str, q: dict, q_num: int,
     """Карточка вопроса «как видит сотрудник» + ✅ на правильном (17.08:
     «Вопросы N» листает карточки вместо простыни-ответника)."""
     phase, idx = resolve_question_ref(q_num, basic_len, exam_len)
-    sub = (f"Базовый блок — вопрос {idx + 1}/{basic_len}" if phase == "basic"
-           else f"Экзамен — вопрос {idx + 1}/{exam_len}")
+    sub = f"Тест — вопрос {q_num}/{basic_len + exam_len}"
     lines = [f"📋 *{doc_name}*", sub, "", f"{q_num}. {q['text']}", ""]
-    correct_prefix = (q.get("correct") or "") + "."
-    for o in q.get("options", []):
-        o = str(o).strip()
-        mark = " ✅" if o.upper().startswith(correct_prefix) else ""
-        lines.append(o + mark)
+    view = quiz.question_view(None, q, phase, idx)
+    for option in view.options:
+        mark = " ✅" if view.valid and option.startswith(view.correct_display + ".") else ""
+        lines.append(option + mark)
     if q.get("explanation"):
         lines += ["", f"Пояснение: {q['explanation']}"]
     return "\n".join(lines)
@@ -262,7 +270,14 @@ def apply_replacement(questions: dict, q_num: int, repl: dict) -> dict:
 # ── История и Отчёт ──────────────────────────────────────────────────────────
 
 def _session_status(session: dict, questions: dict) -> str:
-    """Этап сессии по-русски. Порог сдачи — round(total*0.7), как в _finish_phase."""
+    """Этап и результат с учётом версии теста и сохранённого снимка."""
+    if quiz.unified(session):
+        if session["state"] == "DONE":
+            score, total, passed = quiz.result(session, questions)
+            verdict = "✅ сдан" if passed else "❌ не сдан"
+            return f"завершил — {verdict} (тест {score}/{total})"
+        if session["state"] in quiz.QUIZ_STATES:
+            return "тест на паузе" if quiz.is_paused(session["state"]) else "проходит тест"
     if session["state"] == "DONE":
         basic_total = len(questions.get("basic_questions", []))
         exam_total = len(questions.get("exam_questions", []))
@@ -280,21 +295,23 @@ def build_history_text(employee_label: str, sessions: list[dict],
     """Последние 3 сессии сотрудника с ответами: сквозной номер, ✓/✗, верный ответ."""
     lines = [f"📖 История обучения: {employee_label}", ""]
     for s in sessions[:3]:
-        questions = questions_by_course.get(s["course_id"], {})
+        questions = quiz.session_questions(s, questions_by_course.get(s["course_id"], {}))
         name = course_names.get(s["course_id"], f"курс №{s['course_id']}")
         lines.append(f"*«{name}»* — {_session_status(s, questions)}")
         answers = answers_by_session.get(s["id"], [])
         if not answers:
             lines.append("(ответов пока нет)")
         for a in answers:
-            q_list = questions.get(f"{a['phase']}_questions", [])
+            q_list = quiz.phase_questions(s, questions, a["phase"])
             q = q_list[a["question_id"]] if a["question_id"] < len(q_list) else {}
             mark = "✓" if a["is_correct"] == 1 else "✗"
             b_len = len(questions.get("basic_questions", [])) or 5
-            line = (f"{ui_number(a['phase'], a['question_id'], b_len)}. {mark} "
+            line = (f"{a['question_id'] + 1 if quiz.unified(s) else ui_number(a['phase'], a['question_id'], b_len)}. {mark} "
                     f"{(q.get('text') or '')[:60]} — ответ {a['user_answer']}")
             if a["is_correct"] != 1:
-                line += f" (верно: {q.get('correct', '?')})"
+                view = quiz.question_view(None, q, a["phase"], a["question_id"])
+                correct = view.correct_canonical if view.valid else "?"
+                line += f" (верно: {correct})"
             lines.append(line)
         lines.append("")
     if len(sessions) > 3:

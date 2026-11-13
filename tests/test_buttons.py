@@ -30,7 +30,7 @@ def test_for_session_states():
     assert kb.for_session(None) is None
     fork = _btns(kb.for_session(None, fork=True))
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in fork] == \
-        [("🔁 Пересдать экзамен", "Пересдать"), ("Далее, к следующему", "Далее"),
+        [("🔁 Пересдать тест", "Пересдать"), ("Далее, к следующему", "Далее"),
          ("📚 Мои курсы", "Мои курсы"), ("📄 Документы", "Документы"),
          ("❓ Помощь", "Помощь")]
     roles = _btns(kb.for_session({"state": "ROLE_SELECT"},
@@ -44,10 +44,10 @@ def test_for_session_states():
     assert reading[0]["DISPLAY"] == "BLOCK"
     test_kb = _btns(kb.for_session({"state": "BASIC_TEST"}))
     assert [b["COMMAND_PARAMS"] for b in test_kb] == \
-        ["A", "B", "C", "D", "Выйти", "Помощь"]   # 19.08/26.08: пауза, помощь
+        [f"answer:0:0:basic:0:{x}" for x in "ABCD"] + ["Выйти", "Помощь"]   # 19.08/26.08: пауза, помощь
     exam_kb = _btns(kb.for_session({"state": "EXAM"}))
     assert [b["COMMAND_PARAMS"] for b in exam_kb] == \
-        ["A", "B", "C", "D", "Выйти", "Помощь"]      # payload'ы прежние
+        [f"answer:0:0:exam:0:{x}" for x in "ABCD"] + ["Выйти", "Помощь"]      # payload'ы прежние
     assert exam_kb[4]["TEXT"] == "⏸ Отложить экзамен"  # 01.09: имя фазы
     waiting = _btns(kb.for_session({"state": "WAITING_HR"}))
     assert [(b["TEXT"], b["COMMAND_PARAMS"]) for b in waiting] == \
@@ -121,7 +121,7 @@ def test_keyboard_attached_when_flag_on(monkeypatch):
     asyncio.run(run())
     assert captured and \
         [b["COMMAND_PARAMS"] for b in captured[0] if "TEXT" in b] == \
-        ["A", "B", "C", "D", "Выйти", "Помощь"]
+        [f"answer:0:0:basic:0:{x}" for x in "ABCD"] + ["Выйти", "Помощь"]
 
 
 # ── /command ─────────────────────────────────────────────────────────────────

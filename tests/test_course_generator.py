@@ -17,7 +17,7 @@ FACTS = {"course_summary": "О документе.",
          "facts_basic": [f"факт {i}" for i in range(5)],
          "facts_exam": [f"положение {i}" for i in range(10)]}
 QUESTIONS = {"basic_questions": [_q(i) for i in range(5)],
-             "exam_questions": [_q(i) for i in range(10)]}
+             "exam_questions": [_q(i + 5) for i in range(10)]}
 
 
 def _verdicts(bad=(), reason="мета-вопрос"):

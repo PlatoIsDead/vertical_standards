@@ -44,12 +44,12 @@ def test_format_question_card():
          "correct": "B", "explanation": "по стандарту"}
     card = ht.format_question_card("Пожар.docx", q, 2)
     assert "📋 *Пожар.docx*" in card
-    assert "Базовый блок — вопрос 2/5" in card
+    assert "Тест — вопрос 2/15" in card
     assert "2. Куда звонить?" in card
     assert "B. 01 ✅" in card and "A. 112\n" in card
     assert "Пояснение: по стандарту" in card
     # экзаменационная нумерация
-    assert "Экзамен — вопрос 2/10" in ht.format_question_card("Д", q, 7)
+    assert "Тест — вопрос 7/15" in ht.format_question_card("Д", q, 7)
 
 
 # ── Роутинг «Вопросы N.q» ────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ def test_questions_card_navigation(hr_env, monkeypatch):
     client, captured = hr_env
     _post_hr(client, "Вопросы 5.7")
     assert _wait_for(lambda: captured)
-    assert "Экзамен — вопрос 2/10" in captured[0]["text"]
+    assert "Тест — вопрос 7/15" in captured[0]["text"]
     assert "7. Вопрос 1?" in captured[0]["text"]
     _post_hr(client, "Вопросы 5.16")
     assert _wait_for(lambda: len(captured) >= 2)

@@ -40,6 +40,10 @@ def cosine_sim(a, b):
 
 def answer(query, chunks, embeddings, section_filter, answer_length,
            role_filter=None, exclude_doc=None):
+    from app.document_access import reconcile_sources
+    allowed = np.array([r["available"] for r in reconcile_sources(chunks)], dtype=bool)
+    if not allowed.any():
+        return "Не найдено релевантных фрагментов.", []
     # Flapping WSL2 network times out on OpenAI; SDK does exponential backoff itself.
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=20.0, max_retries=3)
 
@@ -48,6 +52,7 @@ def answer(query, chunks, embeddings, section_filter, answer_length,
     qvec = np.array(resp.data[0].embedding, dtype=np.float32)
 
     scores = cosine_sim(qvec, embeddings)
+    scores[~allowed] = 0
 
     if section_filter and section_filter != "Общее":
         mask = np.array([1.0 if c["section"] == section_filter else 0.0 for c in chunks])
@@ -71,7 +76,8 @@ def answer(query, chunks, embeddings, section_filter, answer_length,
         return "Не найдено релевантных фрагментов.", []
 
     context = "\n\n---\n\n".join(
-        f"[{c['section']} | {c['heading']}]\n{c['text']}"
+        f"[Источник {c.get('source_id', c.get('course_id', i))} | "
+        f"{c['section']} | {c['heading']}]\n{c['text']}"
         for i, c in enumerate(relevant, 1)
     )
 

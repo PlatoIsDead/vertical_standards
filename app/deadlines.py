@@ -5,7 +5,8 @@ app/deadlines.py — чистые функции №9 v2 (протокол кл�
 
 Ни сети, ни БД. «Назначенность» — ЕДИНСТВЕННАЯ логика репо: роль ∩ роли курса
 (без роли → только ALL), как в _course_recipients/pick_course_for_role.
-Сдача — ЕДИНСТВЕННАЯ формула: score_exam >= round(exam_total * 0.7).
+Сдача определяется quiz.result: ceil(70%) для единого теста,
+историческая формула для legacy-сессий.
 Времена — naive UTC ISO-строки, как пишет БД.
 
 Дедлайн назначения = max(approved_at курса, added_at сотрудника, baseline) + N дней;
@@ -15,14 +16,14 @@ baseline — meta-метка первого запуска после депло
 import json
 from datetime import datetime, timedelta
 
+from app import quiz
 from app.hr_tools import _session_status
 from app.roles import display_name, role_matches
 from app.state_machine import course_roles
 
 
 def _passed(session: dict, questions: dict) -> bool:
-    exam_total = len(questions.get("exam_questions", []))
-    return bool(exam_total) and session["score_exam"] >= round(exam_total * 0.7)
+    return quiz.result(session, questions)[2]
 
 
 def _safe_questions(course: dict) -> dict:
@@ -60,7 +61,7 @@ def assignments_with_deadlines(employees: list[dict], courses: list[dict],
             questions = _safe_questions(c)
             latest = latest_by_course.get(c["id"])
             if latest and latest["state"] == "DONE":
-                if not questions.get("exam_questions"):
+                if not quiz.result(latest, questions)[1]:
                     continue                      # судить нечем — пропуск
                 if _passed(latest, questions):
                     continue                      # сдан — назначение закрыто
@@ -101,7 +102,7 @@ def build_reminder_text(items: list[dict]) -> str | None:
         name = display_name(it["course"]["doc_name"])
         line = f"• «{name}» — {_term(it['days_left'])}"
         if it["status"] == "failed":
-            line += " (экзамен не сдан — напиши *Пересдать*)"
+            line += " (тест не сдан — напиши *Пересдать*)"
         elif it["status"] == "not_started":
             line += " (напиши мне любое сообщение, чтобы начать)"
         lines.append(line)
@@ -145,5 +146,5 @@ def build_escalation_message(due: list[dict], employees_by_uid: dict,
         lines.append(f"• {label} — «{name}»: {status}, "
                      f"дедлайн был {it['deadline'].date().isoformat()}")
     if has_failed:
-        lines += ["", "Сотрудник может пересдать экзамен командой «Пересдать»."]
+        lines += ["", "Сотрудник может пересдать тест командой «Пересдать»."]
     return "\n".join(lines)

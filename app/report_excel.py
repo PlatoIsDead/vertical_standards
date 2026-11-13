@@ -4,7 +4,7 @@ app/report_excel.py — №10: xlsx-отчёт «сотрудник × курс�
 Чистый модуль: bytes на выходе, без сети и БД. Правило ячейки зафиксировано:
 сдал ХОТЬ ОДНУ сессию пары → «Сдан N/M» (лучший результат); иначе судим
 ПОСЛЕДНЮЮ (max id): DONE → «Не сдан N/M», не-DONE → «Идёт»; сессий нет →
-пусто. Формула сдачи — как в _finish_phase: score_exam >= round(total * 0.7).
+пусто. Версия теста, снимок вопросов и порог сдачи — через quiz.result.
 
 18.09 (фидбек Дмитрия «статусы неоднозначны, нужен фильтр по отделу»):
 эмодзи заменены текстом + заливкой (стандартные цвета условного
@@ -19,6 +19,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from app import quiz
 from app.hr_tools import _STATE_LABELS
 from app.roles import display_name, role_name
 
@@ -30,16 +31,16 @@ FILLS = {
 
 LEGEND = [
     ("Сдан 7/10", "green",
-     "экзамен сдан (не меньше 70 % верных), лучший результат из попыток"),
-    ("Не сдан 3/10", "red", "последняя попытка экзамена провалена"),
+     "тест сдан (не меньше 70 % верных), лучший результат из попыток; старые результаты сохранены"),
+    ("Не сдан 3/10", "red", "последняя попытка теста провалена"),
     ("Идёт", "yellow",
      "курс начат: читает, проходит тест, на паузе или ждёт допуска HR"),
     ("", None, "пустая ячейка — сотрудник курс не начинал"),
 ]
 
 _MATRIX_FIXED = ["Сотрудник", "Должность", "Отдел", "Роль"]
-_DETAILS_HEADER = ["Сотрудник", "Отдел", "Курс", "Статус", "Базовый",
-                   "Экзамен", "Дата"]
+_DETAILS_HEADER = ["Сотрудник", "Отдел", "Курс", "Статус", "Базовый (старые сессии)",
+                   "Тест / экзамен", "Дата"]
 
 
 def _questions(obj: dict) -> dict:
@@ -54,8 +55,7 @@ def _exam_total(questions: dict) -> int:
 
 
 def _passed(session: dict, questions: dict) -> bool:
-    total = _exam_total(questions)
-    return bool(total) and session["score_exam"] >= round(total * 0.7)
+    return quiz.result(session, questions)[2]
 
 
 def _cell(pair_sessions: list[dict] | None,
@@ -67,21 +67,25 @@ def _cell(pair_sessions: list[dict] | None,
     passed = [s for s in pair_sessions
               if s["state"] == "DONE" and _passed(s, questions)]
     if passed:
-        best = max(s["score_exam"] for s in passed)   # лучший результат пары
-        return f"Сдан {best}/{total}", "green"
+        best = max(passed, key=lambda s: quiz.result(s, questions)[0] / quiz.result(s, questions)[1])
+        score, total, _ = quiz.result(best, questions)
+        return f"Сдан {score}/{total}", "green"
     last = max(pair_sessions, key=lambda s: s["id"])
     if last["state"] == "DONE":
-        return f"Не сдан {last['score_exam']}/{total}", "red"
+        score, total, _ = quiz.result(last, questions)
+        return f"Не сдан {score}/{total}", "red"
     return "Идёт", "yellow"
 
 
 def _session_cell(session: dict, questions: dict) -> tuple[str, str | None]:
     """Статус одной сессии для листа «Детали» — тот же язык, что в матрице."""
     if session["state"] == "DONE":
-        total = _exam_total(questions)
+        _, total, _ = quiz.result(session, questions)
         if _passed(session, questions):
             return f"Сдан {session['score_exam']}/{total}", "green"
         return f"Не сдан {session['score_exam']}/{total}", "red"
+    if quiz.unified(session) and session["state"] in quiz.QUIZ_STATES:
+        return "тест на паузе" if quiz.is_paused(session["state"]) else "проходит тест", "yellow"
     return _STATE_LABELS.get(session["state"], session["state"]), "yellow"
 
 
@@ -165,15 +169,15 @@ def build_report_xlsx(rows: list[dict], employees_by_uid: dict[str, dict],
     for r in sorted(rows, key=lambda r: r.get("updated_at") or "",
                     reverse=True):
         uid = str(r["user_id"])
-        q = _questions(r)
+        q = quiz.session_questions(r, _questions(r))
         status, fill = _session_cell(r, q)
         _write_row(det, [
             _label(uid),
             departments_by_uid.get(uid, ""),
             display_name(r["doc_name"]),
             status,
-            f"{r['score_basic']}/{len(q.get('basic_questions', []))}",
-            f"{r['score_exam']}/{_exam_total(q)}",
+            "—" if quiz.unified(r) else f"{r['score_basic']}/{len(q.get('basic_questions', []))}",
+            f"{r['score_exam']}/{quiz.result(r, q)[1]}",
             (r.get("updated_at") or "")[:10],
         ], {3: fill})
     _finish_sheet(det, "A2")

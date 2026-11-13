@@ -101,7 +101,7 @@ def _make_done_session(uid="500", exam=8):
     questions = {"exam_questions": [{}] * 10, "basic_questions": [{}] * 5}
     course_id = db.save_draft_course("Курс.docx", "1", json.dumps(questions))
     db.activate_course_by_id(course_id, "hr")
-    session = db.create_session(uid, f"u{uid}", course_id)
+    session = db.create_session(uid, f"u{uid}", course_id, quiz_version=1)
     db.update_session(session["id"], state="DONE", score_basic=4, score_exam=exam)
 
 
@@ -155,7 +155,7 @@ def exam_env(tmp_path, monkeypatch):
     course_id = db.save_draft_course(
         "Стандарты.docx", "1", json.dumps(EXAM_QUESTIONS, ensure_ascii=False))
     db.activate_course_by_id(course_id, "hr")
-    session = db.create_session("u1", "d1", course_id)
+    session = db.create_session("u1", "d1", course_id, quiz_version=1)
     db.update_session(session["id"], state="EXAM", q_idx=0)
 
     calls = []

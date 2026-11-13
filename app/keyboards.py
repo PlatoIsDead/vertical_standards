@@ -69,7 +69,7 @@ def for_session(session: dict | None, fork: bool = False,
     test_options — 4 ТЕЛА вариантов текущего вопроса (без «A. »)."""
     if session is None:
         if fork:
-            return [_btn("🔁 Пересдать экзамен", "Пересдать",
+            return [_btn("🔁 Пересдать тест", "Пересдать",
                          display="BLOCK", role="primary"),
                     dict(_NEWLINE),
                     _btn("Далее, к следующему", "Далее", width=180),
@@ -101,20 +101,21 @@ def for_session(session: dict | None, fork: bool = False,
                 _btn("📄 Документы", "Документы", width=130),
                 dict(_NEWLINE),
                 _btn("❓ Помощь", "Помощь", width=130, role="service")]
-    if state in ("BASIC_TEST", "EXAM"):
+    if state in quiz.TEST_STATES:
         # Короткие варианты (все ≤24) — BLOCK с текстом: нажатие не требует
-        # сверки с сообщением; payload — буква (parse_answer).
-        # 01.09: в экзамене кнопка называет экзамен (payload прежний)
-        pause_label = ("⏸ Отложить экзамен" if state == "EXAM"
+        # сверки с сообщением; payload привязан к сессии/попытке/вопросу.
+        # Старые сессии сохраняют названия своих фаз.
+        pause_label = ("⏸ Отложить экзамен" if state == "EXAM" and not quiz.unified(session)
                        else "⏸ Отложить тест")
         pause = [dict(_NEWLINE),
                  _btn(pause_label, "Выйти", width=160, role="service"),
                  _btn("❓ Помощь", "Помощь", width=130, role="service")]
         if (test_options and len(test_options) == 4
                 and all(len(b) <= 24 for b in test_options)):
-            return [_btn(f"{letter} · {body}", letter, display="BLOCK")
+            return [_btn(f"{letter} · {body}", quiz.answer_payload(session, letter), display="BLOCK")
                     for letter, body in zip("ABCD", test_options)] + pause
-        return [_btn(x, width=70) for x in ("A", "B", "C", "D")] + pause
+        letters = quiz.LETTERS[:len(test_options)] if test_options else quiz.LETTERS
+        return [_btn(x, quiz.answer_payload(session, x), width=70) for x in letters] + pause
     if state == "EXAM_READY":
         # 31.08: авто-допуск — экзамен стартует ТОЛЬКО кнопкой/командой
         return [_btn("🎓 Начать экзамен", "Начать", display="BLOCK",
@@ -133,7 +134,7 @@ def for_session(session: dict | None, fork: bool = False,
     if state in quiz.PAUSED_STATES:
         # 02.09: пауза — своё состояние. Букв A–D здесь нет намеренно: ответ
         # на паузе не засчитывается (кнопка под старым сообщением = промах)
-        label = ("▶ Продолжить экзамен" if state == "PAUSED_EXAM"
+        label = ("▶ Продолжить экзамен" if state == "PAUSED_EXAM" and not quiz.unified(session)
                  else "▶ Продолжить тест")
         return [_btn(label, "Продолжить", display="BLOCK", role="primary"),
                 dict(_NEWLINE),
@@ -158,7 +159,7 @@ def courses_menu(items: list, reading: bool = False,
     Текущий и пройденные курсы кнопками не делаются (нажимать незачем).
     resume_test (21.08, тупик паузы) — primary [▶ Продолжить тест] вместо
     «Готов» (01.09: resume_exam=True называет экзамен, payload прежний);
-    retake — [🔁 Пересдать экзамен] после курсов."""
+    retake — [🔁 Пересдать тест] после курсов."""
     rows: list = []
     if resume_test:
         resume_label = ("▶ Продолжить экзамен" if resume_exam
@@ -181,7 +182,7 @@ def courses_menu(items: list, reading: bool = False,
             rows.append(_btn(f"Выбрать {n}", width=96))
         rows.append(dict(_NEWLINE))
     if retake:
-        rows += [_btn("🔁 Пересдать экзамен", "Пересдать", display="BLOCK"),
+        rows += [_btn("🔁 Пересдать тест", "Пересдать", display="BLOCK"),
                  dict(_NEWLINE)]
     if show_courses_button:
         # В паузе явный вход в список курсов не должен быть
